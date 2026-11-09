@@ -109,7 +109,9 @@ lock = threading.Lock()
 
 def homes() -> dict[str, pathlib.Path]:
     found = {"default": HOME}
-    for path in sorted((HOME / "profiles").iterdir()):
+    folder = HOME / "profiles"
+    # A Hermes with only its default bot has no profiles folder at all.
+    for path in sorted(folder.iterdir()) if folder.is_dir() else []:
         if (path / ".env").exists():
             found[path.name] = path
     return found
@@ -178,9 +180,11 @@ def start_bridge_update() -> dict:
     hermes = str(bundled) if bundled.exists() else tool_path("hermes")
     script = update_script(hermes, PLUGIN_ROOT.name, f"gui/{os.getuid()}",
                            restart_labels(pathlib.Path.home() / "Library/LaunchAgents"))
-    log = (HOME / "logs/hermit-update.log").open("ab")
-    # Detached, because restarting the bridge ends this process.
-    subprocess.Popen(["/bin/sh", "-c", script], stdout=log, stderr=log, start_new_session=True)
+    # Hermes's own commands should behave as they would from a terminal.
+    env = {name: value for name, value in os.environ.items() if name != "HERMES_DISABLE_LAZY_INSTALLS"}
+    with (HOME / "logs/hermit-update.log").open("ab") as log:
+        # Detached, because restarting the bridge ends this process.
+        subprocess.Popen(["/bin/sh", "-c", script], stdout=log, stderr=log, start_new_session=True, env=env)
     return {"ok": True}
 
 
@@ -209,7 +213,8 @@ def hermes_compatibility() -> dict:
 
 
 def api_key(home: pathlib.Path) -> str | None:
-    for line in (home / ".env").read_text().splitlines():
+    env = home / ".env"
+    for line in env.read_text().splitlines() if env.exists() else []:
         if line.startswith("API_SERVER_KEY="):
             return line.split("=", 1)[1].strip().strip("'\"")
     return None
@@ -961,8 +966,9 @@ def claim_pair_code(code: str) -> dict | None:
             state["tries"] += 1
             write_json(PAIR_CODE, state)
             return None
+        # Gathered before the code is spent, so a failure here leaves it good for another try.
+        bots = [{"profile": name, "key": key} for name, home in homes().items() if (key := api_key(home))]
         PAIR_CODE.unlink(missing_ok=True)
-    bots = [{"profile": name, "key": key} for name, home in homes().items() if (key := api_key(home))]
     return {"url": state["url"], "bots": bots}
 
 
@@ -2372,6 +2378,9 @@ class Server(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
+    # Hermes's own modules can restart whoever imports them under a bare Python to finish an install.
+    # That Python has none of the bridge's packages, so the bridge died mid-request and launchd restarted it.
+    os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
     threading.Thread(target=udp_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
