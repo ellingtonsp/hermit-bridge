@@ -511,10 +511,16 @@ def read_json(path: pathlib.Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def write_json(path: pathlib.Path, value: dict) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value))
-    temporary.replace(path)
+def write_json(path: pathlib.Path, value: dict | list) -> None:
+    # A temporary file of its own, so two writers can never trip over one name. Private from the start.
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w") as file:
+            file.write(json.dumps(value))
+        os.replace(temporary, path)
+    except BaseException:
+        pathlib.Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def link_rules() -> list[dict]:
@@ -784,6 +790,67 @@ def editable_path(home: pathlib.Path, relative: str) -> pathlib.Path | None:
     if real.name != parts[-1] or not any(real.is_relative_to(root) for root in roots):
         return None
     return real
+
+
+# What a bot's linked file may be, by ending. Config and data formats are left out, since they hold secrets.
+BOT_FILE_TYPES = {
+    "md": "text/markdown", "markdown": "text/markdown", "txt": "text/plain", "log": "text/plain",
+    "csv": "text/csv", "tsv": "text/tab-separated-values", "html": "text/html", "pdf": "application/pdf",
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
+    "heic": "image/heic", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+BOT_FILE_LIMIT = 25 * 1024 * 1024
+# Hermes's own machinery, never a bot's work.
+BOT_FILE_SKIPPED = {"app-bridge", "hermes-agent", "logs", "sessions", "plugins", "tools", "mcp", "bin", "venv",
+                    "node_modules", "__pycache__"}
+
+
+def bot_file_allowed(home: pathlib.Path, real: pathlib.Path, is_default: bool) -> bool:
+    """A file a bot may hand to the app: inside its own folder, of a readable kind, and nothing hidden."""
+    try:
+        inside = real.relative_to(home.resolve()).parts
+    except ValueError:
+        return False
+    if not inside or any(part.startswith(".") for part in inside) or inside[0] in BOT_FILE_SKIPPED:
+        return False
+    # The default bot's folder holds every other bot's, and those are theirs.
+    if is_default and inside[0] == "profiles":
+        return False
+    return real.suffix.lower().lstrip(".") in BOT_FILE_TYPES and real.is_file() and real.stat().st_size <= BOT_FILE_LIMIT
+
+
+def find_bot_file(home: pathlib.Path, name: str, is_default: bool, budget: int = 40000) -> pathlib.Path | None:
+    """The newest file with this exact name in the bot's folder, for when a bot gives only the name."""
+    newest, seen = None, 0
+    for folder, folders, files in os.walk(home):
+        top = pathlib.Path(folder) == home
+        folders[:] = [d for d in folders if not d.startswith(".") and d not in BOT_FILE_SKIPPED
+                      and not (top and is_default and d == "profiles")]
+        seen += len(files) + 1
+        if name in files:
+            found = (pathlib.Path(folder) / name).resolve()
+            if bot_file_allowed(home, found, is_default) and (newest is None or found.stat().st_mtime > newest.stat().st_mtime):
+                newest = found
+        if seen > budget:
+            break
+    return newest
+
+
+def bot_file(home: pathlib.Path, raw: str, is_default: bool) -> pathlib.Path | None:
+    """Where a path a bot wrote really is, or None if the app may not have it."""
+    raw = raw.strip()
+    if not raw or "\0" in raw or len(raw) > 1024:
+        return None
+    if "/" not in raw:
+        return find_bot_file(home, raw, is_default)
+    if raw.startswith("~/"):
+        path = pathlib.Path.home() / raw[2:]
+    else:
+        path = pathlib.Path(raw) if raw.startswith("/") else home / raw
+    real = path.resolve()
+    return real if bot_file_allowed(home, real, is_default) else None
 
 
 def file_version(data: bytes) -> str:
@@ -1650,14 +1717,31 @@ def session_owner(session_id: str) -> tuple[str, str] | None:
     return matches[0] if matches else None
 
 
+devices_lock = threading.Lock()
+
+
 def load_devices() -> list[dict]:
     return json.loads(DEVICES.read_text()) if DEVICES.exists() else []
 
 
 def save_devices(devices: list[dict]) -> None:
     STATE.mkdir(mode=0o700, exist_ok=True)
-    DEVICES.write_text(json.dumps(devices))
+    write_json(DEVICES, devices)
     DEVICES.chmod(0o600)
+
+
+def settle_devices(gone: set[str], relay_tokens: dict[str, str]) -> None:
+    """Records what a round of pushes learned, on the list as it is now: dead tokens go, and new relay
+    tokens are kept. A phone may have registered or changed its mutes while the pushes were going out, and
+    saving the list read before them would undo that."""
+    if not gone and not relay_tokens:
+        return
+    with devices_lock:
+        devices = [device for device in load_devices() if device["token"] not in gone]
+        for device in devices:
+            if device["token"] in relay_tokens and not device.get("relay_token"):
+                device["relay_token"] = relay_tokens[device["token"]]
+        save_devices(devices)
 
 
 def use_relay() -> bool:
@@ -1757,15 +1841,18 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
         payload["avatar"] = avatar
     body = json.dumps(payload)
     authorization = None if relay else apns_token(config)
-    remaining = []
+    gone: set[str] = set()
+    relay_tokens: dict[str, str] = {}
     for device in load_devices():
         if is_muted(device, profile, routine):
-            remaining.append(device)
             continue
         if relay:
+            had_token = bool(device.get("relay_token"))
             status = relay_send(device, "alert", sealed_alert(device, payload))
-            if status != "410":
-                remaining.append(device)
+            if not had_token and device.get("relay_token"):
+                relay_tokens[device["token"]] = device["relay_token"]
+            if status == "410":
+                gone.add(device["token"])
             print(f"push {profile}: {status}", flush=True)
             continue
         host = "api.sandbox.push.apple.com" if device.get("sandbox") else "api.push.apple.com"
@@ -1776,10 +1863,10 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
             input=f'header = "authorization: bearer {authorization}"\n'
                   f'header = "apns-topic: {push_topic(device.get("topic"), config["topic"])}"\nheader = "apns-push-type: alert"\n',
             capture_output=True, text=True)
-        if result.stdout.strip() != "410":
-            remaining.append(device)
+        if result.stdout.strip() == "410":
+            gone.add(device["token"])
         print(f"push {profile}: {result.stdout.strip()}", flush=True)
-    save_devices(remaining)
+    settle_devices(gone, relay_tokens)
 
 
 def publish(session_id: str, event: dict) -> bool:
@@ -1976,6 +2063,22 @@ class Handler(BaseHTTPRequestHandler):
                 result = gateway_rpc("groups.log", room_id=match.group(1), since_seq=since, limit=200)
                 return {"events": [room_event(e) for e in result.get("events") or []]}
             return self.guarded(log)
+        if url.path == "/files":
+            query = urllib.parse.parse_qs(url.query)
+            profile = (query.get("profile") or [""])[0]
+            if profile not in homes() or not authorized(header, profile):
+                return self.json(401, {"error": {"message": "unauthorized"}})
+            found = bot_file(homes()[profile], (query.get("path") or [""])[0], profile == "default")
+            if found is None:
+                return self.json(404, {"error": {"message": "Hermit can only open documents and images in this bot's own folder."}})
+            self.send_response(200)
+            self.send_header("Content-Type", BOT_FILE_TYPES[found.suffix.lower().lstrip(".")])
+            self.send_header("Content-Length", str(found.stat().st_size))
+            self.send_header("X-File-Name", urllib.parse.quote(found.name))
+            self.end_headers()
+            with found.open("rb") as file:
+                shutil.copyfileobj(file, self.wfile)
+            return
         if url.path == "/file":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -2350,7 +2453,6 @@ class Handler(BaseHTTPRequestHandler):
         token = str(body.get("token") or "")
         if not re.fullmatch(r"[0-9a-f]{32,200}", token):
             return self.json(400, {"error": "invalid token"})
-        devices = [d for d in load_devices() if d["token"] != token]
         muted = [str(name) for name in (body.get("muted") or [])][:64]
         muted_routines = [str(name)[:200] for name in (body.get("muted_routines") or [])][:200]
         # A timed mute ends here on the Mac, so it lifts on time even if the phone never opens the app.
@@ -2358,11 +2460,12 @@ class Handler(BaseHTTPRequestHandler):
         muted_until = {str(name)[:64]: float(end) for name, end in list(until.items())[:64]
                        if isinstance(end, (int, float)) and end > time.time()}
         push_key = str(body.get("push_key") or "")
-        devices.append({"token": token, "sandbox": bool(body.get("sandbox")), "muted": muted,
-                        "topic": push_topic(body.get("topic"), ""),
-                        "muted_routines": muted_routines, "muted_until": muted_until,
-                        **({"push_key": push_key} if re.fullmatch(r"[A-Za-z0-9+/]{43}=", push_key) else {})})
-        save_devices(devices)
+        entry = {"token": token, "sandbox": bool(body.get("sandbox")), "muted": muted,
+                 "topic": push_topic(body.get("topic"), ""),
+                 "muted_routines": muted_routines, "muted_until": muted_until,
+                 **({"push_key": push_key} if re.fullmatch(r"[A-Za-z0-9+/]{43}=", push_key) else {})}
+        with devices_lock:
+            save_devices([d for d in load_devices() if d["token"] != token] + [entry])
         self.json(200, {"ok": True, "push": True})
 
 
