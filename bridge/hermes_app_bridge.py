@@ -913,7 +913,8 @@ def session_reply(method: str, result) -> dict:
                             for s in result.get("subagents") or [] if isinstance(s, dict)]}
     if method == "subagent.interrupt":
         return {"found": bool(result.get("found"))}
-    keep = ("operation", "effort", "rewound_count", "model", "provider", "confirm_required", "confirm_message", "confirm", "warning")
+    keep = ("operation", "effort", "rewound_count", "model", "provider", "confirm_required", "confirm_message", "confirm",
+            "confirm_token", "warning")
     return {key: result.get(key) for key in keep if result.get(key) is not None} | {"ok": True}
 
 
@@ -1650,13 +1651,20 @@ def configured_models() -> list[dict]:
 def set_model(profile: str, model: str, provider: str, confirmed: bool) -> dict:
     """Uses Hermes's own profile editor, so its expensive-model and data-policy check still applies.
     A guarded pick writes nothing and comes back with a message for the person to confirm."""
+    if not model_choice_ok(model, provider):
+        raise VoiceError("That isn't a model Hermit can set.")
     extra = {"confirm_expensive_model": True} if confirmed else {}
     result = gateway_rpc("profiles.configure", name=profile, model=model, provider=provider, **extra)
     if result.get("confirm_required"):
         return {"confirm": result.get("confirm_message") or "This model needs confirmation."}
     if not (result.get("applied") or {}).get("model"):
-        raise VoiceError("Hermes didn't change the model")
+        raise VoiceError("Hermes didn't accept that model. Check that its provider is signed in on your Mac.")
     return {"ok": True}
+
+
+def model_choice_ok(model: str, provider: str) -> bool:
+    """A model and provider as Hermes names them. Anything else is refused before it reaches Hermes's config."""
+    return bool(re.fullmatch(r"[\w./:@+-]{1,200}", model)) and bool(re.fullmatch(r"[\w./:@+-]{1,80}", provider))
 
 
 def room_summary(room: dict) -> dict:
@@ -2205,6 +2213,8 @@ class Handler(BaseHTTPRequestHandler):
     def guarded(self, work) -> None:
         try:
             self.json(200, work())
+        except VoiceError as error:  # written for people, so it's shown as it is
+            self.json(409, {"error": {"message": str(error)}})
         except Exception as error:  # the app shows this message, so keep it free of internals
             print(f"gateway error: {type(error).__name__}: {error}", flush=True)
             self.json(502, {"error": {"message": "Hermes couldn't complete that"}})
