@@ -113,6 +113,13 @@ def current_host() -> str | None:
         return None
 
 
+def platform_problem(platform: str) -> str | None:
+    """The bridge runs as a macOS launch agent, so anything else has to stop before changes are made."""
+    if platform == "darwin":
+        return None
+    return "  MISSING  Mac: Hermit's setup only works with Hermes running on a Mac for now. Nothing was changed."
+
+
 def checks(home: pathlib.Path, public_url: str | None = None) -> list[Check]:
     import hermes_app_bridge as bridge  # Here so a missing Python package is reported, not a crash.
     found = bridge.hermes_compatibility()
@@ -184,6 +191,10 @@ def main() -> int:
     public_url = options.url.rstrip("/") if options.url else None
     if public_url and not public_url.startswith("https://"):
         print("Your address has to start with https://.")
+        return 1
+
+    if problem := platform_problem(sys.platform):
+        print(problem)
         return 1
 
     results = checks(HOME, public_url)
