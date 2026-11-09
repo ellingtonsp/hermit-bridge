@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import queue
+import shlex
 import re
 import secrets
 import shutil
@@ -115,12 +116,72 @@ def homes() -> dict[str, pathlib.Path]:
 
 
 # The oldest Hermes this bridge has been run against, and the internals it can't work without.
+LABEL_BRIDGE = "ai.hermes.app-bridge"
 MIN_HERMES_RELEASE = "2026.9.24"
 REQUIRED_HERMES_MODULES = ("hermes_cli.gateway_client", "hermes_cli.gateway_runtime")
 
 
 def release_number(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split(".") if part.isdigit())
+
+
+PUBLISHED_PLUGIN = "https://raw.githubusercontent.com/ellingtonsp/hermit-bridge/main/plugin.yaml"
+PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def yaml_version(text: str) -> str | None:
+    match = re.search(r"^version:\s*[\"']?([0-9][0-9A-Za-z.\-]*)", text, re.M)
+    return match.group(1) if match else None
+
+
+def version_is_newer(latest: str | None, installed: str | None) -> bool:
+    def parts(value: str) -> list[int]:
+        return [int(piece) for piece in re.findall(r"\d+", value)]
+    return bool(latest and installed and parts(latest) > parts(installed))
+
+
+def installed_plugin_version() -> str | None:
+    for path in (PLUGIN_ROOT / "plugin.yaml", PLUGIN_ROOT / "plugin/hermes-cards/plugin.yaml"):
+        if path.exists():
+            return yaml_version(path.read_text())
+    return None
+
+
+def bridge_update_status() -> dict:
+    installed = installed_plugin_version()
+    latest = None
+    try:
+        with urllib.request.urlopen(PUBLISHED_PLUGIN, timeout=8) as response:
+            latest = yaml_version(response.read(4096).decode())
+    except Exception:
+        pass
+    return {"installed": installed, "latest": latest, "available": version_is_newer(latest, installed),
+            # A plugin copied in by hand has no source to update from.
+            "canUpdate": (PLUGIN_ROOT / ".git").exists()}
+
+
+def restart_labels(agents: pathlib.Path) -> list[str]:
+    """Every gateway and dashboard installed here. The bridge goes last, because it ends this process."""
+    names = sorted(path.stem for path in agents.glob("ai.hermes.*.plist"))
+    return [name for name in names if name.startswith(("ai.hermes.gateway", "ai.hermes.dashboard"))]
+
+
+def update_script(hermes: str, plugin: str, domain: str, labels: list[str]) -> str:
+    restarts = [f"launchctl kickstart -k {shlex.quote(domain + '/' + label)}" for label in labels + [LABEL_BRIDGE]]
+    return "sleep 1; " + shlex.quote(hermes) + " plugins update " + shlex.quote(plugin) + " && { " + "; ".join(restarts) + "; }"
+
+
+def start_bridge_update() -> dict:
+    if not (PLUGIN_ROOT / ".git").exists():
+        raise ValueError("This plugin was installed by hand, so update it on the Mac.")
+    bundled = HOME / "hermes-agent/venv/bin/hermes"
+    hermes = str(bundled) if bundled.exists() else tool_path("hermes")
+    script = update_script(hermes, PLUGIN_ROOT.name, f"gui/{os.getuid()}",
+                           restart_labels(pathlib.Path.home() / "Library/LaunchAgents"))
+    log = (HOME / "logs/hermit-update.log").open("ab")
+    # Detached, because restarting the bridge ends this process.
+    subprocess.Popen(["/bin/sh", "-c", script], stdout=log, stderr=log, start_new_session=True)
+    return {"ok": True}
 
 
 def hermes_compatibility() -> dict:
@@ -1789,6 +1850,10 @@ class Handler(BaseHTTPRequestHandler):
             if not avatar or not avatar.exists():
                 return self.json(404, {"error": "not found"})
             return self.reply(200, avatar.read_bytes(), "image/png")
+        if url.path == "/updates/bridge":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            return self.json(200, bridge_update_status())
         if url.path in ("/updates/mac", "/updates/mac/download"):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -2035,7 +2100,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, claimed)
         if path == "/devices":
             return self.register_device(header)
-        if path == "/controls/respond" or path == "/controls/stop":
+        if path == "/updates/bridge":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            return self.guarded(start_bridge_update)
+        if path in ("/controls/respond", "/controls/stop", "/controls/correct"):
             return self.control_action(path, header)
         if path == "/mail/send":
             return self.mail_send(header)
@@ -2181,6 +2250,11 @@ class Handler(BaseHTTPRequestHandler):
 
         def act():
             watch = watcher(profile, session_id)
+            if path == "/controls/correct":
+                verb, text = str(fields.get("verb") or ""), str(fields.get("text") or "").strip()
+                if verb not in ("steer", "redirect") or not text:
+                    raise ValueError("verb must be steer or redirect, with text")
+                return watch.call(f"session.{verb}", text=text)
             if path == "/controls/stop":
                 return watch.call("session.interrupt", execution_generation=watch.generation)
             identity = {"execution_generation": fields.get("generation"), "prompt_id": fields.get("prompt")}
