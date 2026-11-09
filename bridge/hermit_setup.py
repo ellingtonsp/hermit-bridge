@@ -151,6 +151,29 @@ def run(*command: str) -> None:
     subprocess.run(command, check=True)
 
 
+def plugin_version() -> str:
+    for path in (REPO / "plugin.yaml", REPO / "plugin/hermes-cards/plugin.yaml"):
+        if path.exists():
+            for line in path.read_text().splitlines():
+                if line.startswith("version:"):
+                    return line.split(":", 1)[1].strip().strip("'\"")
+    return "unknown"
+
+
+def setup_fingerprint(home: pathlib.Path, version: str) -> dict:
+    return {"version": version, "profiles": sorted(profiles(home))}
+
+
+def needs_restart(stamp: pathlib.Path, fingerprint: dict, keys_added: bool) -> bool:
+    """Restarting takes every bot offline for minutes, so only do it when the gateway has something new to load."""
+    if keys_added:
+        return True
+    try:
+        return json.loads(stamp.read_text()) != fingerprint
+    except (OSError, ValueError):
+        return True
+
+
 def link_plugin(link: pathlib.Path, target: pathlib.Path) -> None:
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.is_symlink() and not link.exists():
@@ -253,10 +276,12 @@ def main() -> int:
     if not hermes:
         print("Couldn't find the hermes command.")
         return 1
+    keys_added = False
     if missing and confirm(f"Add an API key to {len(missing)} profile(s)?", options.yes):
         all_profiles = profiles(HOME)
         for name in missing:
             add_api_key(all_profiles[name], name == "default", secrets.token_urlsafe(32))
+        keys_added = True
     if confirm("Install the hermes-cards plugin in every profile?", options.yes):
         install_plugin(HOME, hermes)
     python = str(HOME / "hermes-agent/venv/bin/python3")
@@ -276,9 +301,14 @@ def main() -> int:
     url = public_url or f"https://{host}:{HTTPS_PORT}"
     code = bridge.new_pair_code(url)
     print(f"\nIn Hermit, enter\n  Address: {url}\n  Code: {code}\nThe code works once and expires in 10 minutes.")
-    if not options.no_restart:
+    stamp = HOME / "app-bridge/setup.json"
+    fingerprint = setup_fingerprint(HOME, plugin_version())
+    if not needs_restart(stamp, fingerprint, keys_added):
+        print("Nothing new for Hermes to load, so your bots keep running.")
+    elif not options.no_restart:
+        stamp.write_text(json.dumps(fingerprint))
         # Last and detached: when a bot runs this, the restart ends its own turn.
-        print("Restarting Hermes in a few seconds so everything loads.", flush=True)
+        print("Restarting Hermes in a few seconds so everything loads. Your bots may be offline for a few minutes.", flush=True)
         subprocess.Popen(["/bin/sh", "-c", f"sleep 8; '{hermes}' -p default gateway restart"], start_new_session=True,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return 0
