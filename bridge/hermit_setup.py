@@ -161,7 +161,11 @@ def plugin_version() -> str:
 
 
 def setup_fingerprint(home: pathlib.Path, version: str) -> dict:
-    return {"version": version, "profiles": sorted(profiles(home))}
+    found = {"version": version, "profiles": sorted(profiles(home))}
+    # Turning off an older copy only takes effect after a restart, so its presence is part of what changed.
+    if (REPO / "plugin.yaml").exists() and any(has_legacy_plugin(home, path) for path in profiles(home).values()):
+        found["legacy_off"] = True
+    return found
 
 
 def needs_restart(stamp: pathlib.Path, fingerprint: dict, keys_added: bool) -> bool:
@@ -182,6 +186,13 @@ def link_plugin(link: pathlib.Path, target: pathlib.Path) -> None:
         link.symlink_to(target)
 
 
+LEGACY_PLUGIN = "hermes-cards"
+
+
+def has_legacy_plugin(home: pathlib.Path, profile_home: pathlib.Path) -> bool:
+    return (home / "plugins" / LEGACY_PLUGIN).exists() or (profile_home / "plugins" / LEGACY_PLUGIN).exists()
+
+
 def install_plugin(home: pathlib.Path, hermes: str) -> None:
     # Installed through `hermes plugins install`, this folder already is the plugin.
     packaged = (REPO / "plugin.yaml").exists()
@@ -195,6 +206,9 @@ def install_plugin(home: pathlib.Path, hermes: str) -> None:
         # `hermes plugins install` only adds it to the profile that ran it, which may not be this one.
         link_plugin(path / f"plugins/{plugin}", target)
         run(hermes, "-p", name, "plugins", "enable", plugin)
+        if packaged and has_legacy_plugin(home, path):
+            # An older hand-installed copy does the same job. With both on, every streamed word arrives twice.
+            subprocess.run([hermes, "-p", name, "plugins", "disable", LEGACY_PLUGIN], capture_output=True)
         run(hermes, "-p", name, "tools", "enable", "--platform", "api_server", "hermes_cards")
 
 
