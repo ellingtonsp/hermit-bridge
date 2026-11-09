@@ -14,6 +14,9 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -148,6 +151,14 @@ def run(*command: str) -> None:
     subprocess.run(command, check=True)
 
 
+def link_plugin(link: pathlib.Path, target: pathlib.Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() and not link.exists():
+        link.unlink()
+    if not link.exists():
+        link.symlink_to(target)
+
+
 def install_plugin(home: pathlib.Path, hermes: str) -> None:
     # Installed through `hermes plugins install`, this folder already is the plugin.
     packaged = (REPO / "plugin.yaml").exists()
@@ -158,13 +169,43 @@ def install_plugin(home: pathlib.Path, hermes: str) -> None:
         shutil.copytree(REPO / "plugin/hermes-cards", target, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("__pycache__", "test_*"))
     for name, path in profiles(home).items():
-        if name != "default":
-            link = path / f"plugins/{plugin}"
-            link.parent.mkdir(parents=True, exist_ok=True)
-            if not link.exists():
-                link.symlink_to(target)
+        # `hermes plugins install` only adds it to the profile that ran it, which may not be this one.
+        link_plugin(path / f"plugins/{plugin}", target)
         run(hermes, "-p", name, "plugins", "enable", plugin)
         run(hermes, "-p", name, "tools", "enable", "--platform", "api_server", "hermes_cards")
+
+
+def bootstrap_with_retries(start, tries: int = 15, pause: float = 1, sleep=time.sleep) -> None:
+    """launchd refuses a new load, with error 5, until the old process has finished exiting."""
+    for attempt in range(tries):
+        try:
+            return start()
+        except subprocess.CalledProcessError:
+            if attempt == tries - 1:
+                raise
+            sleep(pause)
+
+
+def reload_service(domain: str, agent: pathlib.Path) -> None:
+    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
+    bootstrap_with_retries(lambda: subprocess.run(["launchctl", "bootstrap", domain, str(agent)], check=True, capture_output=True))
+
+
+def bridge_answers(tries: int = 30, pause: float = 1, sleep=time.sleep, fetch=None) -> bool:
+    """Waits for the bridge to really serve, so a code is never handed out for something that isn't there."""
+    def default_fetch() -> int:
+        with urllib.request.urlopen(f"http://127.0.0.1:{BRIDGE_PORT}/health", timeout=2) as reply:
+            return reply.status
+    fetch = fetch or default_fetch
+    for attempt in range(tries):
+        try:
+            if fetch() == 200:
+                return True
+        except (OSError, urllib.error.URLError):
+            pass
+        if attempt < tries - 1:
+            sleep(pause)
+    return False
 
 
 def install_bridge(python: str, tailscale: str | None, api_port: str) -> None:
@@ -172,9 +213,7 @@ def install_bridge(python: str, tailscale: str | None, api_port: str) -> None:
     agent = pathlib.Path.home() / f"Library/LaunchAgents/{LABEL}.plist"
     agent.parent.mkdir(parents=True, exist_ok=True)
     agent.write_bytes(launch_agent(python, str(REPO / "bridge/hermes_app_bridge.py"), str(HOME / "logs/app-bridge.log")))
-    domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
-    run("launchctl", "bootstrap", domain, str(agent))
+    reload_service(f"gui/{os.getuid()}", agent)
     if not tailscale:
         return
     run(tailscale, "serve", "--bg", f"--https={HTTPS_PORT}", f"http://127.0.0.1:{api_port}")
@@ -222,7 +261,14 @@ def main() -> int:
         install_plugin(HOME, hermes)
     python = str(HOME / "hermes-agent/venv/bin/python3")
     if confirm(f"Install the Hermit bridge, reachable at {public_url or host}?", options.yes):
-        install_bridge(python if os.path.exists(python) else sys.executable, None if public_url else tailscale_binary(), API_PORT)
+        try:
+            install_bridge(python if os.path.exists(python) else sys.executable, None if public_url else tailscale_binary(), API_PORT)
+        except subprocess.CalledProcessError as error:
+            print(f"\n  MISSING  Bridge: couldn't start it ({error.cmd[0]} exit {error.returncode}). Run setup again.")
+            return 1
+        if not bridge_answers():
+            print("\n  MISSING  Bridge: it didn't start. See ~/.hermes/logs/app-bridge.log, then run setup again.")
+            return 1
     if public_url:
         print(f"\nPoint {public_url} at this Mac: / to 127.0.0.1:{API_PORT}, /app to 127.0.0.1:{BRIDGE_PORT}, and")
         print("/p/<profile> to any standalone profile. Your API keys are the only protection on a public address.")
