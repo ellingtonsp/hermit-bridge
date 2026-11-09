@@ -40,6 +40,7 @@ HOME = pathlib.Path.home() / ".hermes"
 STATE = HOME / "app-bridge"
 DEVICES = STATE / "devices.json"
 APNS_CONFIG = STATE / "apns.json"
+RELAY_URL = os.environ.get("HERMIT_RELAY_URL", "https://hermit-relay.vercel.app")
 HTTP_PORT = 8650
 UDP_PORT = 8651
 MAX_IMAGE = 2_000_000
@@ -533,7 +534,9 @@ def live_payload(state: dict, end: bool = False, alert: str | None = None) -> di
 
 
 def live_send(entry: dict, payload: dict, priority: int) -> None:
-    if not APNS_CONFIG.exists():
+    if use_relay():
+        state = payload["aps"]
+        print(f"live activity {state['event']} {state['content-state']['phase']}: {relay_send(entry, 'liveactivity', payload, priority)}", flush=True)
         return
     config = json.loads(APNS_CONFIG.read_text())
     host = "api.sandbox.push.apple.com" if entry.get("sandbox") else "api.push.apple.com"
@@ -1581,6 +1584,60 @@ def save_devices(devices: list[dict]) -> None:
     DEVICES.chmod(0o600)
 
 
+def use_relay() -> bool:
+    """Most people have no Apple key of their own, so their pushes go through Hermit's relay."""
+    return os.environ.get("HERMIT_USE_RELAY") == "1" or not APNS_CONFIG.exists()
+
+
+def relay_post(path: str, body: dict) -> tuple[int, dict]:
+    request = urllib.request.Request(RELAY_URL + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        return error.code, {}
+    except (OSError, ValueError):
+        return 0, {}
+
+
+def relay_token(entry: dict) -> str | None:
+    """Fetched once per device. The relay keeps no list of devices, so this signed token is the only record."""
+    if not entry.get("relay_token"):
+        status, answer = relay_post("/api/register", {"token": entry["token"], "sandbox": bool(entry.get("sandbox"))})
+        if status == 200:
+            entry["relay_token"] = answer.get("relay_token")
+    return entry.get("relay_token")
+
+
+def sealed_alert(device: dict, payload: dict) -> dict:
+    """What the relay and Apple see: a generic alert. The phone's notification extension opens the rest."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    aps = payload["aps"]
+    alert = aps["alert"]
+    outer_aps = {"alert": {"title": "Hermit", "body": "New message"}, "sound": aps.get("sound"), "badge": aps.get("badge"),
+                 "thread-id": "hermit", "mutable-content": 1}
+    if aps.get("category"):
+        outer_aps["category"] = aps["category"]
+    sealed = {"aps": outer_aps}
+    if device.get("push_key"):
+        secret = {**{k: v for k, v in payload.items() if k not in ("aps", "avatar")}, "title": alert.get("title"),
+                  "body": alert.get("body"), "subtitle": alert.get("subtitle"), "thread": aps.get("thread-id")}
+        nonce = os.urandom(12)
+        box = AESGCM(base64.b64decode(device["push_key"])).encrypt(nonce, json.dumps(secret).encode(), None)
+        sealed["enc"] = base64.b64encode(nonce + box).decode()
+        if payload.get("avatar") and len(json.dumps(sealed)) + len(payload["avatar"]) < 3900:
+            sealed["avatar"] = payload["avatar"]
+    return sealed
+
+
+def relay_send(entry: dict, kind: str, payload: dict, priority: int = 10) -> str:
+    token = relay_token(entry)
+    if not token:
+        return "0"
+    return str(relay_post("/api/push", {"relay_token": token, "type": kind, "payload": payload, "priority": priority})[0])
+
+
 def apns_token(config: dict) -> str:
     key = pathlib.Path(config["key_path"]).expanduser().read_text()
     return jwt.encode({"iss": config["team_id"], "iat": int(time.time())}, key, algorithm="ES256",
@@ -1611,9 +1668,8 @@ def small_avatar(home: pathlib.Path) -> str | None:
 def push(profile: str, reply: str, data: dict | None = None, category: str | None = None,
          routine: str | None = None) -> None:
     """`category` picks the buttons the app shows: Allow and Deny, a question's choices, or Reply."""
-    if not APNS_CONFIG.exists():
-        return
-    config = json.loads(APNS_CONFIG.read_text())
+    relay = use_relay()
+    config = None if relay else json.loads(APNS_CONFIG.read_text())
     title = bot_info(profile, homes()[profile])["title"] or profile.replace("-", " ").title()
     payload = {"aps": {"alert": {"title": title, "body": plain_text(reply)}, "sound": "default", "badge": badge_count(),
                        "thread-id": profile, "mutable-content": 1}, "profile": profile, **(data or {})}
@@ -1624,11 +1680,17 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
     if avatar := small_avatar(homes()[profile]):
         payload["avatar"] = avatar
     body = json.dumps(payload)
-    authorization = apns_token(config)
+    authorization = None if relay else apns_token(config)
     remaining = []
     for device in load_devices():
         if is_muted(device, profile, routine):
             remaining.append(device)
+            continue
+        if relay:
+            status = relay_send(device, "alert", sealed_alert(device, payload))
+            if status != "410":
+                remaining.append(device)
+            print(f"push {profile}: {status}", flush=True)
             continue
         host = "api.sandbox.push.apple.com" if device.get("sandbox") else "api.push.apple.com"
         # macOS curl speaks HTTP/2, which APNs requires. The token stays out of the process list.
@@ -1718,7 +1780,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/status":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
-            return self.json(200, {"push": APNS_CONFIG.exists(), "hermes": hermes_compatibility()})
+            return self.json(200, {"push": True, "hermes": hermes_compatibility()})
         if match := re.fullmatch(r"/avatars/([a-z0-9_-]+)\.png", url.path):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -2205,10 +2267,12 @@ class Handler(BaseHTTPRequestHandler):
         until = body.get("muted_until") if isinstance(body.get("muted_until"), dict) else {}
         muted_until = {str(name)[:64]: float(end) for name, end in list(until.items())[:64]
                        if isinstance(end, (int, float)) and end > time.time()}
+        push_key = str(body.get("push_key") or "")
         devices.append({"token": token, "sandbox": bool(body.get("sandbox")), "muted": muted,
-                        "muted_routines": muted_routines, "muted_until": muted_until})
+                        "muted_routines": muted_routines, "muted_until": muted_until,
+                        **({"push_key": push_key} if re.fullmatch(r"[A-Za-z0-9+/]{43}=", push_key) else {})})
         save_devices(devices)
-        self.json(200, {"ok": True, "push": APNS_CONFIG.exists()})
+        self.json(200, {"ok": True, "push": True})
 
 
 class Server(ThreadingHTTPServer):
