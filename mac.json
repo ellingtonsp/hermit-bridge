@@ -1,0 +1,9 @@
+{
+ "version": "1.0",
+ "build": 11,
+ "file": "Hermit-1.0-11.dmg",
+ "sha256": "743929262fb35403186e003b24d6e5a42b4230685cc85192d83f4db912429e81",
+ "notes": "One-paste setup, smoother chats, slash commands, per-chat model and thinking, file links, and updates that verify themselves.",
+ "size": 19567105,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-11/Hermit-1.0-11.dmg"
+}
