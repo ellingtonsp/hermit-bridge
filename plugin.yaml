@@ -1,0 +1,11 @@
+name: hermit
+version: "0.16.0"
+description: Connect the Hermit iPhone, iPad and Mac app to your Hermes agents
+provides_tools:
+  - hermes_card
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - on_stream_delta
+  - on_stream_end
