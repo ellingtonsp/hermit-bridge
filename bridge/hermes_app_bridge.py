@@ -594,6 +594,15 @@ def live_payload(state: dict, end: bool = False, alert: str | None = None) -> di
     return {"aps": aps}
 
 
+def push_topic(value: object, fallback: str) -> str:
+    """The app a push is for. A Dev build has its own ID, and Apple rejects a push sent under another's.
+
+    The value goes into a request header, so anything but a plain bundle ID falls back to the configured one.
+    """
+    text = str(value or "")
+    return text if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{2,150}", text) else fallback
+
+
 def live_send(entry: dict, payload: dict, priority: int) -> None:
     if use_relay():
         state = payload["aps"]
@@ -605,7 +614,7 @@ def live_send(entry: dict, payload: dict, priority: int) -> None:
         ["curl", "-s", "--http2", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "-K", "-",
          "-d", json.dumps(payload), f"https://{host}/3/device/{entry['token']}"],
         input=f'header = "authorization: bearer {apns_token(config)}"\n'
-              f'header = "apns-topic: {config["topic"]}.push-type.liveactivity"\n'
+              f'header = "apns-topic: {push_topic(entry.get("topic"), config["topic"])}.push-type.liveactivity"\n'
               f'header = "apns-push-type: liveactivity"\nheader = "apns-priority: {priority}"\n',
         capture_output=True, text=True)
     state = payload["aps"]
@@ -1759,7 +1768,7 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
             ["curl", "-s", "--http2", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "-K", "-",
              "-d", body, f"https://{host}/3/device/{device['token']}"],
             input=f'header = "authorization: bearer {authorization}"\n'
-                  f'header = "apns-topic: {config["topic"]}"\nheader = "apns-push-type: alert"\n',
+                  f'header = "apns-topic: {push_topic(device.get("topic"), config["topic"])}"\nheader = "apns-push-type: alert"\n',
             capture_output=True, text=True)
         if result.stdout.strip() != "410":
             remaining.append(device)
@@ -2063,7 +2072,8 @@ class Handler(BaseHTTPRequestHandler):
         if not session_id or not re.fullmatch(r"[0-9a-f]{32,400}", token):
             return self.json(400, {"error": "invalid token"})
         with live_lock:
-            live[session_id] = {"token": token, "sandbox": bool(fields.get("sandbox")), "profile": profile}
+            live[session_id] = {"token": token, "sandbox": bool(fields.get("sandbox")), "profile": profile,
+                                    "topic": push_topic(fields.get("topic"), "")}
         self.json(200, {"ok": True})
 
     def mail_send(self, header) -> None:
@@ -2343,6 +2353,7 @@ class Handler(BaseHTTPRequestHandler):
                        if isinstance(end, (int, float)) and end > time.time()}
         push_key = str(body.get("push_key") or "")
         devices.append({"token": token, "sandbox": bool(body.get("sandbox")), "muted": muted,
+                        "topic": push_topic(body.get("topic"), ""),
                         "muted_routines": muted_routines, "muted_until": muted_until,
                         **({"push_key": push_key} if re.fullmatch(r"[A-Za-z0-9+/]{43}=", push_key) else {})})
         save_devices(devices)
