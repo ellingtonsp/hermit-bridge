@@ -853,6 +853,86 @@ def bot_file(home: pathlib.Path, raw: str, is_default: bool) -> pathlib.Path | N
     return real if bot_file_allowed(home, real, is_default) else None
 
 
+REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def session_request(action: str, fields: dict) -> tuple[str, dict]:
+    """The Hermes call for one of the app's chat controls. Only these are reachable, with only these inputs."""
+    if action == "context":
+        return "session.context_breakdown", {}
+    if action == "commands":
+        return "commands.catalog", {}
+    if action == "helpers":
+        return "subagent.list", {}
+    if action == "stop_helper":
+        helper = str(fields.get("helper") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", helper):
+            raise ValueError("Which helper?")
+        return "subagent.interrupt", {"subagent_id": helper}
+    if action == "slash":
+        command = str(fields.get("command") or "").strip()
+        if not re.fullmatch(r"/[A-Za-z][\w.-]*(?: [^\r\n\0]{0,2000})?", command):
+            raise ValueError("That isn't a command.")
+        return "slash.exec", {"command": command}
+    if action == "undo":
+        message = fields.get("message")
+        if not isinstance(message, int) or isinstance(message, bool) or message <= 0:
+            raise ValueError("Which message?")
+        return "session.mutate", {"operation": "rewind", "payload": {"target_message_id": message}}
+    if action == "reasoning":
+        effort = fields.get("effort")
+        if effort is not None and effort not in REASONING_EFFORTS:
+            raise ValueError("That isn't a thinking effort.")
+        return "session.mutate", {"operation": "reasoning", "payload": {"effort": effort}}
+    if action == "model":
+        model, provider = str(fields.get("model") or "").strip(), str(fields.get("provider") or "").strip()
+        if not re.fullmatch(r"[\w./:@-]{1,200}", model) or (provider and not re.fullmatch(r"[\w./:@-]{1,80}", provider)):
+            raise ValueError("That isn't a model.")
+        payload = {"model": model, **({"provider": provider} if provider else {})}
+        if isinstance(fields.get("confirm"), str) and fields["confirm"]:
+            payload["confirm"] = fields["confirm"][:200]
+        return "session.mutate", {"operation": "model", "payload": payload}
+    raise ValueError("Hermit doesn't know that control.")
+
+
+def session_reply(method: str, result) -> dict:
+    """What the app needs from a reply, and nothing else Hermes happened to include."""
+    result = result if isinstance(result, dict) else {}
+    if method == "commands.catalog":
+        commands = [{"name": pair[0], "description": pair[1]} for pair in result.get("pairs") or []
+                    if isinstance(pair, list) and len(pair) >= 2 and isinstance(pair[0], str) and pair[0].startswith("/")]
+        return {"commands": commands[:400]}
+    if method == "session.context_breakdown":
+        return {"max": result.get("context_max"), "percent": result.get("context_percent"),
+                "categories": [{"label": c.get("label"), "tokens": c.get("tokens")}
+                               for c in result.get("categories") or [] if isinstance(c, dict)]}
+    if method == "slash.exec":
+        return {key: result.get(key) for key in ("output", "warning", "type", "message", "notice", "target") if result.get(key)}
+    if method == "subagent.list":
+        return {"helpers": [{key: s.get(key) for key in ("subagent_id", "delegation_id", "goal", "model", "status", "last_tool", "started_at")}
+                            for s in result.get("subagents") or [] if isinstance(s, dict)]}
+    if method == "subagent.interrupt":
+        return {"found": bool(result.get("found"))}
+    keep = ("operation", "effort", "rewound_count", "model", "provider", "confirm_required", "confirm_message", "confirm", "warning")
+    return {key: result.get(key) for key in keep if result.get(key) is not None} | {"ok": True}
+
+
+def session_refusal(error: Exception) -> str:
+    """Hermes's reason codes, in words."""
+    reason = str(error)
+    for code, words in (("permission_denied", "Hermes doesn't allow that in this chat."),
+                        ("unsupported_command", "That command only works in the Hermes terminal."),
+                        ("session_busy", "Wait for the bot to finish, then try again."),
+                        ("revision_conflict", "The chat changed just then. Try again."),
+                        ("stale_generation", "The chat changed just then. Try again."),
+                        ("runtime_draining", "Hermes is restarting. Try again in a minute."),
+                        ("runtime_coordination_required", "Hermes can't do that to this chat right now."),
+                        ("unknown_method", "This Hermes is too old for that. Update Hermes.")):
+        if code in reason:
+            return words
+    return "Hermes couldn't complete that."
+
+
 def file_version(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
@@ -2223,6 +2303,8 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.guarded(start_bridge_update)
+        if path == "/controls/session":
+            return self.session_action(header)
         if path in ("/controls/respond", "/controls/stop", "/controls/correct"):
             return self.control_action(path, header)
         if path == "/mail/send":
@@ -2358,6 +2440,40 @@ class Handler(BaseHTTPRequestHandler):
                         failed.append(name)
             return {"ok": True, "failed": failed}
         self.guarded(apply)
+
+    def session_action(self, header: str | None) -> None:
+        """Hermes's own controls for one chat: slash commands, undo, thinking effort and what fills the context."""
+        fields = json.loads(self.body() or b"{}")
+        profile, session_id = str(fields.get("profile") or ""), str(fields.get("session") or "")
+        if profile not in homes() or not authorized(header, profile):
+            return self.json(401, {"error": {"message": "unauthorized"}})
+        if session_title(homes()[profile], session_id) is None:
+            return self.json(404, {"error": {"message": "That chat wasn't found."}})
+        try:
+            method, params = session_request(str(fields.get("action") or ""), fields)
+        except ValueError as error:
+            return self.json(400, {"error": {"message": str(error)}})
+
+        def act():
+            watch = watcher(profile, session_id)
+            if method == "session.mutate":
+                # Hermes refuses an edit made against a stale copy of the chat, so read its counters first.
+                home = homes()[profile]
+                scope = {} if is_standalone(home) or profile == "default" else {"profile": profile}
+                state = gateway_rpc("session.resume", home if is_standalone(home) else None,
+                                    session_id=session_id, omit_messages=True, **scope)
+                if state.get("running"):
+                    raise VoiceError("Wait for the bot to finish, then try again.")
+                params.update(request_id=str(uuid.uuid4()), expected_revision=state.get("revision"),
+                              expected_generation=state.get("execution_generation"))
+            return session_reply(method, watch.call(method, **params))
+        try:
+            self.json(200, act())
+        except VoiceError as error:
+            self.json(409, {"error": {"message": str(error)}})
+        except Exception as error:
+            print(f"session action {fields.get('action')}: {type(error).__name__}: {error}", flush=True)
+            self.json(502, {"error": {"message": session_refusal(error)}})
 
     def control_action(self, path: str, header: str | None) -> None:
         fields = json.loads(self.body() or b"{}")
