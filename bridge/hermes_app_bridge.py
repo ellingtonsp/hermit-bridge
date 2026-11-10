@@ -693,12 +693,22 @@ def approval_push(session_id: str, payload: dict, generation: int | None) -> dic
                      "generation": generation}, "category": "hermit.approval"}
 
 
+def closed_cards(profile: str, session_id: str) -> set[str]:
+    """Cards answered or dismissed in the app, which no longer wait on anyone."""
+    prefix = f"{inbox_key(profile, session_id)}:"
+    with inbox_lock:
+        return {key.rsplit(":", 1)[1] for key in load_inbox().get("closed", {}) if key.startswith(prefix)}
+
+
 def reply_push(profile: str, session_id: str, reply: str, routine: str | None = None) -> None:
-    """A finished reply. If it ends on a question card, its choices become the notification's buttons."""
+    """A finished reply. If it ends on a question card, its choices become the notification's buttons.
+
+    Only a card from this reply counts. An older card that was never answered used to take over every
+    later notification, so the new message never showed."""
     time.sleep(LIVE_CARD_SECONDS)  # the card's row can land just after the turn event
     home = homes().get(profile)
-    needs = session_counts(home, session_id, time.time())[1] if home else []
-    question = next((n for n in needs if n["kind"] == "question" and n.get("options")), None)
+    needs = session_counts(home, session_id, time.time(), closed_cards(profile, session_id))[1] if home else []
+    question = next((n for n in needs if n["kind"] == "question" and n.get("options") and n.get("fresh")), None)
     if question:
         push(profile, question["title"] or reply,
              {"session": session_id, "card": question["card"], "title": question["title"],
@@ -1511,6 +1521,10 @@ def inbox_key(profile: str, session_id: str) -> str:
     return f"{profile}:{session_id}"
 
 
+# How long after a card a reply can still be "its" reply. Long enough for a slow turn to finish.
+FRESH_CARD_SECONDS = 1800
+
+
 def card_need(content: str | None) -> dict | None:
     """What a card is asking of you, if it has buttons that reply to the agent."""
     try:
@@ -1567,13 +1581,19 @@ def session_counts(home: pathlib.Path, session_id: str, read_at: float,
     except sqlite3.Error:
         return 0, []
     needs, said = [], set()
-    for row_id, role, tool, content, _stamp in rows:  # newest first, so `said` holds what came after
+    replies_since, now = 0, time.time()
+    for row_id, role, tool, content, stamp in rows:  # newest first, so `said` holds what came after
         if role == "user":
             said.add(reply_text(content))
+        elif role == "assistant" and not tool and str(content or "").strip():
+            replies_since += 1
         elif tool == "hermes_card" and str(row_id) not in (closed or set()) and (need := card_need(content)):
             answers = set(need.pop("answers")) | set(CARD_RESULTS)
             if not answers & said:
                 need["card"] = str(row_id)
+                # From the turn that just ended: nothing said by you since, at most its own reply after it,
+                # and recent. An older card still waits in the inbox, but it isn't this reply's question.
+                need["fresh"] = not said and replies_since <= 1 and now - float(stamp or 0) <= FRESH_CARD_SECONDS
                 needs.append(need)
     return unread, needs
 
@@ -1584,6 +1604,8 @@ def inbox_item(profile: str, session_id: str, state: dict) -> dict:
     read_at = state["read"].setdefault(key, time.time())
     closed = {key.rsplit(":", 1)[1] for key in state.get("closed", {}) if key.startswith(f"{inbox_key(profile, session_id)}:")}
     unread, needs = session_counts(homes()[profile], session_id, read_at, closed)
+    # Whether a card belongs to the latest reply only matters to notifications.
+    needs = [{name: value for name, value in need.items() if name != "fresh"} for need in needs]
     if key in state["marked"]:
         unread = max(unread, 1)
     with lock:
