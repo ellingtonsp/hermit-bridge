@@ -85,7 +85,7 @@ def refresh():
     while True:
         try:
             request = urllib.request.Request("https://api.example.com/v1/thing",
-                                             headers={"Authorization": "Bearer " + os.environ["EXAMPLE_TOKEN"]})
+                                             headers={"Authorization": "Bearer " + os.getenv("EXAMPLE_TOKEN")})
             with urllib.request.urlopen(request, timeout=10) as reply:
                 data = json.load(reply)
             state.update(value=data["value"], updated=time.time(), problem=None)
@@ -95,8 +95,8 @@ def refresh():
         time.sleep(60)
 
 def set_status(values):
-    request = urllib.request.Request(os.environ["HERMIT_STATUS_URL"], data=json.dumps({"set": values}).encode(),
-                                     headers={"Authorization": "Bearer " + os.environ["HERMIT_STATUS_TOKEN"],
+    request = urllib.request.Request(os.getenv("HERMIT_STATUS_URL"), data=json.dumps({"set": values}).encode(),
+                                     headers={"Authorization": "Bearer " + os.getenv("HERMIT_STATUS_TOKEN"),
                                               "Content-Type": "application/json"})
     try:
         urllib.request.urlopen(request, timeout=5).close()
@@ -118,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 threading.Thread(target=refresh, daemon=True).start()
-ThreadingHTTPServer(("127.0.0.1", int(os.environ["PORT"])), Handler).serve_forever()
+ThreadingHTTPServer(("127.0.0.1", int(os.getenv("PORT"))), Handler).serve_forever()
 ```
 
 ## Secrets
@@ -129,7 +129,7 @@ ThreadingHTTPServer(("127.0.0.1", int(os.environ["PORT"])), Handler).serve_forev
 - **Never ask the user to paste a key in chat.** If one is missing, the app shows a field for it when they
   open the mini app. Tell them which name it will ask for and where to get the key.
 - **Never write a secret into a file, the page, `data.json`, a log line or your reply.** The server reads
-  it from `os.environ` and nowhere else.
+  it with `os.getenv` and nowhere else.
 - **Never send a secret to the page.** The page gets results, not credentials. Check every `/api/` answer.
 - **Hermes's own keys are off limits**: this bot's key, model provider keys, and names starting with
   `HERMES_`, `GATEWAY_`, `AUXILIARY_` or `HERMIT_`. Asking for one stops the server from starting.
