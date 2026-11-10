@@ -1,9 +1,9 @@
 {
  "version": "1.0",
- "build": 12,
- "file": "Hermit-1.0-12.dmg",
- "sha256": "dd016f675b3bc8737e617547d2c3180584b64b867423c01e7a36fafd7c6e41f1",
- "notes": "Live helper progress, routines in plain words with pickers, skills you can edit and add, new bots that pair themselves, a hub behind the grid button, and clearer model choices.",
- "size": 19757984,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-12/Hermit-1.0-12.dmg"
+ "build": 16,
+ "file": "Hermit-1.0-16.dmg",
+ "sha256": "f6adf4fcb56977c0b4b589f397562b05e8e4932d2ed3641e99c08c56b18dd878",
+ "notes": "Voice calls now connect on mobile networks such as T-Mobile, and a call that can't connect says why instead of waiting on Connecting.",
+ "size": 20155464,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-16/Hermit-1.0-16.dmg"
 }
