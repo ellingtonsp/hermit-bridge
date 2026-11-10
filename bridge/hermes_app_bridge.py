@@ -12,6 +12,7 @@ import fcntl
 import glob
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import pathlib
@@ -499,7 +500,7 @@ class Watcher:
         model = read_yaml(self.home / "config.yaml").get("model")
         return {"running": self.running, "generation": self.generation, "pending": list(self.pending.values()),
                 "context": self.context or None, "model": model.get("default") if isinstance(model, dict) else None,
-                "status": bot_status(self.home), "apps": mini_apps(self.home)}
+                "status": bot_status(self.home, bar_prefs(self.profile)), "apps": mini_apps(self.home)}
 
 
 def watcher(profile: str, session_id: str) -> Watcher:
@@ -975,18 +976,106 @@ mini_app_tickets: dict[str, dict] = {}
 mini_app_lock = threading.Lock()
 
 
-def bot_status(home: pathlib.Path) -> dict | None:
-    """The line a bot pinned under its chat's header, cleaned again here since it's just a file."""
+# The status bar. Three things can fill it: the bot (its status tool), a feed the Mac polls, and the
+# bot's mini apps. The owner's switches live in the bridge's own folder, where a bot has no reason to
+# write; what the bot arranges (order, hidden values, the feed) lives in its folder so it can read it.
+BARS = STATE / "bars.json"
+BAR_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,23}")
+BAR_SOURCES = ("bot", "feed", "app")
+BAR_VALUES = 8
+BAR_VALUE = 40
+FEED_LIMIT = 256 * 1024
+FEED_SHORTEST, FEED_USUAL, FEED_LONGEST = 60, 300, 24 * 3600
+bars_lock = threading.Lock()
+feed_checked: dict[str, tuple[str, float]] = {}
+
+
+def bar_prefs(profile: str) -> dict:
+    """The owner's switches for one bot's status bar. Everything is on until they turn it off."""
+    try:
+        saved = read_json(BARS).get(profile)
+    except (OSError, ValueError):
+        saved = None
+    saved = saved if isinstance(saved, dict) else {}
+    return {name: saved.get(name) is not False for name in ("show", *BAR_SOURCES)}
+
+
+def bar_names(value) -> list[str]:
+    names = [str(name).strip().lower() for name in value] if isinstance(value, list) else []
+    return list(dict.fromkeys(name for name in names if BAR_KEY.fullmatch(name)))[:40]
+
+
+def feed_config(value) -> dict | None:
+    """A feed as the bridge will poll it, or None when it isn't one."""
+    if not isinstance(value, dict) or not isinstance(value.get("values"), dict):
+        return None
+    address = str(value.get("url") or "")
+    if not address.lower().startswith("https://") or len(address) > 2000 or re.search(r"\s", address):
+        return None
+    values = {str(key).strip().lower(): str(template)[:200] for key, template in value["values"].items()}
+    values = {key: template for key, template in list(values.items())[:BAR_VALUES] if BAR_KEY.fullmatch(key) and template.strip()}
+    if not values:
+        return None
+    try:
+        every = int(value.get("every") or FEED_USUAL)
+    except (TypeError, ValueError):
+        every = FEED_USUAL
+    return {"url": address, "every": max(FEED_SHORTEST, min(FEED_LONGEST, every)), "values": values}
+
+
+def bar_config(home: pathlib.Path) -> dict:
+    """What's arranged for this bot's bar, cleaned, since it's just a file in the bot's folder."""
+    try:
+        saved = json.loads((home / "hermit" / "bar.json").read_text())
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    return {"order": bar_names(saved.get("order")), "hidden": bar_names(saved.get("hidden")), "feed": feed_config(saved.get("feed"))}
+
+
+def bar_filled(home: pathlib.Path) -> dict:
+    """Values the feed and the mini apps put in, which the bridge keeps apart from the bot's own."""
+    try:
+        saved = json.loads((home / "hermit" / "bar-values.json").read_text())
+    except (OSError, ValueError):
+        saved = {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def bar_text(value) -> str:
+    return " ".join(str(value if value is not None else "").split())[:BAR_VALUE]
+
+
+def bar_values(home: pathlib.Path) -> tuple[list[dict], dict]:
+    """Every value on this bot's bar with where it came from, in the order to show them, and what the bot saved."""
     try:
         saved = json.loads((home / "hermit" / "status.json").read_text())
     except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    filled, config = bar_filled(home), bar_config(home)
+    found: dict[str, dict] = {}
+    # A later source takes a name over where it already stands, so a feed can keep a value the bot started.
+    for source, values in (("bot", saved.get("values")), ("app", filled.get("app")), ("feed", filled.get("feed"))):
+        for key, value in (values.items() if isinstance(values, dict) else []):
+            if BAR_KEY.fullmatch(str(key)) and bar_text(value):
+                found[str(key)] = {"key": str(key), "text": bar_text(value), "source": source}
+    first = [found[key] for key in config["order"] if key in found]
+    rest = [value for key, value in found.items() if key not in config["order"]]
+    hidden = set(config["hidden"])
+    return [value | {"hidden": value["key"] in hidden} for value in first + rest], saved
+
+
+def bot_status(home: pathlib.Path, prefs: dict | None = None) -> dict | None:
+    """The line under a chat's header: this bot's values from whoever the owner lets fill them."""
+    prefs = prefs or {name: True for name in ("show", *BAR_SOURCES)}
+    if not prefs["show"]:
         return None
-    if not isinstance(saved, dict):
-        return None
-    # Named values in the order the bot first set them, or its single sentence.
-    values = saved.get("values") if isinstance(saved.get("values"), dict) else {}
-    parts = [" ".join(str(value).split())[:40] for value in list(values.values())[:8] if str(value).strip()]
-    text = (" · ".join(parts) if parts else " ".join(str(saved.get("text") or "").split()))[:140]
+    values, saved = bar_values(home)
+    parts = [value["text"] for value in values if not value["hidden"] and prefs[value["source"]]][:BAR_VALUES]
+    # With no named values the bot's single sentence stands in.
+    sentence = " ".join(str(saved.get("text") or "").split()) if prefs["bot"] and not values else ""
+    text = (" · ".join(parts) if parts else sentence)[:140]
     if not text:
         return None
     status = {"text": text}
@@ -996,6 +1085,206 @@ def bot_status(home: pathlib.Path) -> dict | None:
     if MINI_APP_NAME.fullmatch(app) and (home / "hermit" / "apps" / app / "index.html").is_file():
         status["app"] = app
     return status
+
+
+def bar_settings(profile: str) -> dict:
+    """Everything the app's status bar screen shows for one bot."""
+    home = homes()[profile]
+    prefs, config, filled = bar_prefs(profile), bar_config(home), bar_filled(home)
+    values, _ = bar_values(home)
+    feed = None
+    if config["feed"]:
+        feed = {"host": urlparse(config["feed"]["url"]).hostname or "", "every": config["feed"]["every"],
+                "at": filled.get("feed_at") if isinstance(filled.get("feed_at"), (int, float)) else None,
+                "problem": str(filled.get("feed_problem") or "")[:200] or None}
+    return {"show": prefs["show"], "sources": {name: prefs[name] for name in BAR_SOURCES}, "values": values, "feed": feed,
+            "text": (bot_status(home, prefs) or {}).get("text")}
+
+
+def change_bar(profile: str, fields: dict) -> dict:
+    """The owner's changes from the app: their switches, the order, what's hidden, and the feed's pace."""
+    home = homes()[profile]
+    with bars_lock:
+        switches = {name: fields[name] for name in ("show",) if isinstance(fields.get(name), bool)}
+        sources = fields.get("sources") if isinstance(fields.get("sources"), dict) else {}
+        switches |= {name: sources[name] for name in BAR_SOURCES if isinstance(sources.get(name), bool)}
+        if switches:
+            try:
+                everyone = read_json(BARS)
+            except (OSError, ValueError):
+                everyone = {}
+            everyone[profile] = (everyone.get(profile) if isinstance(everyone.get(profile), dict) else {}) | switches
+            STATE.mkdir(parents=True, exist_ok=True)
+            write_json(BARS, everyone)
+        path = home / "hermit" / "bar.json"
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            saved = {}
+        saved = saved if isinstance(saved, dict) else {}
+        before = json.dumps(saved, sort_keys=True)
+        for name in ("order", "hidden"):
+            if isinstance(fields.get(name), list):
+                saved[name] = bar_names(fields[name])
+        if "feed" in fields and fields["feed"] is None:
+            saved.pop("feed", None)
+            drop_feed_values(home)
+        elif isinstance(fields.get("feed"), dict) and isinstance(saved.get("feed"), dict):
+            # Only the pace: where a feed reads from is the bot's to set, where the owner can read it in chat.
+            try:
+                saved["feed"]["every"] = max(FEED_SHORTEST, min(FEED_LONGEST, int(fields["feed"].get("every"))))
+            except (TypeError, ValueError):
+                pass
+        if json.dumps(saved, sort_keys=True) != before:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(path, saved)
+    feed_checked.pop(profile, None)
+    return bar_settings(profile)
+
+
+def save_filled(home: pathlib.Path, change) -> None:
+    with bars_lock:
+        filled = bar_filled(home)
+        change(filled)
+        (home / "hermit").mkdir(parents=True, exist_ok=True)
+        write_json(home / "hermit" / "bar-values.json", filled)
+
+
+def drop_feed_values(home: pathlib.Path) -> None:
+    filled = bar_filled(home)
+    if any(name in filled for name in ("feed", "feed_at", "feed_problem")):
+        write_json(home / "hermit" / "bar-values.json", {k: v for k, v in filled.items() if not k.startswith("feed")})
+
+
+def app_sets_bar(profile: str, fields: dict) -> dict:
+    """A mini app changing values on its bot's bar, when the owner lets mini apps do that."""
+    home = homes()[profile]
+    name = str(fields.get("app") or "")
+    if not any(app["name"] == name for app in mini_apps(home)):
+        raise FileProblem(404, "That mini app isn't there any more.")
+    if not bar_prefs(profile)["app"]:
+        raise FileProblem(403, "Mini apps are switched off for this bot's status bar.")
+    changes = fields.get("set") if isinstance(fields.get("set"), dict) else {}
+    cleaned = {str(key).strip().lower(): bar_text(value) for key, value in list(changes.items())[:BAR_VALUES]}
+    if any(not BAR_KEY.fullmatch(key) for key in cleaned):
+        raise FileProblem(400, "A value's name can only use lowercase letters, digits, dashes and underscores.")
+
+    def change(filled: dict) -> None:
+        values = filled.get("app") if isinstance(filled.get("app"), dict) else {}
+        for key, value in cleaned.items():
+            values.pop(key, None) if not value else values.update({key: value})
+        for key in bar_names(fields.get("remove")):
+            values.pop(key, None)
+        filled["app"] = dict(list(values.items())[:BAR_VALUES])
+
+    save_filled(home, change)
+    return {"text": (bot_status(home, bar_prefs(profile)) or {}).get("text")}
+
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def feed_address_ok(address: str) -> bool:
+    """True for an https address on the open internet. A feed is chosen by a bot, so it must never reach
+    this Mac, the home network or the tailnet."""
+    parts = urlparse(address)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        return False
+    try:
+        found = socket.getaddrinfo(parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return bool(found) and all(ipaddress.ip_address(entry[4][0].split("%")[0]).is_global for entry in found)
+
+
+def feed_fetch(address: str):
+    """The JSON a feed answers with. Raises ValueError with a reason worth showing the owner."""
+    if not feed_address_ok(address):
+        raise ValueError("The feed's address has to be a public https one.")
+    request = urllib.request.Request(address, headers={"Accept": "application/json", "User-Agent": "status-feed"})
+    try:
+        with urllib.request.build_opener(NoRedirects).open(request, timeout=8) as reply:
+            data = reply.read(FEED_LIMIT + 1)
+    except urllib.error.HTTPError as error:
+        raise ValueError(f"The feed answered {error.code}.") from None
+    except (OSError, ValueError):
+        raise ValueError("The feed couldn't be reached.") from None
+    if len(data) > FEED_LIMIT:
+        raise ValueError("The feed's answer is too big.")
+    try:
+        return json.loads(data)
+    except ValueError:
+        raise ValueError("The feed didn't answer with JSON.") from None
+
+
+def feed_value(template: str, data) -> str | None:
+    """A template such as "{current.temp|round}°" filled from the feed's answer, or None if a part is missing."""
+    missing = False
+
+    def fill(match: re.Match) -> str:
+        nonlocal missing
+        found = data
+        for step in match.group(1).strip().split("."):
+            if isinstance(found, dict) and step in found:
+                found = found[step]
+            elif isinstance(found, list) and re.fullmatch(r"-?\d+", step) and -len(found) <= int(step) < len(found):
+                found = found[int(step)]
+            else:
+                missing = True
+                return ""
+        if isinstance(found, (dict, list)) or found is None:
+            missing = True
+            return ""
+        if match.group(2) and isinstance(found, (int, float)) and not isinstance(found, bool):
+            return str(round(found))
+        return str(found)
+
+    text = bar_text(re.sub(r"\{([^{}|]+)(?:\|(round))?\}", fill, template))
+    return None if missing or not text else text
+
+
+def refresh_feed(profile: str, home: pathlib.Path, feed: dict) -> None:
+    try:
+        data = feed_fetch(feed["url"])
+        values = {key: text for key, template in feed["values"].items() if (text := feed_value(template, data))}
+        problem = None if values else "The feed answered, but none of its values were there."
+    except ValueError as error:
+        values, problem = None, str(error)
+
+    def change(filled: dict) -> None:
+        if values is not None:
+            filled["feed"] = values
+        filled["feed_at"] = time.time()
+        filled.pop("feed_problem", None) if problem is None else filled.update(feed_problem=problem)
+
+    save_filled(home, change)
+
+
+def feeds_due(now: float) -> list[tuple[str, pathlib.Path, dict]]:
+    """Feeds to read now: on, shown, and past their pace or changed since the last read."""
+    due = []
+    for profile, home in homes().items():
+        feed, prefs = bar_config(home)["feed"], bar_prefs(profile)
+        if not feed or not prefs["show"] or not prefs["feed"]:
+            continue
+        mark = json.dumps(feed, sort_keys=True)
+        last = feed_checked.get(profile)
+        if last is None or last[0] != mark or now - last[1] >= feed["every"]:
+            feed_checked[profile] = (mark, now)
+            due.append((profile, home, feed))
+    return due
+
+
+def feed_loop() -> None:
+    while True:
+        try:
+            for profile, home, feed in feeds_due(time.time()):
+                refresh_feed(profile, home, feed)
+        except Exception as error:  # A bad feed must never stop the others.
+            print(f"feed: {error}", flush=True)
+        time.sleep(15)
 
 
 def mini_apps(home: pathlib.Path) -> list[dict]:
@@ -2418,6 +2707,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, {"seed": seed, "faces": [
                 {"kind": kind, "png": base64.b64encode(image).decode()}
                 for kind, image in zip(FACE_KINDS, images)]})
+        if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/bar", url.path):
+            if match.group(1) not in homes() or not authorized(header, match.group(1)):
+                return self.json(401, {"error": {"message": "unauthorized"}})
+            return self.json(200, bar_settings(match.group(1)))
         if url.path == "/controls":
             profile = (query.get("profile") or [""])[0]
             session_id = (query.get("session") or [""])[0]
@@ -2630,6 +2923,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(401, {"error": {"message": "unauthorized"}})
             self.body(4096)
             return self.file_action(lambda: open_mini_app(profile, match.group(2)))
+        if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/bar(/values)?", path):
+            profile = match.group(1)
+            if profile not in homes() or not authorized(header, profile):
+                return self.json(401, {"error": {"message": "unauthorized"}})
+            fields = json.loads(self.body(65536) or b"{}")
+            fields = fields if isinstance(fields, dict) else {}
+            return self.file_action(lambda: (app_sets_bar if match.group(2) else change_bar)(profile, fields))
         if path == "/controls/session":
             return self.session_action(header)
         if path in ("/controls/respond", "/controls/stop", "/controls/correct"):
@@ -2939,4 +3239,5 @@ if __name__ == "__main__":
     os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
     threading.Thread(target=udp_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    threading.Thread(target=feed_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()

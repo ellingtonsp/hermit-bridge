@@ -338,6 +338,7 @@ def handle(args, **_kwargs):
 
 STATUS_TOOL = "hermit_status"
 APP_TOOL = "hermit_mini_app"
+BAR_TOOL = "hermit_status_config"
 MAX_STATUS = 100
 MAX_STATUS_VALUES = 8
 MAX_STATUS_VALUE = 30
@@ -473,8 +474,126 @@ def handle_status(args, **_kwargs):
             path.unlink(missing_ok=True)
             return json.dumps({"cleared": True})
         _write_json(path, status)
-        return json.dumps({"shown": status_line(status), "values": status.get("values") or {},
-                           "note": "The user sees this line under the chat's header. Don't repeat it."})
+        off = _switched_off(_bot_home())
+        note = ("Saved, but the user has switched off " + " and ".join(off) + " for this status bar in the app, so it may not show."
+                if any(word in off for word in ("the whole status bar", "your own updates"))
+                else "The user sees this line under the chat's header. Don't repeat it.")
+        return json.dumps({"shown": status_line(status), "values": status.get("values") or {}, "note": note})
+    except (ValueError, OSError) as exc:
+        return json.dumps({"error": str(exc)})
+
+
+BAR_SCHEMA = {
+    "name": BAR_TOOL,
+    "description": (
+        "Read or change how this chat's status bar in the Hermit app is set up. Call it with nothing to see "
+        "the setup: the order of the values, which are hidden, the feed, and which sources the user has switched "
+        "off. `order` lists value names in the order to show them. `hidden` lists names to keep but not show. "
+        "`feed` has the user's Mac read a public https JSON address on a schedule and fill values from it with "
+        "no turn from you: give `url`, `every` (seconds, 60 at least, 300 usual) and `values`, a map of value "
+        "name to a template such as \"{current.temperature_2m|round}°\", where the braces hold a dotted path "
+        "into the JSON and `|round` rounds a number. Use a feed for numbers that change on their own; keep "
+        "hermit_status for things only you know. `feed_off` removes the feed. A mini app can also set values "
+        "itself with window.hermit.setStatus({name: value}). The user can change all of this in the app, and "
+        "can switch you, the feed or mini apps off, so read the setup before assuming a value is showing."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "order": {"type": "array", "items": {"type": "string"}, "description": "Value names, first to last."},
+            "hidden": {"type": "array", "items": {"type": "string"}, "description": "Value names to keep but not show. Replaces the list."},
+            "feed": {"type": "object", "properties": {
+                "url": {"type": "string"}, "every": {"type": "integer"},
+                "values": {"type": "object", "additionalProperties": {"type": "string"}}},
+                "description": "A public https JSON address for the Mac to read on a schedule."},
+            "feed_off": {"type": "boolean", "description": "Remove the feed."},
+        },
+    },
+}
+
+
+def _names(value) -> list:
+    names = [str(name).strip().lower() for name in value] if isinstance(value, list) else []
+    bad = [name for name in names if not STATUS_KEY.fullmatch(name)]
+    if bad:
+        raise ValueError(f"{bad[0]!r} isn't a usable name: use lowercase letters, digits, dashes or underscores")
+    return list(dict.fromkeys(names))
+
+
+def build_feed(value) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("feed needs url, every and values")
+    link = _https(value.get("url"))
+    if not link:
+        raise ValueError("the feed's url has to be an https link")
+    values = value.get("values") if isinstance(value.get("values"), dict) else {}
+    if not values or len(values) > MAX_STATUS_VALUES:
+        raise ValueError(f"the feed needs between 1 and {MAX_STATUS_VALUES} values, each a name and a template")
+    cleaned = {}
+    for raw_key, template in values.items():
+        key = str(raw_key).strip().lower()
+        if not STATUS_KEY.fullmatch(key):
+            raise ValueError(f"{raw_key!r} isn't a usable name: use lowercase letters, digits, dashes or underscores")
+        if "{" not in str(template) or len(str(template)) > 200:
+            raise ValueError(f"the template for {key} needs a {{path}} into the JSON, and at most 200 characters")
+        cleaned[key] = str(template)
+    try:
+        every = int(value.get("every") or 300)
+    except (TypeError, ValueError):
+        raise ValueError("every has to be a number of seconds") from None
+    return {"url": link, "every": max(60, min(86400, every)), "values": cleaned}
+
+
+def _switched_off(home: Path) -> list:
+    """Sources the user turned off for this bot in the app, read from the bridge's own notes."""
+    profile = home.name if home.parent.name == "profiles" else "default"
+    try:
+        saved = json.loads((Path.home() / ".hermes" / "app-bridge" / "bars.json").read_text()).get(profile)
+    except (OSError, ValueError, AttributeError):
+        return []
+    saved = saved if isinstance(saved, dict) else {}
+    names = {"show": "the whole status bar", "bot": "your own updates", "feed": "the feed", "app": "mini apps"}
+    return [words for name, words in names.items() if saved.get(name) is False]
+
+
+def handle_bar(args, **_kwargs):
+    try:
+        args = args or {}
+        home = _bot_home()
+        path = home / "hermit" / "bar.json"
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            saved = {}
+        saved = saved if isinstance(saved, dict) else {}
+        before = json.dumps(saved, sort_keys=True)
+        if "order" in args:
+            saved["order"] = _names(args.get("order"))
+        if "hidden" in args:
+            saved["hidden"] = _names(args.get("hidden"))
+        if args.get("feed_off"):
+            saved.pop("feed", None)
+        elif "feed" in args:
+            saved["feed"] = build_feed(args.get("feed"))
+        if json.dumps(saved, sort_keys=True) != before:
+            _write_json(path, saved)
+        try:
+            status = json.loads((home / "hermit" / "status.json").read_text())
+        except (OSError, ValueError):
+            status = {}
+        try:
+            filled = json.loads((home / "hermit" / "bar-values.json").read_text())
+        except (OSError, ValueError):
+            filled = {}
+        result = {"order": saved.get("order") or [], "hidden": saved.get("hidden") or [], "feed": saved.get("feed"),
+                  "values": {"yours": (status.get("values") if isinstance(status, dict) else None) or {},
+                             "feed": (filled.get("feed") if isinstance(filled, dict) else None) or {},
+                             "mini_apps": (filled.get("app") if isinstance(filled, dict) else None) or {}},
+                  "switched_off_by_user": _switched_off(home)}
+        if isinstance(filled, dict) and filled.get("feed_problem"):
+            result["feed_problem"] = str(filled["feed_problem"])
+        if "feed" in args and not args.get("feed_off"):
+            result["note"] = "The Mac reads a new feed within about 15 seconds. Call this again to see its values or a problem."
+        return json.dumps(result)
     except (ValueError, OSError) as exc:
         return json.dumps({"error": str(exc)})
 
@@ -618,5 +737,7 @@ def register(ctx):
     # In the same toolset as cards, so a bot that has cards has these without another switch.
     ctx.register_tool(name=STATUS_TOOL, toolset=TOOLSET, schema=STATUS_SCHEMA, handler=handle_status,
                       description=STATUS_SCHEMA["description"], emoji="📌")
+    ctx.register_tool(name=BAR_TOOL, toolset=TOOLSET, schema=BAR_SCHEMA, handler=handle_bar,
+                      description=BAR_SCHEMA["description"], emoji="🎛️")
     ctx.register_tool(name=APP_TOOL, toolset=TOOLSET, schema=APP_SCHEMA, handler=handle_mini_app,
                       description=APP_SCHEMA["description"], emoji="🧩")
