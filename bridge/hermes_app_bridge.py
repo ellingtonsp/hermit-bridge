@@ -498,7 +498,8 @@ class Watcher:
         self.touched = self.polled = time.time()
         model = read_yaml(self.home / "config.yaml").get("model")
         return {"running": self.running, "generation": self.generation, "pending": list(self.pending.values()),
-                "context": self.context or None, "model": model.get("default") if isinstance(model, dict) else None}
+                "context": self.context or None, "model": model.get("default") if isinstance(model, dict) else None,
+                "status": bot_status(self.home), "apps": mini_apps(self.home)}
 
 
 def watcher(profile: str, session_id: str) -> Watcher:
@@ -953,6 +954,94 @@ def session_refusal(error: Exception) -> str:
         if code in reason:
             return words
     return "Hermes couldn't complete that."
+
+
+# ---- A status line and mini apps. Both are files a bot keeps under hermit/ in its own folder.
+
+MINI_APP_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,40}")
+MINI_APP_TYPES = {
+    "html": "text/html; charset=utf-8", "css": "text/css; charset=utf-8", "js": "text/javascript; charset=utf-8",
+    "mjs": "text/javascript; charset=utf-8", "json": "application/json", "txt": "text/plain; charset=utf-8",
+    "csv": "text/csv; charset=utf-8", "md": "text/markdown; charset=utf-8", "svg": "image/svg+xml", "png": "image/png",
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
+    "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf",
+}
+MINI_APP_LIMIT = 10 * 1024 * 1024
+MINI_APP_SECONDS = 2 * 3600
+# A page can use only what's in its own folder. Nothing loads from, or is sent to, anywhere else.
+MINI_APP_POLICY = ("default-src 'self' 'unsafe-inline' data: blob:; connect-src 'self'; form-action 'none'; "
+                   "frame-ancestors 'none'; base-uri 'self'")
+mini_app_tickets: dict[str, dict] = {}
+mini_app_lock = threading.Lock()
+
+
+def bot_status(home: pathlib.Path) -> dict | None:
+    """The line a bot pinned under its chat's header, cleaned again here since it's just a file."""
+    try:
+        saved = json.loads((home / "hermit" / "status.json").read_text())
+    except (OSError, ValueError):
+        return None
+    text = " ".join(str(saved.get("text") or "").split())[:140] if isinstance(saved, dict) else ""
+    if not text:
+        return None
+    status = {"text": text}
+    link, app = str(saved.get("url") or ""), str(saved.get("app") or "")
+    if link.lower().startswith("https://") and len(link) <= 2000 and not re.search(r"\s", link):
+        status["url"] = link
+    if MINI_APP_NAME.fullmatch(app) and (home / "hermit" / "apps" / app / "index.html").is_file():
+        status["app"] = app
+    return status
+
+
+def mini_apps(home: pathlib.Path) -> list[dict]:
+    """Mini apps this bot has: each folder under hermit/apps with a page in it."""
+    root = home / "hermit" / "apps"
+    found = []
+    for folder in sorted(root.iterdir()) if root.is_dir() else []:
+        if not MINI_APP_NAME.fullmatch(folder.name) or folder.is_symlink() or not (folder / "index.html").is_file():
+            continue
+        try:
+            details = json.loads((folder / "app.json").read_text())
+        except (OSError, ValueError):
+            details = {}
+        details = details if isinstance(details, dict) else {}
+        title = " ".join(str(details.get("title") or "").split())[:40] or folder.name.replace("-", " ").title()
+        icon = str(details.get("icon") or "")
+        found.append({"name": folder.name, "title": title,
+                      "icon": icon if re.fullmatch(r"[a-z0-9.]{1,60}", icon) else None})
+    return found[:20]
+
+
+def open_mini_app(profile: str, name: str) -> dict:
+    """A ticket for one mini app. A web view can't send the bot's key with every image and script, so the
+    page is reached through an unguessable address that stops working after two hours."""
+    home = homes()[profile]
+    app = next((a for a in mini_apps(home) if a["name"] == name), None)
+    if app is None:
+        raise FileProblem(404, "That mini app isn't there any more.")
+    ticket, now = secrets.token_urlsafe(32), time.time()
+    with mini_app_lock:
+        for old in [key for key, entry in mini_app_tickets.items() if entry["until"] < now]:
+            del mini_app_tickets[old]
+        mini_app_tickets[ticket] = {"folder": (home / "hermit" / "apps" / name).resolve(), "until": now + MINI_APP_SECONDS}
+    return {"path": f"/apps/{ticket}/index.html", "title": app["title"]}
+
+
+def mini_app_file(ticket: str, relative: str) -> pathlib.Path | None:
+    """The file behind one address in a mini app, or None for anything outside its folder."""
+    with mini_app_lock:
+        entry = mini_app_tickets.get(ticket)
+    if not entry or entry["until"] < time.time():
+        return None
+    parts = pathlib.PurePosixPath(relative or "index.html").parts
+    if not parts or any(part in ("..", "/") or part.startswith(".") for part in parts):
+        return None
+    real = entry["folder"].joinpath(*parts).resolve()
+    if not real.is_relative_to(entry["folder"]) or not real.is_file():
+        return None
+    if real.suffix.lower().lstrip(".") not in MINI_APP_TYPES or real.stat().st_size > MINI_APP_LIMIT:
+        return None
+    return real
 
 
 def file_version(data: bytes) -> str:
@@ -2226,6 +2315,22 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, {"push": True, "hermes": hermes_compatibility()})
+        if match := re.fullmatch(r"/apps/([A-Za-z0-9_-]{20,80})/(.*)", url.path):
+            # No key here by design: the ticket in the address is the permission. See open_mini_app.
+            found = mini_app_file(match.group(1), urllib.parse.unquote(match.group(2)))
+            if found is None:
+                return self.reply(404, b"Not found", "text/plain")
+            data = found.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", MINI_APP_TYPES[found.suffix.lower().lstrip(".")])
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Security-Policy", MINI_APP_POLICY)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if match := re.fullmatch(r"/avatars/([a-z0-9_-]+)\.png", url.path):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -2514,6 +2619,12 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.guarded(start_bridge_update)
+        if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/apps/([a-z0-9-]{2,41})/open", path):
+            profile = match.group(1)
+            if profile not in homes() or not authorized(header, profile):
+                return self.json(401, {"error": {"message": "unauthorized"}})
+            self.body(4096)
+            return self.file_action(lambda: open_mini_app(profile, match.group(2)))
         if path == "/controls/session":
             return self.session_action(header)
         if path in ("/controls/respond", "/controls/stop", "/controls/correct"):

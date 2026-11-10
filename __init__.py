@@ -333,6 +333,124 @@ def handle(args, **_kwargs):
         return json.dumps({"error": str(exc)})
 
 
+# ---- A status line and mini apps for the Hermit app. Both live as plain files in the bot's own folder,
+# under hermit/, so a bot, a routine or the owner can change them with ordinary file tools.
+
+STATUS_TOOL = "hermit_status"
+APP_TOOL = "hermit_mini_app"
+MAX_STATUS = 100
+APP_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,40}")
+
+STATUS_SCHEMA = {
+    "name": STATUS_TOOL,
+    "description": (
+        "Set the one-line status the Hermit app pins under this chat's header, for something the user wants to "
+        "see at a glance without asking: a few live numbers, a build's state, what you're watching. Keep it "
+        "short enough to read in a second. Call it again to update it, and with empty text to remove it. "
+        "Tapping it can open an https link, or one of your mini apps by name."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": f"The line, at most {MAX_STATUS} characters. Empty removes the status."},
+            "url": {"type": "string", "description": "Optional https link to open when the line is tapped."},
+            "app": {"type": "string", "description": "Optional mini app name to open when the line is tapped."},
+        },
+        "required": ["text"],
+    },
+}
+
+APP_SCHEMA = {
+    "name": APP_TOOL,
+    "description": (
+        "Create or look up a mini app: a small web page the Hermit app opens from a button in this chat. "
+        "This returns the folder to write it in. Put an index.html there, plus any css, js, images or json "
+        "it needs, using your normal file tools. Pages are served only from that folder and can't load "
+        "anything from the internet, so keep everything local and write data the page reads, such as "
+        "data.json, into the same folder. In the page, window.hermit offers close(), send(text) to send the "
+        "user's message to you, openLink(url), haptic(), and theme colours as CSS variables like "
+        "--hermit-bg, --hermit-text, --hermit-secondary, --hermit-surface and --hermit-accent."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Lowercase letters, digits and dashes, such as home-os."},
+            "title": {"type": "string", "description": "The button's label, one to three words."},
+            "icon": {"type": "string", "description": "Optional SF Symbol name for the button, such as house or chart.bar."},
+        },
+        "required": ["name"],
+    },
+}
+
+
+def _bot_home() -> Path:
+    """This bot's own folder. Hermes scopes it to the profile whose turn is running."""
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def _write_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value))
+    temporary.replace(path)
+
+
+def build_status(args: dict) -> dict | None:
+    """The status to save, or None to remove it."""
+    text = " ".join(str(args.get("text") or "").split())
+    if not text:
+        return None
+    if len(text) > MAX_STATUS:
+        raise ValueError(f"the status is {len(text)} characters: keep it to {MAX_STATUS}")
+    status = {"text": text, "at": datetime.now().timestamp()}
+    if args.get("url"):
+        link = _https(args.get("url"))
+        if not link:
+            raise ValueError("url has to be an https link")
+        status["url"] = link
+    if args.get("app"):
+        name = str(args.get("app")).strip().lower()
+        if not APP_NAME.fullmatch(name):
+            raise ValueError("app has to be a mini app's name: lowercase letters, digits and dashes")
+        status["app"] = name
+    return status
+
+
+def handle_status(args, **_kwargs):
+    try:
+        status = build_status(args or {})
+        path = _bot_home() / "hermit" / "status.json"
+        if status is None:
+            path.unlink(missing_ok=True)
+            return json.dumps({"cleared": True})
+        _write_json(path, status)
+        return json.dumps({"shown": True, "note": "The user sees this line under the chat's header. Don't repeat it."})
+    except (ValueError, OSError) as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def handle_mini_app(args, **_kwargs):
+    try:
+        name = str((args or {}).get("name") or "").strip().lower()
+        if not APP_NAME.fullmatch(name):
+            raise ValueError("name has to be lowercase letters, digits and dashes, such as home-os")
+        folder = _bot_home() / "hermit" / "apps" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        about = folder / "app.json"
+        details = json.loads(about.read_text()) if about.exists() else {}
+        for key in ("title", "icon"):
+            if _text(args.get(key)):
+                details[key] = _text(args.get(key))[:40]
+        _write_json(about, details)
+        return json.dumps({"folder": str(folder), "has_page": (folder / "index.html").exists(),
+                           "note": "Write index.html and its files in this folder. The app's button appears in this chat "
+                                   "once index.html exists."})
+    except (ValueError, OSError) as exc:
+        return json.dumps({"error": str(exc)})
+
+
 BRIDGE = ("127.0.0.1", 8651)
 MAX_DETAIL = 240
 _socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -449,3 +567,8 @@ def register(ctx):
     ctx.register_hook("on_stream_end", on_stream_end)
     ctx.register_tool(name=TOOL_NAME, toolset=TOOLSET, schema=SCHEMA, handler=handle,
                       description=SCHEMA["description"], emoji="🃏")
+    # In the same toolset as cards, so a bot that has cards has these without another switch.
+    ctx.register_tool(name=STATUS_TOOL, toolset=TOOLSET, schema=STATUS_SCHEMA, handler=handle_status,
+                      description=STATUS_SCHEMA["description"], emoji="📌")
+    ctx.register_tool(name=APP_TOOL, toolset=TOOLSET, schema=APP_SCHEMA, handler=handle_mini_app,
+                      description=APP_SCHEMA["description"], emoji="🧩")
