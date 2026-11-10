@@ -1033,6 +1033,15 @@ def memory_file_lock(real: pathlib.Path):
     return handle
 
 
+def new_skill_path_ok(home: pathlib.Path, relative: str, real: pathlib.Path) -> bool:
+    """A skill the app may create: `skills/<name>/SKILL.md` in the bot's own folder, with a plain name.
+    The shared library and anything nested deeper are left to Hermes."""
+    parts = pathlib.PurePosixPath(relative).parts
+    return (len(parts) == 3 and parts[0] == "skills" and parts[2] == "SKILL.md"
+            and bool(re.fullmatch(r"[a-z0-9][a-z0-9-]{1,48}", parts[1]))
+            and real.is_relative_to(home.resolve() / "skills") and not real.parent.exists())
+
+
 def save_bot_file(profile: str, relative: str, content, version) -> dict:
     home = homes()[profile]
     real = editable_path(home, relative)
@@ -1043,7 +1052,8 @@ def save_bot_file(profile: str, relative: str, content, version) -> dict:
     data = content.encode()
     if len(data) > MAX_FILE:
         raise FileProblem(413, "That's too long to save.")
-    if relative not in FIXED_FILES and not real.exists():
+    creating = relative not in FIXED_FILES and not real.exists()
+    if creating and (version != file_version(b"") or not new_skill_path_ok(home, relative, real)):
         raise FileProblem(404, "That skill no longer exists.")
     if relative not in FIXED_FILES and not re.match(r"---[ \t]*\n(?=.*^name:)(?=.*^description:).*?^---[ \t]*$", content, re.S | re.M):
         raise FileProblem(400, "A skill has to keep its header, with a name and a description, between --- lines.")
@@ -1064,6 +1074,8 @@ def save_bot_file(profile: str, relative: str, content, version) -> dict:
             if real.exists():
                 keep_previous(profile, relative, current)
             mode = real.stat().st_mode & 0o777 if real.exists() else 0o600
+            if creating:
+                real.parent.mkdir(parents=True, exist_ok=True)
             handle, temporary = tempfile.mkstemp(dir=real.parent, prefix=".edit-")
             try:
                 with os.fdopen(handle, "wb") as out:
@@ -1118,6 +1130,20 @@ def claim_pair_code(code: str) -> dict | None:
         bots = [{"profile": name, "key": key} for name, home in homes().items() if (key := api_key(home))]
         PAIR_CODE.unlink(missing_ok=True)
     return {"url": state["url"], "bots": bots}
+
+
+def plugin_ready(home: pathlib.Path) -> bool:
+    """Whether Hermit's plugin is in this bot's folder. Without it the bot can chat, but sends no cards
+    or live progress, and setup has to run again."""
+    return any((home / "plugins" / name).exists() for name in ("hermit", "hermes-cards"))
+
+
+def new_bots(have: list[str]) -> dict:
+    """Keys for bots made since the phone was paired, and the names of any that still need setup."""
+    known = homes()
+    bots = [{"profile": name, "key": key} for name, home in known.items()
+            if name not in have and (key := api_key(home))]
+    return {"bots": bots, "unready": sorted(name for name, home in known.items() if not plugin_ready(home))}
 
 
 def achievements() -> dict:
@@ -1306,7 +1332,8 @@ def job_steps(log: pathlib.Path, limit: int = 400) -> tuple[list[dict], dict]:
         at, kind, text = match.groups()
         if kind == "tool":
             name = text.removeprefix("->").strip().split("(", 1)[0].split(" ", 1)[0]
-            steps.append({"at": at, "kind": "step", "text": live_phrase(name)})
+            steps.append({"at": at, "kind": "step", "text": live_phrase(name),
+                          "tool": re.sub(r"[^A-Za-z0-9_.-]", "", name)[:60]})
         elif kind == "result" and re.search(r"\b(error|failed|traceback)\b", text, re.IGNORECASE):
             steps.append({"at": at, "kind": "problem", "text": "Hit a snag and kept going"})
         elif kind == "assistant" and text.strip():
@@ -1344,6 +1371,10 @@ def helper_jobs(home: pathlib.Path, detail: str | None = None) -> list[dict]:
             tasks.append({"goal": plain_text(str(task.get("goal") or ""))[:160], "status": status,
                           "seconds": ending.get("seconds"), "summary": ending.get("summary"),
                           "now": next((s["text"] for s in reversed(steps) if s["kind"] == "step"), None),
+                          "tool": next((s.get("tool") for s in reversed(steps) if s["kind"] == "step"), None),
+                          # Its own latest words, so the row can say more than which tool is running.
+                          "said": next((s["text"][:200] for s in reversed(steps) if s["kind"] == "note"), None),
+                          "problems": sum(1 for s in steps if s["kind"] == "problem"),
                           "steps": len(steps), **({"timeline": steps} if detail else {}),
                           "updated": log.stat().st_mtime if log.exists() else started})
         running = any(t["status"] == "running" for t in tasks)
@@ -2301,6 +2332,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         header = self.headers.get("Authorization")
+        if path == "/pair/new":
+            # The default bot's key is the owner's, and a phone paired by setup already holds every key.
+            if not authorized(header, "default"):
+                return self.json(401, {"error": {"message": "This needs the default bot's key."}})
+            fields = json.loads(self.body(65536) or b"{}")
+            have = fields.get("have") if isinstance(fields.get("have"), list) else []
+            return self.json(200, new_bots([str(name) for name in have][:500]))
         if path == "/pair/claim":
             fields = json.loads(self.body(4096) or b"{}")
             claimed = claim_pair_code(str(fields.get("code") or ""))
