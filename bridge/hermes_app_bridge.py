@@ -981,7 +981,12 @@ def bot_status(home: pathlib.Path) -> dict | None:
         saved = json.loads((home / "hermit" / "status.json").read_text())
     except (OSError, ValueError):
         return None
-    text = " ".join(str(saved.get("text") or "").split())[:140] if isinstance(saved, dict) else ""
+    if not isinstance(saved, dict):
+        return None
+    # Named values in the order the bot first set them, or its single sentence.
+    values = saved.get("values") if isinstance(saved.get("values"), dict) else {}
+    parts = [" ".join(str(value).split())[:40] for value in list(values.values())[:8] if str(value).strip()]
+    text = (" · ".join(parts) if parts else " ".join(str(saved.get("text") or "").split()))[:140]
     if not text:
         return None
     status = {"text": text}

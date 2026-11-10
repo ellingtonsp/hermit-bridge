@@ -339,23 +339,33 @@ def handle(args, **_kwargs):
 STATUS_TOOL = "hermit_status"
 APP_TOOL = "hermit_mini_app"
 MAX_STATUS = 100
+MAX_STATUS_VALUES = 8
+MAX_STATUS_VALUE = 30
+STATUS_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,23}")
 APP_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,40}")
 
 STATUS_SCHEMA = {
     "name": STATUS_TOOL,
     "description": (
         "Set the one-line status the Hermit app pins under this chat's header, for something the user wants to "
-        "see at a glance without asking: a few live numbers, a build's state, what you're watching. Keep it "
-        "short enough to read in a second. Call it again to update it, and with empty text to remove it. "
-        "Tapping it can open an https link, or one of your mini apps by name."),
+        "see at a glance without asking: a few live numbers, a build's state, what you're watching. "
+        "Prefer `set`: named values you can change one at a time, such as {\"car\": \"🚗 88%\", \"garage\": "
+        "\"closed\"}. Each call only touches the names you give, so the rest stay as they are, and a name set "
+        "to an empty value is removed. Values show in the order they were first set, joined by dots. Use "
+        "`text` for a single sentence in their place. `clear` removes the whole status. Keep it short enough "
+        "to read in a second. Tapping the line can open an https link, or one of your mini apps by name."),
     "parameters": {
         "type": "object",
         "properties": {
-            "text": {"type": "string", "description": f"The line, at most {MAX_STATUS} characters. Empty removes the status."},
-            "url": {"type": "string", "description": "Optional https link to open when the line is tapped."},
-            "app": {"type": "string", "description": "Optional mini app name to open when the line is tapped."},
+            "set": {"type": "object", "additionalProperties": {"type": "string"},
+                    "description": f"Named values to add or change, at most {MAX_STATUS_VALUES} in all and "
+                                   f"{MAX_STATUS_VALUE} characters each. An empty value removes that name."},
+            "remove": {"type": "array", "items": {"type": "string"}, "description": "Names to remove."},
+            "text": {"type": "string", "description": f"One line in place of named values, at most {MAX_STATUS} characters."},
+            "clear": {"type": "boolean", "description": "Remove the whole status."},
+            "url": {"type": "string", "description": "Optional https link to open when the line is tapped. Empty removes it."},
+            "app": {"type": "string", "description": "Optional mini app name to open when the line is tapped. Empty removes it."},
         },
-        "required": ["text"],
     },
 }
 
@@ -397,36 +407,74 @@ def _write_json(path: Path, value) -> None:
     temporary.replace(path)
 
 
-def build_status(args: dict) -> dict | None:
-    """The status to save, or None to remove it."""
-    text = " ".join(str(args.get("text") or "").split())
-    if not text:
+def status_line(status: dict) -> str:
+    """What the app shows: the named values in order, or the single line."""
+    values = [str(v) for v in (status.get("values") or {}).values() if str(v).strip()]
+    return " · ".join(values) if values else str(status.get("text") or "")
+
+
+def build_status(args: dict, current: dict | None = None) -> dict | None:
+    """The status to save after this call, starting from what's saved now. None removes it."""
+    if args.get("clear"):
         return None
-    if len(text) > MAX_STATUS:
-        raise ValueError(f"the status is {len(text)} characters: keep it to {MAX_STATUS}")
-    status = {"text": text, "at": datetime.now().timestamp()}
-    if args.get("url"):
+    status = dict(current or {})
+    values = dict(status.get("values") or {})
+    if "text" in args:
+        text = " ".join(str(args.get("text") or "").split())
+        if len(text) > MAX_STATUS:
+            raise ValueError(f"the status is {len(text)} characters: keep it to {MAX_STATUS}")
+        # A sentence and named values are two ways to fill one line, so setting one drops the other.
+        status["text"], values = text, {}
+    changes = args.get("set") if isinstance(args.get("set"), dict) else {}
+    for raw_key, raw_value in changes.items():
+        key, value = str(raw_key).strip().lower(), " ".join(str(raw_value or "").split())
+        if not STATUS_KEY.fullmatch(key):
+            raise ValueError(f"{raw_key!r} isn't a usable name: use lowercase letters, digits, dashes or underscores")
+        if len(value) > MAX_STATUS_VALUE:
+            raise ValueError(f"the value for {key} is {len(value)} characters: keep each to {MAX_STATUS_VALUE}")
+        if value:
+            values[key] = value
+            status.pop("text", None)
+        else:
+            values.pop(key, None)
+    for raw_key in args.get("remove") or []:
+        values.pop(str(raw_key).strip().lower(), None)
+    if len(values) > MAX_STATUS_VALUES:
+        raise ValueError(f"that makes {len(values)} values: keep it to {MAX_STATUS_VALUES}, or remove some first")
+    status["values"] = values
+    if "url" in args:
         link = _https(args.get("url"))
-        if not link:
+        if args.get("url") and not link:
             raise ValueError("url has to be an https link")
-        status["url"] = link
-    if args.get("app"):
-        name = str(args.get("app")).strip().lower()
-        if not APP_NAME.fullmatch(name):
+        status.pop("url", None) if not link else status.update(url=link)
+    if "app" in args:
+        name = str(args.get("app") or "").strip().lower()
+        if name and not APP_NAME.fullmatch(name):
             raise ValueError("app has to be a mini app's name: lowercase letters, digits and dashes")
-        status["app"] = name
+        status.pop("app", None) if not name else status.update(app=name)
+    line = status_line(status)
+    if not line:
+        return None
+    if len(line) > MAX_STATUS + 40:
+        raise ValueError(f"together the values make a {len(line)}-character line: shorten or remove some")
+    status["at"] = datetime.now().timestamp()
     return status
 
 
 def handle_status(args, **_kwargs):
     try:
-        status = build_status(args or {})
         path = _bot_home() / "hermit" / "status.json"
+        try:
+            current = json.loads(path.read_text())
+        except (OSError, ValueError):
+            current = None
+        status = build_status(args or {}, current if isinstance(current, dict) else None)
         if status is None:
             path.unlink(missing_ok=True)
             return json.dumps({"cleared": True})
         _write_json(path, status)
-        return json.dumps({"shown": True, "note": "The user sees this line under the chat's header. Don't repeat it."})
+        return json.dumps({"shown": status_line(status), "values": status.get("values") or {},
+                           "note": "The user sees this line under the chat's header. Don't repeat it."})
     except (ValueError, OSError) as exc:
         return json.dumps({"error": str(exc)})
 
