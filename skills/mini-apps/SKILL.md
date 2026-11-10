@@ -35,8 +35,25 @@ Rules the page must follow, because the app enforces them:
 - **Relative addresses only.** `fetch("data.json")`, `fetch("api/state")`, `<img src="img/a.png">`. Never
   start an address with `/` or `http`.
 - **Follow the app's colours** so it works in light and dark: `--hermit-bg`, `--hermit-surface`,
-  `--hermit-text`, `--hermit-secondary`, `--hermit-separator`, `--hermit-accent`. Listen for the
-  `hermit:theme` event if you draw to a canvas.
+  `--hermit-text`, `--hermit-secondary`, `--hermit-separator`, `--hermit-accent`, `--hermit-on-accent`,
+  `--hermit-danger`, `--hermit-success`. Listen for the `hermit:theme` event if you draw to a canvas.
+- **Never write a colour as a literal**: no `#fff`, `white`, `black` or `rgb(...)` for text, backgrounds or
+  borders. A literal that looks right in light mode is invisible in dark. Fallbacks inside `var()` are fine.
+- **The accent is not blue.** It's near black in light mode and near white in dark. So white text on an
+  accent button disappears in dark mode. Colours come in pairs, and each background has one text colour:
+
+  | Background | Text on it |
+  | --- | --- |
+  | `--hermit-accent` | `--hermit-on-accent` |
+  | `--hermit-bg` or `--hermit-surface` | `--hermit-text` or `--hermit-secondary` |
+  | `--hermit-surface`, for a warning or a good state | `--hermit-danger` or `--hermit-success`, as text or border only |
+
+  Don't use `--hermit-danger` or `--hermit-success` as a background: they have no paired text colour.
+
+- **Buttons are styled for you.** A plain `<button>` already gets the accent pair, a 44px height and rounded
+  corners. Leave it alone for a main action. For a quieter one, use
+  `background: var(--hermit-surface); color: var(--hermit-text); border: 1px solid var(--hermit-separator)`.
+  If you set a button's background, set its `color` from the same row of the table.
 - **It's a phone.** One column, 16px side padding, text 15px or larger, tap targets 44px or taller, and
   bottom padding of `env(safe-area-inset-bottom)`. The sheet can be half height, so put what matters first.
 - **Refresh without reloading.** Fetch on a timer (every 5 to 30 seconds is plenty) and update the page in
@@ -163,7 +180,9 @@ A button that does something real (unlock, send, buy, delete) needs more care th
 ## Before you say it's done
 
 - [ ] The page has no address starting with `http` or `/`, and loads nothing from outside its folder.
-- [ ] It reads well at phone width in light and dark, and says something useful when data is missing.
+- [ ] It reads well at phone width, and says something useful when data is missing.
+- [ ] Dark mode: no colour literals outside `var()` fallbacks, and every button, badge and chip takes its
+      background and text from the same row of the colour table. Search the page for `#` and `white`.
 - [ ] No secret appears in any file, log line or `/api/` answer. Search the folder for the values' names.
 - [ ] The server listens on `127.0.0.1:$PORT`, answers under `/api/`, and survives a service being down.
 - [ ] Changing things takes a `POST` to a fixed action, with a confirmation for anything hard to undo.
