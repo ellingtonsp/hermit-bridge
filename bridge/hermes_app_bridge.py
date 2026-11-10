@@ -1138,12 +1138,78 @@ def plugin_ready(home: pathlib.Path) -> bool:
     return any((home / "plugins" / name).exists() for name in ("hermit", "hermes-cards"))
 
 
-def new_bots(have: list[str]) -> dict:
-    """Keys for bots made since the phone was paired, and the names of any that still need setup."""
+readying: set[str] = set()
+# Bots the bridge tried to ready and couldn't. Only these, and bots with no key, are reported as needing setup.
+ready_failed: set[str] = set()
+ready_lock = threading.Lock()
+
+
+def plugin_source() -> tuple[str, pathlib.Path] | None:
+    """The plugin this bridge belongs to, by the name Hermes knows it and where it lives."""
+    if (PLUGIN_ROOT / "plugin.yaml").exists():
+        return "hermit", PLUGIN_ROOT
+    legacy = HOME / "plugins" / "hermes-cards"
+    return ("hermes-cards", legacy) if legacy.exists() else None
+
+
+def ready_bot(name: str, home: pathlib.Path, run=subprocess.run) -> bool:
+    """Gives a bot made after setup what setup gave the others: Hermit's plugin, switched on, with its
+    card tool. Hermes loads an enabled plugin into the running gateway, so nothing restarts."""
+    source = plugin_source()
+    bundled = HOME / "hermes-agent/venv/bin/hermes"
+    hermes = str(bundled) if bundled.exists() else tool_path("hermes")
+    if source is None or not hermes:
+        return False
+    plugin, target = source
+    link = home / "plugins" / plugin
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() and not link.exists():
+            link.unlink()
+        if not link.exists():
+            link.symlink_to(target)
+        env = {key: value for key, value in os.environ.items() if key != "HERMES_DISABLE_LAZY_INSTALLS"}
+        for command in (["plugins", "enable", plugin], ["tools", "enable", "--platform", "api_server", "hermes_cards"]):
+            done = run([hermes, "-p", name, *command], capture_output=True, text=True, timeout=90,
+                       stdin=subprocess.DEVNULL, env=env)
+            if done.returncode != 0:
+                print(f"ready {name}: {' '.join(command)} exit {done.returncode}", flush=True)
+                return False
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"ready {name}: {type(error).__name__}", flush=True)
+        return False
+    print(f"ready {name}: plugin on", flush=True)
+    return True
+
+
+def ready_in_background(name: str, home: pathlib.Path) -> None:
+    """One attempt per bot for each run of the bridge, so a bot that can't be readied isn't retried forever."""
+    with ready_lock:
+        if name in readying:
+            return
+        readying.add(name)
+
+    def attempt():
+        if not ready_bot(name, home):
+            with ready_lock:
+                ready_failed.add(name)
+    threading.Thread(target=attempt, daemon=True).start()
+
+
+def new_bots(have: list[str], ready=ready_in_background) -> dict:
+    """Keys for bots made since the phone was paired. A bot without Hermit's plugin gets it now, and is
+    named as unready until that's done, or for good if it has no key and so needs setup run again."""
     known = homes()
     bots = [{"profile": name, "key": key} for name, home in known.items()
             if name not in have and (key := api_key(home))]
-    return {"bots": bots, "unready": sorted(name for name, home in known.items() if not plugin_ready(home))}
+    lacking = sorted(name for name, home in known.items() if not plugin_ready(home))
+    for name in lacking:
+        if api_key(known[name]):
+            ready(name, known[name])
+    # While a bot is being readied it isn't the owner's problem yet, so it isn't named.
+    with ready_lock:
+        unready = [name for name in lacking if not api_key(known[name]) or name in ready_failed]
+    return {"bots": bots, "unready": unready}
 
 
 def achievements() -> dict:
