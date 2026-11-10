@@ -3068,6 +3068,10 @@ class Handler(BaseHTTPRequestHandler):
             if match.group(1) not in homes() or not authorized(header, match.group(1)):
                 return self.json(401, {"error": {"message": "unauthorized"}})
             return self.file_action(lambda: server_detail(match.group(1), match.group(2)))
+        if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/apps", url.path):
+            if match.group(1) not in homes() or not authorized(header, match.group(1)):
+                return self.json(401, {"error": {"message": "unauthorized"}})
+            return self.json(200, {"apps": mini_apps(homes()[match.group(1)], match.group(1))})
         if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/bar", url.path):
             if match.group(1) not in homes() or not authorized(header, match.group(1)):
                 return self.json(401, {"error": {"message": "unauthorized"}})
