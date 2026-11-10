@@ -374,18 +374,38 @@ APP_SCHEMA = {
     "name": APP_TOOL,
     "description": (
         "Create or look up a mini app: a small web page the Hermit app opens from a button in this chat. "
+        "Before building or changing one, read this plugin's mini-apps skill with skill_view: it has the rules "
+        "the page and server must follow, a server to start from, and how to handle secrets safely. "
         "This returns the folder to write it in. Put an index.html there, plus any css, js, images or json "
         "it needs, using your normal file tools. Pages are served only from that folder and can't load "
         "anything from the internet, so keep everything local and write data the page reads, such as "
         "data.json, into the same folder. In the page, window.hermit offers close(), send(text) to send the "
-        "user's message to you, openLink(url), haptic(), and theme colours as CSS variables like "
-        "--hermit-bg, --hermit-text, --hermit-secondary, --hermit-surface and --hermit-accent."),
+        "user's message to you, openLink(url), haptic(), setStatus({name: value}) for the status bar, and "
+        "theme colours as CSS variables like --hermit-bg, --hermit-text, --hermit-secondary, "
+        "--hermit-surface and --hermit-accent. "
+        "For live data, credentials or actions, give the app a server: pass `server` with `command`, such as "
+        "[\"python3\", \"server.py\"] (python3 or node, run in the app's folder), and `secrets`, the names of "
+        "environment variables it needs, such as [\"TESLA_TOKEN\"]. Write the server to listen on 127.0.0.1 "
+        "at the port in the PORT environment variable and answer under /api/. The page calls it with relative "
+        "addresses like fetch(\"api/state\"). The user's Mac runs it, keeps it running and restarts it, but "
+        "only after the user allows it in the app, and again whenever command or secrets change, so tell them "
+        "to open the mini app and allow it. Secrets come from the user's own Hermes secrets (their secrets "
+        "manager or this bot's .env) as environment variables, and the app lets the user type in any that are "
+        "missing: never ask for a secret's value in chat, never write one into a file, and never print one. "
+        "Hermes's own keys and model provider keys can't be requested. The server can update the status bar "
+        "any time by POSTing JSON {\"set\": {name: value}} to the address in HERMIT_STATUS_URL with the header "
+        "Authorization: Bearer $HERMIT_STATUS_TOKEN. Its output goes to a log the user can read in the app."),
     "parameters": {
         "type": "object",
         "properties": {
             "name": {"type": "string", "description": "Lowercase letters, digits and dashes, such as home-os."},
             "title": {"type": "string", "description": "The button's label, one to three words."},
             "icon": {"type": "string", "description": "Optional SF Symbol name for the button, such as house or chart.bar."},
+            "server": {"type": "object", "properties": {
+                "command": {"type": "array", "items": {"type": "string"}},
+                "secrets": {"type": "array", "items": {"type": "string"}}},
+                "description": "A server for this app: command (python3 or node first) and the secret names it needs."},
+            "server_off": {"type": "boolean", "description": "Remove this app's server."},
         },
         "required": ["name"],
     },
@@ -598,6 +618,27 @@ def handle_bar(args, **_kwargs):
         return json.dumps({"error": str(exc)})
 
 
+SECRET_NAME = re.compile(r"[A-Z][A-Z0-9_]{1,60}")
+
+
+def build_server(value) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("server needs command, and secrets if it uses any")
+    command = value.get("command")
+    if not isinstance(command, list) or not 1 <= len(command) <= 12 or not all(isinstance(part, str) and 0 < len(part) <= 300 for part in command):
+        raise ValueError("command has to be a short list of words, such as [\"python3\", \"server.py\"]")
+    if command[0] not in ("python", "python3", "node"):
+        raise ValueError("the server has to be run with python3 or node")
+    names = [str(name).strip() for name in value.get("secrets") or []]
+    bad = [name for name in names if not SECRET_NAME.fullmatch(name)]
+    if bad or len(names) > 12:
+        raise ValueError("secrets are names of environment variables in capitals, such as TESLA_TOKEN, and 12 at most")
+    hermes = [name for name in names if name == "API_SERVER_KEY" or name.startswith(("HERMES_", "GATEWAY_", "AUXILIARY_", "HERMIT_"))]
+    if hermes:
+        raise ValueError(f"{hermes[0]} belongs to Hermes and can't be given to a mini app")
+    return {"command": command, "secrets": list(dict.fromkeys(names))}
+
+
 def handle_mini_app(args, **_kwargs):
     try:
         name = str((args or {}).get("name") or "").strip().lower()
@@ -610,10 +651,16 @@ def handle_mini_app(args, **_kwargs):
         for key in ("title", "icon"):
             if _text(args.get(key)):
                 details[key] = _text(args.get(key))[:40]
+        note = "Write index.html and its files in this folder. The app's button appears in this chat once index.html exists."
+        if args.get("server_off"):
+            details.pop("server", None)
+        elif "server" in args:
+            details["server"] = build_server(args.get("server"))
+            note += (" Write the server too. It starts once the user opens the mini app and allows it, and they'll be "
+                     "asked again if its command or secrets change.")
         _write_json(about, details)
         return json.dumps({"folder": str(folder), "has_page": (folder / "index.html").exists(),
-                           "note": "Write index.html and its files in this folder. The app's button appears in this chat "
-                                   "once index.html exists."})
+                           "server": details.get("server"), "note": note})
     except (ValueError, OSError) as exc:
         return json.dumps({"error": str(exc)})
 
@@ -737,6 +784,13 @@ def register(ctx):
     # In the same toolset as cards, so a bot that has cards has these without another switch.
     ctx.register_tool(name=STATUS_TOOL, toolset=TOOLSET, schema=STATUS_SCHEMA, handler=handle_status,
                       description=STATUS_SCHEMA["description"], emoji="📌")
+    # Older Hermes has no plugin skills. The tools still say enough to build a simple page.
+    try:
+        ctx.register_skill("mini-apps", Path(__file__).parent / "skills" / "mini-apps" / "SKILL.md",
+                           "Build a mini app for the Hermit app: a page in the chat, with an optional server for live "
+                           "data, credentials and actions, and values on the status bar.")
+    except Exception:
+        pass
     ctx.register_tool(name=BAR_TOOL, toolset=TOOLSET, schema=BAR_SCHEMA, handler=handle_bar,
                       description=BAR_SCHEMA["description"], emoji="🎛️")
     ctx.register_tool(name=APP_TOOL, toolset=TOOLSET, schema=APP_SCHEMA, handler=handle_mini_app,

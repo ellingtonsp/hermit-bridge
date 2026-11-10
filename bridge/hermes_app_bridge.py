@@ -12,6 +12,7 @@ import fcntl
 import glob
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -500,7 +501,7 @@ class Watcher:
         model = read_yaml(self.home / "config.yaml").get("model")
         return {"running": self.running, "generation": self.generation, "pending": list(self.pending.values()),
                 "context": self.context or None, "model": model.get("default") if isinstance(model, dict) else None,
-                "status": bot_status(self.home, bar_prefs(self.profile)), "apps": mini_apps(self.home)}
+                "status": bot_status(self.home, bar_prefs(self.profile)), "apps": mini_apps(self.home, self.profile)}
 
 
 def watcher(profile: str, session_id: str) -> Watcher:
@@ -1287,7 +1288,7 @@ def feed_loop() -> None:
         time.sleep(15)
 
 
-def mini_apps(home: pathlib.Path) -> list[dict]:
+def mini_apps(home: pathlib.Path, profile: str | None = None) -> list[dict]:
     """Mini apps this bot has: each folder under hermit/apps with a page in it."""
     root = home / "hermit" / "apps"
     found = []
@@ -1301,8 +1302,10 @@ def mini_apps(home: pathlib.Path) -> list[dict]:
         details = details if isinstance(details, dict) else {}
         title = " ".join(str(details.get("title") or "").split())[:40] or folder.name.replace("-", " ").title()
         icon = str(details.get("icon") or "")
-        found.append({"name": folder.name, "title": title,
-                      "icon": icon if re.fullmatch(r"[a-z0-9.]{1,60}", icon) else None})
+        app = {"name": folder.name, "title": title, "icon": icon if re.fullmatch(r"[a-z0-9.]{1,60}", icon) else None}
+        if profile and "server" in details:
+            app["server"] = server_summary(profile, folder.name, server_spec(details))
+        found.append(app)
     return found[:20]
 
 
@@ -1317,8 +1320,360 @@ def open_mini_app(profile: str, name: str) -> dict:
     with mini_app_lock:
         for old in [key for key, entry in mini_app_tickets.items() if entry["until"] < now]:
             del mini_app_tickets[old]
-        mini_app_tickets[ticket] = {"folder": (home / "hermit" / "apps" / name).resolve(), "until": now + MINI_APP_SECONDS}
+        mini_app_tickets[ticket] = {"folder": (home / "hermit" / "apps" / name).resolve(), "until": now + MINI_APP_SECONDS,
+                                    "profile": profile, "name": name}
     return {"path": f"/apps/{ticket}/index.html", "title": app["title"]}
+
+
+# A mini app can have a small server of its own, for pages that need live data or to do things.
+# The bot writes it; the bridge runs it, only after the owner says so in the app, and gives it nothing
+# from Hermes but the secrets it names. The page reaches it under its own address, at api/.
+APP_SERVERS = STATE / "app-servers.json"
+APP_LOGS = STATE / "app-logs"
+APP_PIDS = STATE / "app-servers.pids.json"
+SECRET_NAME = re.compile(r"[A-Z][A-Z0-9_]{1,60}")
+SERVER_BODY = 1024 * 1024
+SERVER_STARTS, SERVER_WINDOW = 5, 600
+servers_lock = threading.RLock()
+running_servers: dict[tuple[str, str], dict] = {}
+server_notes: dict[tuple[str, str], dict] = {}
+server_tokens: dict[str, tuple[str, str]] = {}
+
+
+def server_program(name: str) -> str | None:
+    """Only Python and Node, the two a bot is likely to write a server in and a Mac is likely to have."""
+    if name in ("python", "python3"):
+        return sys.executable
+    if name == "node":
+        return shutil.which("node") or next((path for path in ("/opt/homebrew/bin/node", "/usr/local/bin/node")
+                                             if os.path.exists(path)), None)
+    return None
+
+
+def server_spec(details: dict) -> dict | None:
+    """What a mini app says its server needs, or None if it doesn't describe one the bridge will run."""
+    server = details.get("server") if isinstance(details, dict) else None
+    command = server.get("command") if isinstance(server, dict) else None
+    if not isinstance(command, list) or not 1 <= len(command) <= 12 or not all(isinstance(part, str) and 0 < len(part) <= 300 for part in command):
+        return None
+    if command[0] not in ("python", "python3", "node"):
+        return None
+    names = server.get("secrets") if isinstance(server.get("secrets"), list) else []
+    names = list(dict.fromkeys(str(name) for name in names))[:12]
+    spec = {"command": command, "secrets": names}
+    # The owner's OK is for exactly this command and these secrets. Change either and it's asked again.
+    return spec | {"mark": hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]}
+
+
+def secret_allowed(name: str) -> bool:
+    """A mini app may be given the owner's own keys, never Hermes's: not a bot's key, a model provider's
+    key, or anything Hermes keeps for itself."""
+    if not SECRET_NAME.fullmatch(name) or name == "API_SERVER_KEY" or name.startswith(("HERMES_", "GATEWAY_", "AUXILIARY_", "HERMIT_")):
+        return False
+    try:
+        hermes_modules()
+        from tools.environments.local_env_policy import _is_hermes_internal_secret, _is_provider_env_blocklisted
+        return not (_is_provider_env_blocklisted(name) or _is_hermes_internal_secret(name))
+    except Exception:
+        return False
+
+
+def hermes_modules() -> None:
+    if str(HOME / "hermes-agent") not in sys.path:
+        sys.path.insert(0, str(HOME / "hermes-agent"))
+
+
+def plain_env(home: pathlib.Path) -> dict[str, str]:
+    """A bot's .env read simply, for when Hermes's own reader can't be used."""
+    found = {}
+    try:
+        lines = (home / ".env").read_text().splitlines()
+    except OSError:
+        return found
+    for line in lines:
+        match = re.fullmatch(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*", line)
+        if match:
+            value = match.group(2)
+            found[match.group(1)] = value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"" else value
+    return found
+
+
+def bot_secrets(home: pathlib.Path, names: list[str]) -> dict[str, str]:
+    """The named secrets as this bot's Hermes resolves them: its secrets manager first, then its .env."""
+    values: dict[str, str] = {}
+    try:
+        hermes_modules()
+        from hermes_cli import env_loader
+        try:
+            values |= env_loader.resolve_home_dotenv(home)
+        except Exception:
+            values |= plain_env(home)
+        try:
+            env_loader.reset_secret_source_cache(home)
+            values |= env_loader.hydrate_profile_secret_sources(home)
+        except Exception as error:
+            print(f"secrets for {home.name}: {type(error).__name__}", flush=True)
+    except Exception:
+        values |= plain_env(home)
+    return {name: values[name] for name in names if secret_allowed(name) and values.get(name)}
+
+
+def save_bot_secret(home: pathlib.Path, name: str, value: str) -> None:
+    """Keeps a secret in the bot's .env, the plain file Hermes reads when there's no secrets manager."""
+    if "\n" in value or "\r" in value or "'" in value or "${" in value or not value.strip() or len(value) > 4000:
+        raise FileProblem(400, "That value can't be saved here. Add it to this bot's .env on your Mac instead.")
+    path = home / ".env"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    kept = [line for line in lines if not re.match(rf"\s*(?:export\s+)?{re.escape(name)}\s*=", line)]
+    handle, temporary = tempfile.mkstemp(dir=home, prefix=".env.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w") as file:
+            file.write("\n".join(kept + [f"{name}='{value.strip()}'"]) + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        pathlib.Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def servers_allowed() -> dict:
+    try:
+        saved = read_json(APP_SERVERS)
+    except (OSError, ValueError):
+        saved = {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def server_is_allowed(profile: str, name: str, spec: dict) -> bool:
+    allowed = servers_allowed().get(profile)
+    return isinstance(allowed, dict) and allowed.get(name) == spec["mark"]
+
+
+def server_summary(profile: str, name: str, spec: dict | None) -> dict:
+    """The short state the chat needs: whether to ask, and whether it's up."""
+    if spec is None:
+        return {"state": "problem", "problem": "Its server isn't described in a way Hermit can run."}
+    if not server_is_allowed(profile, name, spec):
+        return {"state": "needs_ok"}
+    with servers_lock:
+        entry, note = running_servers.get((profile, name)), server_notes.get((profile, name)) or {}
+        if entry and entry["process"].poll() is None:
+            return {"state": "running"}
+    return {"state": "stopped"} | ({"problem": note["problem"]} if note.get("problem") else {})
+
+
+def app_details(home: pathlib.Path, name: str) -> dict:
+    try:
+        details = json.loads((home / "hermit" / "apps" / name / "app.json").read_text())
+    except (OSError, ValueError):
+        details = {}
+    return details if isinstance(details, dict) else {}
+
+
+def server_detail(profile: str, name: str) -> dict:
+    """Everything the app shows before the owner decides: what runs, and which secrets it gets."""
+    home = homes()[profile]
+    if not any(app["name"] == name for app in mini_apps(home)):
+        raise FileProblem(404, "That mini app isn't there any more.")
+    details = app_details(home, name)
+    if "server" not in details:
+        raise FileProblem(404, "That mini app has no server.")
+    spec = server_spec(details)
+    detail = server_summary(profile, name, spec)
+    if spec:
+        have = bot_secrets(home, spec["secrets"])
+        detail |= {"command": " ".join(spec["command"])[:300],
+                   "secrets": [{"name": secret, "have": secret in have, "allowed": secret_allowed(secret)} for secret in spec["secrets"]]}
+        log = APP_LOGS / f"{profile}-{name}.log"
+        try:
+            detail["log"] = "\n".join(log.read_text(errors="replace").splitlines()[-12:])[-2000:]
+        except OSError:
+            pass
+    return detail
+
+
+def allow_server(profile: str, name: str, allow: bool) -> dict:
+    home = homes()[profile]
+    spec = server_spec(app_details(home, name))
+    if spec is None:
+        raise FileProblem(400, "That mini app has no server Hermit can run.")
+    with servers_lock:
+        saved = servers_allowed()
+        mine = saved.get(profile) if isinstance(saved.get(profile), dict) else {}
+        mine.pop(name, None) if not allow else mine.update({name: spec["mark"]})
+        saved[profile] = mine
+        STATE.mkdir(parents=True, exist_ok=True)
+        write_json(APP_SERVERS, saved)
+        stop_server(profile, name)
+        server_notes.pop((profile, name), None)
+        if allow:
+            start_server(profile, name, home, spec)
+    return server_detail(profile, name)
+
+
+def add_server_secret(profile: str, name: str, fields: dict) -> dict:
+    """The owner typing in a secret a mini app asked for. Only a name that app asks for can be saved."""
+    home = homes()[profile]
+    spec = server_spec(app_details(home, name))
+    secret = str(fields.get("name") or "")
+    if spec is None or secret not in spec["secrets"] or not secret_allowed(secret):
+        raise FileProblem(400, "That mini app doesn't ask for a secret by that name.")
+    save_bot_secret(home, secret, str(fields.get("value") or ""))
+    with servers_lock:
+        server_notes.pop((profile, name), None)
+        if server_is_allowed(profile, name, spec):
+            stop_server(profile, name)
+            start_server(profile, name, home, spec)
+    return server_detail(profile, name)
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def note_pids() -> None:
+    """Which servers are running, on disk, so a bridge that was killed can clear them out when it's back."""
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        write_json(APP_PIDS, [{"pid": entry["process"].pid, "command": entry["line"]} for entry in running_servers.values()])
+    except OSError:
+        pass
+
+
+def stop_leftover_servers() -> None:
+    """Stops servers a previous bridge left behind, checking each is still the command it started."""
+    try:
+        left = read_json(APP_PIDS)
+    except (OSError, ValueError):
+        left = []
+    for entry in left if isinstance(left, list) else []:
+        try:
+            pid, line = int(entry["pid"]), str(entry["command"])
+            now = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+            if now and now == line:
+                os.kill(pid, 15)
+        except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
+            continue
+    pathlib.Path(APP_PIDS).unlink(missing_ok=True)
+
+
+def start_server(profile: str, name: str, home: pathlib.Path, spec: dict) -> bool:
+    """Starts one mini app's server. Returns False, with the reason noted, when it can't."""
+    key, now = (profile, name), time.time()
+    with servers_lock:
+        note = server_notes.setdefault(key, {"starts": []})
+        note["starts"] = [at for at in note.get("starts", []) if now - at < SERVER_WINDOW]
+        if len(note["starts"]) >= SERVER_STARTS:
+            note["problem"] = "It keeps stopping, so it's resting for a few minutes. Ask the bot to check its server."
+            return False
+        refused = [secret for secret in spec["secrets"] if not secret_allowed(secret)]
+        if refused:
+            note["problem"] = f"It asks for {refused[0]}, which a mini app can't be given."
+            return False
+        secrets_found = bot_secrets(home, spec["secrets"])
+        missing = [secret for secret in spec["secrets"] if secret not in secrets_found]
+        if missing:
+            note["problem"] = "It's waiting for " + ", ".join(missing) + "."
+            return False
+        program = server_program(spec["command"][0])
+        if program is None:
+            note["problem"] = f"{spec['command'][0]} isn't installed on this Mac."
+            return False
+        folder = (home / "hermit" / "apps" / name).resolve()
+        port, token = free_port(), secrets.token_urlsafe(32)
+        # Nothing of Hermes's or the bridge's own environment goes along: only these, and the named secrets.
+        env = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(pathlib.Path.home()), "LANG": "en_US.UTF-8",
+               "TMPDIR": tempfile.gettempdir(), "PYTHONUNBUFFERED": "1", "HOST": "127.0.0.1", "PORT": str(port),
+               "HERMIT_APP_DIR": str(folder), "HERMIT_STATUS_URL": f"http://127.0.0.1:{HTTP_PORT}/servers/bar",
+               "HERMIT_STATUS_TOKEN": token} | secrets_found
+        APP_LOGS.mkdir(parents=True, exist_ok=True)
+        log = APP_LOGS / f"{profile}-{name}.log"
+        if log.exists() and log.stat().st_size > 200_000:
+            log.write_bytes(log.read_bytes()[-50_000:])
+        try:
+            with open(log, "ab") as output:
+                process = subprocess.Popen([program, *spec["command"][1:]], cwd=folder, env=env, stdin=subprocess.DEVNULL,
+                                           stdout=output, stderr=subprocess.STDOUT)
+        except OSError as error:
+            note["problem"] = f"It couldn't start: {error.strerror or type(error).__name__}."
+            return False
+        note["starts"].append(now)
+        note.pop("problem", None)
+        running_servers[key] = {"process": process, "port": port, "mark": spec["mark"], "token": token,
+                                "line": " ".join([program, *spec["command"][1:]])}
+        server_tokens[token] = key
+        note_pids()
+    return True
+
+
+def stop_server(profile: str, name: str) -> None:
+    with servers_lock:
+        entry = running_servers.pop((profile, name), None)
+        if entry is None:
+            return
+        server_tokens.pop(entry["token"], None)
+        note_pids()
+    process = entry["process"]
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def tend_servers() -> None:
+    """One pass: start what the owner allowed, restart what stopped, stop what changed or was taken away."""
+    wanted: dict[tuple[str, str], tuple[pathlib.Path, dict]] = {}
+    for profile, home in homes().items():
+        for app in mini_apps(home):
+            spec = server_spec(app_details(home, app["name"]))
+            if spec and server_is_allowed(profile, app["name"], spec):
+                wanted[(profile, app["name"])] = (home, spec)
+    with servers_lock:
+        for key, entry in list(running_servers.items()):
+            if key not in wanted or wanted[key][1]["mark"] != entry["mark"]:
+                stop_server(*key)
+            elif entry["process"].poll() is not None:
+                stop_server(*key)
+        for key, (home, spec) in wanted.items():
+            if key not in running_servers:
+                start_server(key[0], key[1], home, spec)
+
+
+def servers_loop() -> None:
+    stop_leftover_servers()
+    while True:
+        try:
+            tend_servers()
+        except Exception as error:  # One bad app must never stop the rest.
+            print(f"mini app servers: {type(error).__name__}: {error}", flush=True)
+        time.sleep(10)
+
+
+def server_sets_bar(token: str, fields: dict) -> dict:
+    """A mini app's server putting values on its bot's bar, proving itself with the token it was started with."""
+    with servers_lock:
+        key = server_tokens.get(token)
+    if key is None:
+        raise FileProblem(401, "unauthorized")
+    return app_sets_bar(key[0], fields | {"app": key[1]})
+
+
+def server_for_ticket(ticket: str) -> dict | None:
+    """The running server behind a mini app's address, or None."""
+    with mini_app_lock:
+        entry = mini_app_tickets.get(ticket)
+    if not entry or entry["until"] < time.time() or "profile" not in entry:
+        return None
+    with servers_lock:
+        running = running_servers.get((entry["profile"], entry["name"]))
+        return running if running and running["process"].poll() is None else None
 
 
 def mini_app_file(ticket: str, relative: str) -> pathlib.Path | None:
@@ -2611,6 +2966,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, {"push": True, "hermes": hermes_compatibility()})
         if match := re.fullmatch(r"/apps/([A-Za-z0-9_-]{20,80})/(.*)", url.path):
             # No key here by design: the ticket in the address is the permission. See open_mini_app.
+            if match.group(2).startswith("api/"):
+                return self.app_api(match.group(1), match.group(2))
             found = mini_app_file(match.group(1), urllib.parse.unquote(match.group(2)))
             if found is None:
                 return self.reply(404, b"Not found", "text/plain")
@@ -2707,6 +3064,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, {"seed": seed, "faces": [
                 {"kind": kind, "png": base64.b64encode(image).decode()}
                 for kind, image in zip(FACE_KINDS, images)]})
+        if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/apps/([a-z0-9-]{2,41})/server", url.path):
+            if match.group(1) not in homes() or not authorized(header, match.group(1)):
+                return self.json(401, {"error": {"message": "unauthorized"}})
+            return self.file_action(lambda: server_detail(match.group(1), match.group(2)))
         if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/bar", url.path):
             if match.group(1) not in homes() or not authorized(header, match.group(1)):
                 return self.json(401, {"error": {"message": "unauthorized"}})
@@ -2892,6 +3253,44 @@ class Handler(BaseHTTPRequestHandler):
         except FileProblem as problem:
             return self.json(problem.status, {"error": {"message": problem.message}})
 
+    def app_api(self, ticket: str, rest: str) -> None:
+        """Passes a mini app page's request to that app's own server, and nothing else."""
+        running = server_for_ticket(ticket)
+        if running is None:
+            return self.json(503, {"error": {"message": "This mini app's server isn't running."}})
+        body = self.body(SERVER_BODY) if self.command != "GET" else b""
+        if len(body) > SERVER_BODY:
+            return self.json(413, {"error": {"message": "That's too much to send."}})
+        query = urlparse(self.path).query
+        headers = {name: self.headers[name] for name in ("Content-Type", "Accept") if self.headers.get(name)}
+        connection = http.client.HTTPConnection("127.0.0.1", running["port"], timeout=30)
+        try:
+            connection.request(self.command, "/" + rest + ("?" + query if query else ""), body=body or None, headers=headers)
+            answer = connection.getresponse()
+            data = answer.read(MINI_APP_LIMIT + 1)
+            status, kind = answer.status, answer.getheader("Content-Type") or "application/json"
+        except (OSError, http.client.HTTPException):
+            return self.json(502, {"error": {"message": "This mini app's server didn't answer."}})
+        finally:
+            connection.close()
+        if len(data) > MINI_APP_LIMIT:
+            return self.json(502, {"error": {"message": "This mini app's server sent too much."}})
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Security-Policy", MINI_APP_POLICY)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_PUT(self):
+        if match := re.fullmatch(r"/apps/([A-Za-z0-9_-]{20,80})/(api/.*)", urlparse(self.path).path):
+            return self.app_api(match.group(1), match.group(2))
+        return self.json(404, {"error": "not found"})
+
+    do_DELETE = do_PATCH = do_PUT
+
     def body(self, limit: int = MAX_IMAGE) -> bytes:
         return self.rfile.read(min(int(self.headers.get("Content-Length") or 0), limit + 1))
 
@@ -2923,6 +3322,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(401, {"error": {"message": "unauthorized"}})
             self.body(4096)
             return self.file_action(lambda: open_mini_app(profile, match.group(2)))
+        if match := re.fullmatch(r"/apps/([A-Za-z0-9_-]{20,80})/(api/.*)", path):
+            return self.app_api(match.group(1), match.group(2))
+        if path == "/servers/bar":
+            # Only from this Mac: a mini app's own server, with the token the bridge started it with.
+            fields = json.loads(self.body(65536) or b"{}")
+            token = (header or "").removeprefix("Bearer ").strip()
+            return self.file_action(lambda: server_sets_bar(token, fields if isinstance(fields, dict) else {}))
+        if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/apps/([a-z0-9-]{2,41})/(server|secret)", path):
+            profile, name = match.group(1), match.group(2)
+            if profile not in homes() or not authorized(header, profile):
+                return self.json(401, {"error": {"message": "unauthorized"}})
+            fields = json.loads(self.body(65536) or b"{}")
+            fields = fields if isinstance(fields, dict) else {}
+            if match.group(3) == "secret":
+                return self.file_action(lambda: add_server_secret(profile, name, fields))
+            return self.file_action(lambda: allow_server(profile, name, fields.get("allow") is True))
         if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/bar(/values)?", path):
             profile = match.group(1)
             if profile not in homes() or not authorized(header, profile):
@@ -3240,4 +3655,5 @@ if __name__ == "__main__":
     threading.Thread(target=udp_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
     threading.Thread(target=feed_loop, daemon=True).start()
+    threading.Thread(target=servers_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
