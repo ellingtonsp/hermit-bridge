@@ -1,9 +1,9 @@
 {
  "version": "1.0",
- "build": 16,
- "file": "Hermit-1.0-16.dmg",
- "sha256": "f6adf4fcb56977c0b4b589f397562b05e8e4932d2ed3641e99c08c56b18dd878",
- "notes": "Voice calls now connect on mobile networks such as T-Mobile, and a call that can't connect says why instead of waiting on Connecting.",
- "size": 20155464,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-16/Hermit-1.0-16.dmg"
+ "build": 17,
+ "file": "Hermit-1.0-17.dmg",
+ "sha256": "6c516db0ebc7651db772cba90a34b3daed0c67857407842aebcc40946e0c763f",
+ "notes": "The Mac app now fits its window at any size, sends with Return, closes sheets with Esc, makes voice calls, and installs updates itself.",
+ "size": 20183156,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-17/Hermit-1.0-17.dmg"
 }
