@@ -23,6 +23,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import sqlite3
 import subprocess
 import tempfile
@@ -981,6 +982,10 @@ mini_app_lock = threading.Lock()
 # bot's mini apps. The owner's switches live in the bridge's own folder, where a bot has no reason to
 # write; what the bot arranges (order, hidden values, the feed) lives in its folder so it can read it.
 BARS = STATE / "bars.json"
+# Values the feed and mini apps put in. Kept in the bridge's folder, not the bot's, so a bot that's been
+# switched off can't pass its own text off as theirs.
+BAR_FILLED = STATE / "bar-values"
+SMALL_FILE = 256 * 1024
 BAR_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,23}")
 BAR_SOURCES = ("bot", "feed", "app")
 BAR_VALUES = 8
@@ -1019,28 +1024,44 @@ def feed_config(value) -> dict | None:
         return None
     try:
         every = int(value.get("every") or FEED_USUAL)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         every = FEED_USUAL
     return {"url": address, "every": max(FEED_SHORTEST, min(FEED_LONGEST, every)), "values": values}
 
 
 def bar_config(home: pathlib.Path) -> dict:
     """What's arranged for this bot's bar, cleaned, since it's just a file in the bot's folder."""
-    try:
-        saved = json.loads((home / "hermit" / "bar.json").read_text())
-    except (OSError, ValueError):
-        saved = {}
+    saved = small_json(home / "hermit" / "bar.json")
     saved = saved if isinstance(saved, dict) else {}
     return {"order": bar_names(saved.get("order")), "hidden": bar_names(saved.get("hidden")), "feed": feed_config(saved.get("feed"))}
 
 
+def small_json(path: pathlib.Path):
+    """A JSON file a bot may have written, read only if it's a sensible size. None when it can't be used."""
+    try:
+        if path.stat().st_size > SMALL_FILE:
+            return None
+        return json.loads(path.read_text())
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def profile_of(home: pathlib.Path) -> str | None:
+    return next((name for name, path in homes().items() if path == home), None)
+
+
 def bar_filled(home: pathlib.Path) -> dict:
     """Values the feed and the mini apps put in, which the bridge keeps apart from the bot's own."""
-    try:
-        saved = json.loads((home / "hermit" / "bar-values.json").read_text())
-    except (OSError, ValueError):
-        saved = {}
+    profile = profile_of(home)
+    saved = small_json(BAR_FILLED / f"{profile}.json") if profile else None
     return saved if isinstance(saved, dict) else {}
+
+
+def write_filled(home: pathlib.Path, filled: dict) -> None:
+    profile = profile_of(home)
+    if profile:
+        BAR_FILLED.mkdir(parents=True, exist_ok=True)
+        write_json(BAR_FILLED / f"{profile}.json", filled)
 
 
 def bar_text(value) -> str:
@@ -1049,10 +1070,7 @@ def bar_text(value) -> str:
 
 def bar_values(home: pathlib.Path) -> tuple[list[dict], dict]:
     """Every value on this bot's bar with where it came from, in the order to show them, and what the bot saved."""
-    try:
-        saved = json.loads((home / "hermit" / "status.json").read_text())
-    except (OSError, ValueError):
-        saved = {}
+    saved = small_json(home / "hermit" / "status.json")
     saved = saved if isinstance(saved, dict) else {}
     filled, config = bar_filled(home), bar_config(home)
     found: dict[str, dict] = {}
@@ -1118,10 +1136,7 @@ def change_bar(profile: str, fields: dict) -> dict:
             STATE.mkdir(parents=True, exist_ok=True)
             write_json(BARS, everyone)
         path = home / "hermit" / "bar.json"
-        try:
-            saved = json.loads(path.read_text())
-        except (OSError, ValueError):
-            saved = {}
+        saved = small_json(path)
         saved = saved if isinstance(saved, dict) else {}
         before = json.dumps(saved, sort_keys=True)
         for name in ("order", "hidden"):
@@ -1134,7 +1149,7 @@ def change_bar(profile: str, fields: dict) -> dict:
             # Only the pace: where a feed reads from is the bot's to set, where the owner can read it in chat.
             try:
                 saved["feed"]["every"] = max(FEED_SHORTEST, min(FEED_LONGEST, int(fields["feed"].get("every"))))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
         if json.dumps(saved, sort_keys=True) != before:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1147,14 +1162,13 @@ def save_filled(home: pathlib.Path, change) -> None:
     with bars_lock:
         filled = bar_filled(home)
         change(filled)
-        (home / "hermit").mkdir(parents=True, exist_ok=True)
-        write_json(home / "hermit" / "bar-values.json", filled)
+        write_filled(home, filled)
 
 
 def drop_feed_values(home: pathlib.Path) -> None:
     filled = bar_filled(home)
     if any(name in filled for name in ("feed", "feed_at", "feed_problem")):
-        write_json(home / "hermit" / "bar-values.json", {k: v for k, v in filled.items() if not k.startswith("feed")})
+        write_filled(home, {k: v for k, v in filled.items() if not k.startswith("feed")})
 
 
 def app_sets_bar(profile: str, fields: dict) -> dict:
@@ -1182,36 +1196,59 @@ def app_sets_bar(profile: str, fields: dict) -> dict:
     return {"text": (bot_status(home, bar_prefs(profile)) or {}).get("text")}
 
 
-class NoRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
+def feed_address(address: str) -> tuple[str, str, int] | None:
+    """Where a feed lives, as (host, checked IP address, port), or None unless it's https on the open internet.
+    A feed is chosen by a bot, so it must never reach this Mac, the home network or the tailnet."""
+    parts = urlparse(address)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
         return None
+    try:
+        port = parts.port or 443
+        found = socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
+    except (OSError, ValueError):
+        return None
+    addresses = [entry[4][0].split("%")[0] for entry in found]
+    if not addresses or not all(ipaddress.ip_address(one).is_global for one in addresses):
+        return None
+    return parts.hostname, addresses[0], port
 
 
 def feed_address_ok(address: str) -> bool:
-    """True for an https address on the open internet. A feed is chosen by a bot, so it must never reach
-    this Mac, the home network or the tailnet."""
-    parts = urlparse(address)
-    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
-        return False
-    try:
-        found = socket.getaddrinfo(parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
-    except OSError:
-        return False
-    return bool(found) and all(ipaddress.ip_address(entry[4][0].split("%")[0]).is_global for entry in found)
+    return feed_address(address) is not None
+
+
+class PinnedConnection(http.client.HTTPSConnection):
+    """Connects to the address that was checked, not to whatever the name says a moment later, so a name
+    that answers with a public address for the check and a private one for the request gets nowhere."""
+
+    def __init__(self, host: str, pinned: str, port: int):
+        super().__init__(host, port, timeout=8, context=ssl.create_default_context())
+        self.pinned = pinned
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self.pinned, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
 
 
 def feed_fetch(address: str):
     """The JSON a feed answers with. Raises ValueError with a reason worth showing the owner."""
-    if not feed_address_ok(address):
+    where = feed_address(address)
+    if where is None:
         raise ValueError("The feed's address has to be a public https one.")
-    request = urllib.request.Request(address, headers={"Accept": "application/json", "User-Agent": "status-feed"})
+    parts = urlparse(address)
+    connection = PinnedConnection(*where)
     try:
-        with urllib.request.build_opener(NoRedirects).open(request, timeout=8) as reply:
-            data = reply.read(FEED_LIMIT + 1)
-    except urllib.error.HTTPError as error:
-        raise ValueError(f"The feed answered {error.code}.") from None
-    except (OSError, ValueError):
+        connection.request("GET", (parts.path or "/") + ("?" + parts.query if parts.query else ""),
+                           headers={"Accept": "application/json", "User-Agent": "status-feed"})
+        reply = connection.getresponse()
+        # A redirect is refused rather than followed, since it could point anywhere.
+        if reply.status != 200:
+            raise ValueError(f"The feed answered {reply.status}.")
+        data = reply.read(FEED_LIMIT + 1)
+    except (OSError, http.client.HTTPException):
         raise ValueError("The feed couldn't be reached.") from None
+    finally:
+        connection.close()
     if len(data) > FEED_LIMIT:
         raise ValueError("The feed's answer is too big.")
     try:
@@ -1239,7 +1276,11 @@ def feed_value(template: str, data) -> str | None:
             missing = True
             return ""
         if match.group(2) and isinstance(found, (int, float)) and not isinstance(found, bool):
-            return str(round(found))
+            try:
+                return str(round(found))
+            except (ValueError, OverflowError):  # infinity, or not a number
+                missing = True
+                return ""
         return str(found)
 
     text = bar_text(re.sub(r"\{([^{}|]+)(?:\|(round))?\}", fill, template))
@@ -1267,7 +1308,11 @@ def feeds_due(now: float) -> list[tuple[str, pathlib.Path, dict]]:
     """Feeds to read now: on, shown, and past their pace or changed since the last read."""
     due = []
     for profile, home in homes().items():
-        feed, prefs = bar_config(home)["feed"], bar_prefs(profile)
+        try:
+            feed, prefs = bar_config(home)["feed"], bar_prefs(profile)
+        except Exception as error:  # One bot's bad file must never stop the others' feeds.
+            print(f"feed {profile}: {type(error).__name__}", flush=True)
+            continue
         if not feed or not prefs["show"] or not prefs["feed"]:
             continue
         mark = json.dumps(feed, sort_keys=True)
@@ -1282,9 +1327,12 @@ def feed_loop() -> None:
     while True:
         try:
             for profile, home, feed in feeds_due(time.time()):
-                refresh_feed(profile, home, feed)
-        except Exception as error:  # A bad feed must never stop the others.
-            print(f"feed: {error}", flush=True)
+                try:
+                    refresh_feed(profile, home, feed)
+                except Exception as error:  # A bad feed must never stop the others.
+                    print(f"feed {profile}: {type(error).__name__}", flush=True)
+        except Exception as error:
+            print(f"feed: {type(error).__name__}", flush=True)
         time.sleep(15)
 
 
@@ -1295,10 +1343,7 @@ def mini_apps(home: pathlib.Path, profile: str | None = None) -> list[dict]:
     for folder in sorted(root.iterdir()) if root.is_dir() else []:
         if not MINI_APP_NAME.fullmatch(folder.name) or folder.is_symlink() or not (folder / "index.html").is_file():
             continue
-        try:
-            details = json.loads((folder / "app.json").read_text())
-        except (OSError, ValueError):
-            details = {}
+        details = small_json(folder / "app.json")
         details = details if isinstance(details, dict) else {}
         title = " ".join(str(details.get("title") or "").split())[:40] or folder.name.replace("-", " ").title()
         icon = str(details.get("icon") or "")
@@ -1320,7 +1365,7 @@ def open_mini_app(profile: str, name: str) -> dict:
     with mini_app_lock:
         for old in [key for key, entry in mini_app_tickets.items() if entry["until"] < now]:
             del mini_app_tickets[old]
-        mini_app_tickets[ticket] = {"folder": (home / "hermit" / "apps" / name).resolve(), "until": now + MINI_APP_SECONDS,
+        mini_app_tickets[ticket] = {"folder": app_folder(home, name), "until": now + MINI_APP_SECONDS,
                                     "profile": profile, "name": name}
     return {"path": f"/apps/{ticket}/index.html", "title": app["title"]}
 
@@ -1334,6 +1379,10 @@ APP_PIDS = STATE / "app-servers.pids.json"
 SECRET_NAME = re.compile(r"[A-Z][A-Z0-9_]{1,60}")
 SERVER_BODY = 1024 * 1024
 SERVER_STARTS, SERVER_WINDOW = 5, 600
+# Names a mini app can't ask for as a secret: Hermes's own, and ones that would change how its server runs.
+SERVER_OWN_NAMES = {"API_SERVER_KEY", "PATH", "HOME", "LANG", "TMPDIR", "HOST", "PORT", "USER", "SHELL", "NODE_OPTIONS",
+                    "NODE_PATH", "BASH_ENV", "ENV"}
+SERVER_OWN_PREFIXES = ("HERMES_", "GATEWAY_", "AUXILIARY_", "HERMIT_", "PYTHON", "DYLD_", "LD_", "LC_", "TERMINAL_")
 servers_lock = threading.RLock()
 running_servers: dict[tuple[str, str], dict] = {}
 server_notes: dict[tuple[str, str], dict] = {}
@@ -1368,7 +1417,7 @@ def server_spec(details: dict) -> dict | None:
 def secret_allowed(name: str) -> bool:
     """A mini app may be given the owner's own keys, never Hermes's: not a bot's key, a model provider's
     key, or anything Hermes keeps for itself."""
-    if not SECRET_NAME.fullmatch(name) or name == "API_SERVER_KEY" or name.startswith(("HERMES_", "GATEWAY_", "AUXILIARY_", "HERMIT_")):
+    if not SECRET_NAME.fullmatch(name) or name in SERVER_OWN_NAMES or name.startswith(SERVER_OWN_PREFIXES):
         return False
     try:
         hermes_modules()
@@ -1420,7 +1469,9 @@ def bot_secrets(home: pathlib.Path, names: list[str]) -> dict[str, str]:
 
 def save_bot_secret(home: pathlib.Path, name: str, value: str) -> None:
     """Keeps a secret in the bot's .env, the plain file Hermes reads when there's no secrets manager."""
-    if "\n" in value or "\r" in value or "'" in value or "${" in value or not value.strip() or len(value) > 4000:
+    # Nothing that could end the line, or the quotes, and so start a setting of its own.
+    breaks = any(ord(char) < 32 or ord(char) == 127 or char in "\u0085\u2028\u2029" for char in value)
+    if breaks or "'" in value or "${" in value or not value.strip() or len(value) > 4000:
         raise FileProblem(400, "That value can't be saved here. Add it to this bot's .env on your Mac instead.")
     path = home / ".env"
     try:
@@ -1437,6 +1488,52 @@ def save_bot_secret(home: pathlib.Path, name: str, value: str) -> None:
     except BaseException:
         pathlib.Path(temporary).unlink(missing_ok=True)
         raise
+
+
+SANDBOX = "/usr/bin/sandbox-exec"
+
+
+def sandbox_profile(folder: pathlib.Path, program: str) -> str:
+    """What a mini app's server may touch on a Mac: its own folder, the internet, and the bridge.
+    Not the owner's files, not Hermes's (every bot's keys are in there), and no other program on this Mac."""
+    def quoted(path) -> str:
+        return json.dumps(str(path))
+    home = pathlib.Path.home()
+    runtime = pathlib.Path(os.path.realpath(program)).parent.parent
+    readable = [folder, HOME / "hermes-agent", runtime, pathlib.Path(sys.base_prefix)]
+    return "\n".join([
+        "(version 1)", "(allow default)",
+        f"(deny file-read* (subpath {quoted(home)}))",
+        "(allow file-read* " + " ".join(f"(subpath {quoted(path)})" for path in readable) + ")",
+        f"(allow file-read-metadata (subpath {quoted(home)}))",
+        '(deny file-write* (subpath "/"))',
+        f'(allow file-write* (subpath {quoted(folder)}) (subpath "/private/tmp") (subpath "/private/var/folders") '
+        '(literal "/dev/null") (literal "/dev/dtracehelper"))',
+        '(deny network-outbound (remote ip "localhost:*"))',
+        f'(allow network-outbound (remote ip "localhost:{HTTP_PORT}"))',
+    ])
+
+
+def sandboxed(command: list[str], folder: pathlib.Path) -> list[str]:
+    """The command wrapped in macOS's sandbox. Elsewhere it runs as it is, as the bot's own commands do."""
+    if sys.platform != "darwin" or not os.path.exists(SANDBOX):
+        return command
+    return [SANDBOX, "-p", sandbox_profile(folder, command[0]), *command]
+
+
+def stop_group(pid: int, signal_number: int) -> None:
+    try:
+        os.killpg(pid, signal_number)
+    except (OSError, PermissionError):
+        pass
+
+
+def process_started(pid: int) -> str:
+    """When a process started, as ps words it, to tell it from a later one that got the same number."""
+    try:
+        return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def servers_allowed() -> dict:
@@ -1466,10 +1563,7 @@ def server_summary(profile: str, name: str, spec: dict | None) -> dict:
 
 
 def app_details(home: pathlib.Path, name: str) -> dict:
-    try:
-        details = json.loads((home / "hermit" / "apps" / name / "app.json").read_text())
-    except (OSError, ValueError):
-        details = {}
+    details = small_json(home / "hermit" / "apps" / name / "app.json")
     return details if isinstance(details, dict) else {}
 
 
@@ -1485,21 +1579,35 @@ def server_detail(profile: str, name: str) -> dict:
     detail = server_summary(profile, name, spec)
     if spec:
         have = bot_secrets(home, spec["secrets"])
-        detail |= {"command": " ".join(spec["command"])[:300],
+        detail |= {"command": shlex.join(spec["command"]), "mark": spec["mark"],
                    "secrets": [{"name": secret, "have": secret in have, "allowed": secret_allowed(secret)} for secret in spec["secrets"]]}
         log = APP_LOGS / f"{profile}-{name}.log"
         try:
-            detail["log"] = "\n".join(log.read_text(errors="replace").splitlines()[-12:])[-2000:]
+            with open(log, "rb") as file:
+                file.seek(max(0, log.stat().st_size - 4000))
+                detail["log"] = "\n".join(file.read().decode(errors="replace").splitlines()[-12:])[-2000:]
         except OSError:
             pass
     return detail
 
 
-def allow_server(profile: str, name: str, allow: bool) -> dict:
+def app_folder(home: pathlib.Path, name: str) -> pathlib.Path:
+    """A mini app's real folder, refused unless it is exactly where a mini app belongs: not a link to elsewhere."""
+    wanted = home.resolve() / "hermit" / "apps" / name
+    if not MINI_APP_NAME.fullmatch(name) or (home / "hermit" / "apps" / name).resolve() != wanted or not wanted.is_dir():
+        raise FileProblem(404, "That mini app isn't there any more.")
+    return wanted
+
+
+def allow_server(profile: str, name: str, allow: bool, mark: str | None = None) -> dict:
     home = homes()[profile]
+    app_folder(home, name)
     spec = server_spec(app_details(home, name))
     if spec is None:
         raise FileProblem(400, "That mini app has no server Hermit can run.")
+    if allow and mark != spec["mark"]:
+        # The OK is for the command and secrets that were on screen. If they changed since, it's shown again.
+        raise FileProblem(409, "This mini app's server changed while you were looking. Check it again.")
     with servers_lock:
         saved = servers_allowed()
         mine = saved.get(profile) if isinstance(saved.get(profile), dict) else {}
@@ -1521,6 +1629,9 @@ def add_server_secret(profile: str, name: str, fields: dict) -> dict:
     secret = str(fields.get("name") or "")
     if spec is None or secret not in spec["secrets"] or not secret_allowed(secret):
         raise FileProblem(400, "That mini app doesn't ask for a secret by that name.")
+    if secret in bot_secrets(home, [secret]) or secret in plain_env(home):
+        # Never over a value that's already there: a bot could ask to "add" a name that means something else.
+        raise FileProblem(409, "That secret is already saved. Change it on your Mac, where Hermes keeps it.")
     save_bot_secret(home, secret, str(fields.get("value") or ""))
     with servers_lock:
         server_notes.pop((profile, name), None)
@@ -1540,23 +1651,22 @@ def note_pids() -> None:
     """Which servers are running, on disk, so a bridge that was killed can clear them out when it's back."""
     try:
         STATE.mkdir(parents=True, exist_ok=True)
-        write_json(APP_PIDS, [{"pid": entry["process"].pid, "command": entry["line"]} for entry in running_servers.values()])
+        write_json(APP_PIDS, [{"pid": entry["process"].pid, "started": entry["started"]} for entry in running_servers.values()])
     except OSError:
         pass
 
 
 def stop_leftover_servers() -> None:
-    """Stops servers a previous bridge left behind, checking each is still the command it started."""
+    """Stops servers a previous bridge left behind, checking each is still the process it started."""
     try:
         left = read_json(APP_PIDS)
     except (OSError, ValueError):
         left = []
     for entry in left if isinstance(left, list) else []:
         try:
-            pid, line = int(entry["pid"]), str(entry["command"])
-            now = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
-            if now and now == line:
-                os.kill(pid, 15)
+            pid, started = int(entry["pid"]), str(entry["started"])
+            if started and process_started(pid) == started:
+                stop_group(pid, 15)
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
             continue
     pathlib.Path(APP_PIDS).unlink(missing_ok=True)
@@ -1584,28 +1694,34 @@ def start_server(profile: str, name: str, home: pathlib.Path, spec: dict) -> boo
         if program is None:
             note["problem"] = f"{spec['command'][0]} isn't installed on this Mac."
             return False
-        folder = (home / "hermit" / "apps" / name).resolve()
+        try:
+            folder = app_folder(home, name)
+        except FileProblem:
+            note["problem"] = "Its folder isn't where a mini app's should be."
+            return False
         port, token = free_port(), secrets.token_urlsafe(32)
         # Nothing of Hermes's or the bridge's own environment goes along: only these, and the named secrets.
-        env = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(pathlib.Path.home()), "LANG": "en_US.UTF-8",
+        base = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(pathlib.Path.home()), "LANG": "en_US.UTF-8",
                "TMPDIR": tempfile.gettempdir(), "PYTHONUNBUFFERED": "1", "HOST": "127.0.0.1", "PORT": str(port),
                "HERMIT_APP_DIR": str(folder), "HERMIT_STATUS_URL": f"http://127.0.0.1:{HTTP_PORT}/servers/bar",
-               "HERMIT_STATUS_TOKEN": token} | secrets_found
+               "HERMIT_STATUS_TOKEN": token}
+        env = secrets_found | base  # the server's own settings always win over a secret of the same name
         APP_LOGS.mkdir(parents=True, exist_ok=True)
         log = APP_LOGS / f"{profile}-{name}.log"
         if log.exists() and log.stat().st_size > 200_000:
             log.write_bytes(log.read_bytes()[-50_000:])
         try:
             with open(log, "ab") as output:
-                process = subprocess.Popen([program, *spec["command"][1:]], cwd=folder, env=env, stdin=subprocess.DEVNULL,
-                                           stdout=output, stderr=subprocess.STDOUT)
+                process = subprocess.Popen(sandboxed([program, *spec["command"][1:]], folder), cwd=folder, env=env,
+                                           stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
         except OSError as error:
             note["problem"] = f"It couldn't start: {error.strerror or type(error).__name__}."
             return False
         note["starts"].append(now)
         note.pop("problem", None)
         running_servers[key] = {"process": process, "port": port, "mark": spec["mark"], "token": token,
-                                "line": " ".join([program, *spec["command"][1:]])}
+                                "started": process_started(process.pid)}
         server_tokens[token] = key
         note_pids()
     return True
@@ -1619,12 +1735,12 @@ def stop_server(profile: str, name: str) -> None:
         server_tokens.pop(entry["token"], None)
         note_pids()
     process = entry["process"]
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
+    # Its own group, so anything the server started goes with it and nothing is left holding the secrets.
+    stop_group(process.pid, 15)
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        stop_group(process.pid, 9)
 
 
 def tend_servers() -> None:
@@ -2971,7 +3087,15 @@ class Handler(BaseHTTPRequestHandler):
             found = mini_app_file(match.group(1), urllib.parse.unquote(match.group(2)))
             if found is None:
                 return self.reply(404, b"Not found", "text/plain")
-            data = found.read_bytes()
+            try:
+                # Opened without following a link, in case the file was swapped for one after it was checked.
+                handle = os.open(found, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(handle, "rb") as file:
+                    data = file.read(MINI_APP_LIMIT + 1)
+            except OSError:
+                return self.reply(404, b"Not found", "text/plain")
+            if len(data) > MINI_APP_LIMIT:
+                return self.reply(404, b"Not found", "text/plain")
             self.send_response(200)
             self.send_header("Content-Type", MINI_APP_TYPES[found.suffix.lower().lstrip(".")])
             self.send_header("Content-Length", str(len(data)))
@@ -3296,7 +3420,12 @@ class Handler(BaseHTTPRequestHandler):
     do_DELETE = do_PATCH = do_PUT
 
     def body(self, limit: int = MAX_IMAGE) -> bytes:
-        return self.rfile.read(min(int(self.headers.get("Content-Length") or 0), limit + 1))
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        # Never a negative length, which would mean "read until the connection closes".
+        return self.rfile.read(max(0, min(length, limit + 1)))
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -3341,7 +3470,8 @@ class Handler(BaseHTTPRequestHandler):
             fields = fields if isinstance(fields, dict) else {}
             if match.group(3) == "secret":
                 return self.file_action(lambda: add_server_secret(profile, name, fields))
-            return self.file_action(lambda: allow_server(profile, name, fields.get("allow") is True))
+            mark = fields.get("mark") if isinstance(fields.get("mark"), str) else None
+            return self.file_action(lambda: allow_server(profile, name, fields.get("allow") is True, mark))
         if match := re.fullmatch(r"/bots/([a-z0-9_-]+)/bar(/values)?", path):
             profile = match.group(1)
             if profile not in homes() or not authorized(header, profile):

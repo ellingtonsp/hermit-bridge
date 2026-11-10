@@ -45,10 +45,12 @@ Rules the page must follow, because the app enforces them:
 
 What the page can ask the app to do, through `window.hermit`:
 
-- `send(text)` sends a message to you as if the user typed it, and closes the page. Use it for anything
-  that needs your judgment.
+- `send(text)` sends a message to you as if the user typed it, and closes the page. The user is shown the
+  message and confirms it first, so keep it short and say what it will do. Use it for anything that needs
+  your judgment.
 - `setStatus({name: value})` puts values on the status bar. An empty value removes one.
-- `openLink(url)` opens an https link outside. `close()` closes the page. `haptic()` taps.
+- `openLink(url)` opens an https link outside, after the user confirms the site. A normal `<a href>` link
+  the user taps opens without asking. `close()` closes the page. `haptic()` taps.
 
 ## The server
 

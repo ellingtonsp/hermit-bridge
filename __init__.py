@@ -558,7 +558,7 @@ def build_feed(value) -> dict:
         cleaned[key] = str(template)
     try:
         every = int(value.get("every") or 300)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError("every has to be a number of seconds") from None
     return {"url": link, "every": max(60, min(86400, every)), "values": cleaned}
 
@@ -600,8 +600,9 @@ def handle_bar(args, **_kwargs):
             status = json.loads((home / "hermit" / "status.json").read_text())
         except (OSError, ValueError):
             status = {}
+        profile = home.name if home.parent.name == "profiles" else "default"
         try:
-            filled = json.loads((home / "hermit" / "bar-values.json").read_text())
+            filled = json.loads((Path.home() / ".hermes" / "app-bridge" / "bar-values" / f"{profile}.json").read_text())
         except (OSError, ValueError):
             filled = {}
         result = {"order": saved.get("order") or [], "hidden": saved.get("hidden") or [], "feed": saved.get("feed"),
@@ -633,9 +634,11 @@ def build_server(value) -> dict:
     bad = [name for name in names if not SECRET_NAME.fullmatch(name)]
     if bad or len(names) > 12:
         raise ValueError("secrets are names of environment variables in capitals, such as TESLA_TOKEN, and 12 at most")
-    hermes = [name for name in names if name == "API_SERVER_KEY" or name.startswith(("HERMES_", "GATEWAY_", "AUXILIARY_", "HERMIT_"))]
+    own = {"API_SERVER_KEY", "PATH", "HOME", "LANG", "TMPDIR", "HOST", "PORT", "USER", "SHELL", "NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV"}
+    prefixes = ("HERMES_", "GATEWAY_", "AUXILIARY_", "HERMIT_", "PYTHON", "DYLD_", "LD_", "LC_", "TERMINAL_")
+    hermes = [name for name in names if name in own or name.startswith(prefixes)]
     if hermes:
-        raise ValueError(f"{hermes[0]} belongs to Hermes and can't be given to a mini app")
+        raise ValueError(f"{hermes[0]} belongs to Hermes or the system and can't be given to a mini app")
     return {"command": command, "secrets": list(dict.fromkeys(names))}
 
 
@@ -647,7 +650,11 @@ def handle_mini_app(args, **_kwargs):
         folder = _bot_home() / "hermit" / "apps" / name
         folder.mkdir(parents=True, exist_ok=True)
         about = folder / "app.json"
-        details = json.loads(about.read_text()) if about.exists() else {}
+        try:
+            details = json.loads(about.read_text()) if about.exists() else {}
+        except ValueError:
+            details = {}
+        details = details if isinstance(details, dict) else {}
         for key in ("title", "icon"):
             if _text(args.get(key)):
                 details[key] = _text(args.get(key))[:40]
