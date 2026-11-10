@@ -2834,6 +2834,7 @@ TIDINGS_SOURCES = {"calendar": "Calendar, the next two weeks", "reminders": "Rem
 TIDINGS_HOURS = (7, 16)
 TIDINGS_REFRESH_SECONDS = 900
 TIDINGS_RUN_SECONDS = 300
+TIDINGS_RETRY_SECONDS = 10
 TIDINGS_DAYS = 7
 TIDINGS_CHAT_CHARS = 6000
 TIDINGS_MESSAGE_CHARS = 700
@@ -3128,10 +3129,17 @@ def run_tidings(run=subprocess.run) -> None:
         try:
             with os.fdopen(handle, "w") as file:
                 file.write(ask)
-            done = run(tidings_command(state, query), capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                       timeout=TIDINGS_RUN_SECONDS + 60, env=hermes_env(), cwd=str(tidings_home()))
+            for attempt in range(2):
+                done = run(tidings_command(state, query), capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           timeout=TIDINGS_RUN_SECONDS + 60, env=hermes_env(), cwd=str(tidings_home()))
+                if done.returncode == 0:
+                    break
+                # The first run in a bot made moments ago has failed once and worked on the next try.
+                said = [line for line in (done.stdout + done.stderr).splitlines() if line.strip()]
+                print(f"tidings: run exit {done.returncode}: {clipped(said[-1], 160) if said else 'no output'}", flush=True)
+                if attempt == 0:
+                    time.sleep(TIDINGS_RETRY_SECONDS)
             if done.returncode != 0:
-                print(f"tidings: run exit {done.returncode}", flush=True)
                 problem = "Tidings couldn't run. Check its model in Settings."
             else:
                 cards = tidings_cards(done.stdout, bots, state["web"], material)
