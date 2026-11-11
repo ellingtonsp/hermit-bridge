@@ -2837,7 +2837,7 @@ TIDINGS_RUN_SECONDS = 300
 TIDINGS_RETRY_SECONDS = 10
 # Raise this whenever TIDINGS_ASK or TIDINGS_SOUL changes, so a rating can be traced to the words that
 # produced its card.
-TIDINGS_PROMPT = 4
+TIDINGS_PROMPT = 5
 # Ratings and what each run read, kept on this Mac to judge and improve the prompt. Never sent anywhere.
 TIDINGS_EVALS = STATE / "tidings-evals.jsonl"
 TIDINGS_RUNS = STATE / "tidings-runs"
@@ -2851,6 +2851,8 @@ TIDINGS_KINDS = {"action": "a step the owner could take", "trip": "something abo
                  "followup": "something promised, drafted or awaited that hasn't happened",
                  "headsup": "a clash, a gap or a date coming up", "link": "something worth reading"}
 TIDINGS_GUIDE_CHARS = 500
+TIDINGS_LESSON_DAYS = 45
+TIDINGS_LESSONS = 8
 TIDINGS_LIMITS = {"limit": (1, 10, 6), "days": (1, 14, 7), "keep": (0, 365, 60)}
 TIDINGS_SOUL = """You write the cards in the owner's Tidings feed in Hermit.
 
@@ -2874,7 +2876,7 @@ Answer with a JSON list only, at most {limit} cards, each an object with:
 - "link": a web address, only one that appears in the material{web}
 - "about": the ids in square brackets of the Calendar or Reminders lines the card is about, if any
 - "place": optional, the street address or named place the card is about, as it appears in the material
-{action}{guide}
+{action}{guide}{lessons}
 Today is {today}.
 
 Open cards: {open}
@@ -2897,6 +2899,36 @@ TIDINGS_GUIDE = """
 The owner's own words on what they want from this feed, which outrank the advice above:
 {guide}
 """
+
+
+TIDINGS_LEARNED = """
+What the owner made of earlier cards. Write more like the ones they liked, and steer away from what they
+didn't, taking their words as the reason:
+{lessons}
+"""
+
+
+def tidings_lessons(now: float | None = None) -> str:
+    """The owner's latest thumb on each recent card, as lines for the bot to learn from. Thumbs down come
+    with what was written about them, which is the most useful part."""
+    if not TIDINGS_EVALS.exists():
+        return ""
+    since = (now or time.time()) - TIDINGS_LESSON_DAYS * 86400
+    latest = {}
+    for line in TIDINGS_EVALS.read_text().splitlines()[-4000:]:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "rating" and entry.get("card") and float(entry.get("at") or 0) > since:
+            latest[entry["card"]] = entry  # a later thumb, or taking one back, replaces the earlier
+    lines = {"up": [], "down": []}
+    for entry in sorted(latest.values(), key=lambda entry: entry["at"], reverse=True):
+        rating = entry.get("rating")
+        if rating in lines and len(lines[rating]) < TIDINGS_LESSONS:
+            words = f": {entry['note']}" if rating == "down" and entry.get("note") else ""
+            lines[rating].append(f"- {'Liked' if rating == 'up' else 'Not useful'}: \"{entry.get('title')}\" ({entry.get('kind')}){words}")
+    return "\n".join(lines["down"] + lines["up"])
 
 
 def tidings_number(value, name: str) -> int:
@@ -2926,6 +2958,7 @@ def tidings_state() -> dict:
             "kinds": [kind for kind in TIDINGS_KINDS if kind in saved["kinds"]] if isinstance(saved.get("kinds"), list)
             else list(TIDINGS_KINDS),
             "asks": saved.get("asks") is not False, "thumbs": saved.get("thumbs") is not False,
+            "learns": saved.get("learns") is not False,
             "guide": saved.get("guide") if isinstance(saved.get("guide"), str) else "",
             "hours": tidings_hours(saved.get("hours")) or list(TIDINGS_HOURS),
             "chat": saved.get("chat") if isinstance(saved.get("chat"), str) else None,
@@ -2955,6 +2988,7 @@ def tidings_view(state: dict | None = None) -> dict:
             "ready": tidings_home().is_dir(), "running": tidings_running.is_set(),
             "ran": state["ran"], "problem": state["problem"],
             "kinds": state["kinds"], "asks": state["asks"], "thumbs": state["thumbs"], "guide": state["guide"],
+            "learns": state["learns"],
             "hours": state["hours"], "limit": state["limit"], "days": state["days"], "keep": state["keep"],
             "chat": state["chat"] if state["chat"] in known else None, "lead": state["lead"],
             "cards": [card for card in state["cards"] if card.get("id") not in state["closed"]] if state["on"] else []}
@@ -3009,7 +3043,7 @@ def ensure_tidings(run=subprocess.run) -> None:
 def change_tidings(fields: dict) -> dict:
     with tidings_lock:
         state = tidings_state()
-        for name in ("on", "web", "calendar", "reminders", "asks", "thumbs"):
+        for name in ("on", "web", "calendar", "reminders", "asks", "thumbs", "learns"):
             if isinstance(fields.get(name), bool):
                 state[name] = fields[name]
         if isinstance(fields.get("kinds"), list):
@@ -3245,6 +3279,18 @@ def tidings_command(state: dict, query: pathlib.Path) -> list[str]:
     return command
 
 
+def tidings_question(asked: dict) -> str:
+    """The question for a run, from what the run was given. The eval script asks it again of saved runs."""
+    return TIDINGS_ASK.format(
+        limit=asked["limit"], today=asked["today"],
+        kinds=", ".join(f"{kind} ({TIDINGS_KINDS[kind]})" for kind in asked["kinds"]),
+        action=TIDINGS_ACTION if asked["bots"] else "",
+        guide=TIDINGS_GUIDE.format(guide=asked["guide"]) if asked["guide"] else "",
+        lessons=TIDINGS_LEARNED.format(lessons=asked["lessons"]) if asked["lessons"] else "",
+        web=", or one you found by searching" if asked["web"] else "",
+        open=json.dumps(asked["open"]), closed=json.dumps(asked["closed"]), material=asked["material"])
+
+
 def run_tidings(run=subprocess.run) -> None:
     """One run: gather, ask, keep the new cards. A run with nothing to read asks nothing."""
     state = tidings_state()
@@ -3258,17 +3304,13 @@ def run_tidings(run=subprocess.run) -> None:
     if material and state["kinds"]:
         open_cards = [card for card in state["cards"] if card.get("id") not in state["closed"]]
         closed = [card.get("key") for card in state["cards"] if card.get("id") in state["closed"]]
-        ask = TIDINGS_ASK.format(
-            limit=state["limit"], today=time.strftime("%A %B %d, %Y"),
-            kinds=", ".join(f"{kind} ({TIDINGS_KINDS[kind]})" for kind in state["kinds"]),
-            action=TIDINGS_ACTION if bots else "",
-            guide=TIDINGS_GUIDE.format(guide=state["guide"]) if state["guide"] else "",
-            web=", or one you found by searching" if state["web"] else "",
-            open=json.dumps([{"key": card.get("key"), "title": card.get("title")} for card in open_cards]),
-            closed=json.dumps(closed), material=material)
+        # Everything the question is made from, kept with the run so a new wording can be tried on it later.
         asked = {"today": time.strftime("%A %B %d, %Y"), "web": state["web"], "bots": bots,
                  "kinds": state["kinds"], "limit": state["limit"], "guide": state["guide"],
-                 "open": [card.get("key") for card in open_cards], "closed": closed, "material": material}
+                 "lessons": tidings_lessons() if state["learns"] and state["thumbs"] else "",
+                 "open": [{"key": card.get("key"), "title": card.get("title")} for card in open_cards],
+                 "closed": closed, "material": material}
+        ask = tidings_question(asked)
         handle, name = tempfile.mkstemp(prefix="tidings.", suffix=".txt")
         query = pathlib.Path(name)
         try:
@@ -3314,6 +3356,7 @@ def run_tidings(run=subprocess.run) -> None:
         keep_tidings_run(run_id, asked | {"prompt": TIDINGS_PROMPT, "model": model, "answer": answer}, state["keep"])
         tidings_log("run", run=run_id, prompt=TIDINGS_PROMPT, model=model.get("model"), web=asked["web"],
                     kinds=asked["kinds"], limit=asked["limit"], guided=bool(asked["guide"]),
+                    lessons=len(asked["lessons"].splitlines()),
                     sources=bots + [name for name in TIDINGS_SOURCES if state[name]], problem=problem,
                     cards=[card_record(card) for card in fresh])
     print(f"tidings: {len(cards)} cards, {len(fresh)} new", flush=True)
