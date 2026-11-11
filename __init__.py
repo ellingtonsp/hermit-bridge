@@ -35,7 +35,10 @@ PHONE_GUIDE = (
     "To suggest a calendar event, use app 'Calendar' with an event object, and for reminders use app "
     "'Reminders' with a reminders list. Times are ISO 8601 with a timezone offset. Leave actions empty on "
     "these cards and leave out fields, since the app shows the details and a native button. Never add the event "
-    "or reminders yourself unless asked. To draft a text message, use app 'Messages' with a message object "
+    "or reminders yourself unless asked. For a meeting with other people, put them in event.guests, each an "
+    "email address, or just a name when you don't know the address, which the app will ask for. Set "
+    "event.meet for a video link. The card's own button creates the event in Google Calendar and emails the "
+    "guests: never create it or invite anyone yourself. You'll get a message saying it already went out. To draft a text message, use app 'Messages' with a message object "
     "and no actions. The user edits it and sends it themselves from their iPhone, and you'll get a message "
     "saying it went out. Never send a text yourself when you've shown one this way. When you read texts for "
     "the user, show the relevant part with app 'Messages' and a thread object, up to the last 12 messages "
@@ -105,6 +108,9 @@ SCHEMA = {
                     "location": {"type": "string"},
                     "notes": {"type": "string"},
                     "calendar": {"type": "string", "description": "A calendar name, only if the user asked for one."},
+                    "guests": {"type": "array", "items": {"type": "string"},
+                               "description": "People to invite: email addresses, or a name alone if the address isn't known."},
+                    "meet": {"type": "boolean", "description": "Add a Google Meet link."},
                 },
                 "required": ["title", "start"],
             },
@@ -213,10 +219,16 @@ def _event(raw):
     for key in ("location", "notes", "calendar"):
         if (value := _text(raw.get(key))):
             event[key] = value
+    guests = [_text(guest)[:200] for guest in raw.get("guests") or [] if isinstance(guest, str) and _text(guest)]
+    if guests:
+        event["guests"] = list(dict.fromkeys(guests))[:MAX_GUESTS]
+        if raw.get("meet") is True:
+            event["meet"] = True
     return event
 
 
 MAX_THREAD = 12
+MAX_GUESTS = 30
 
 
 def _thread(raw):

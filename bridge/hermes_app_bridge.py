@@ -8,6 +8,7 @@ events over loopback UDP, which can't slow the agent down.
 """
 import asyncio
 import base64
+import datetime
 import fcntl
 import glob
 import hashlib
@@ -77,6 +78,7 @@ def tool_path(name: str) -> str:
 GOG = tool_path("gog")
 GOG_ENV = HOME / "scripts/gog_env.sh"
 MAIL_SENT = STATE / "mail-sent.json"
+INVITES_SENT = STATE / "invites-sent.json"
 INBOX = STATE / "inbox.json"
 VOICE_PREFS = STATE / "voice-prefs.json"
 FILE_HISTORY = STATE / "file-history"
@@ -2414,7 +2416,7 @@ def card_need(content: str | None) -> dict | None:
 
 
 # What the app sends after a card is used elsewhere, such as a mail sent from its card.
-CARD_RESULTS = ("Sent the email", "Sent the message")
+CARD_RESULTS = ("Sent the email", "Sent the message", "Sent the invitation")
 
 
 def reply_text(content: str | None) -> str:
@@ -2616,6 +2618,97 @@ def send_mail(draft: dict) -> dict:
         message = (re.search(r'"(?:messageId|id)"\s*:\s*"([^"]+)"', result.stdout or "") or [None, "sent"])[1]
         write_json(MAIL_SENT, {**sent, key: message})
     return {"sent": True, "id": message}
+
+
+def calendar_accounts() -> list[str]:
+    """The Google accounts signed in on this Mac, any of which can hold a meeting and invite its guests."""
+    result = run_gog(["auth", "list"])
+    if result.returncode != 0:
+        raise RuntimeError(f"gog couldn't list accounts: exit {result.returncode}")
+    return [account["email"] for account in json.loads(result.stdout).get("accounts", []) if account.get("email")]
+
+
+def found_in(value, name: str) -> str | None:
+    """The first text under this name, however deep the answer nests it."""
+    if isinstance(value, dict):
+        if isinstance(value.get(name), str) and value[name]:
+            return value[name]
+        value = list(value.values())
+    for inner in value if isinstance(value, list) else []:
+        if (found := found_in(inner, name)):
+            return found
+    return None
+
+
+def send_invite(draft: dict) -> dict:
+    """Makes the meeting on the card in Google Calendar, which emails its guests. Like a mail card, it goes
+    out once: anything other than a clear failure stays recorded as sent."""
+    key, account = str(draft.get("id") or ""), str(draft.get("account") or "")
+    title = " ".join(str(draft.get("title") or "").split())
+    guests = draft.get("guests") if isinstance(draft.get("guests"), list) else []
+    guests = list(dict.fromkeys(mail_addresses(",".join(str(guest) for guest in guests))))
+    if not key:
+        raise ValueError("This card can't be sent")
+    if not title:
+        raise ValueError("Add a title")
+    if not guests:
+        raise ValueError("Add a guest")
+    if len(guests) > 50:
+        raise ValueError("That's too many guests for one card")
+    try:
+        start = datetime.datetime.fromisoformat(str(draft.get("start") or ""))
+        end = datetime.datetime.fromisoformat(str(draft["end"])) if draft.get("end") else None
+    except ValueError:
+        raise ValueError("That time couldn't be read") from None
+    arguments = ["calendar", "create", "primary", "-a", account, f"--summary={title}",
+                 f"--attendees={','.join(guests)}", "--send-updates=all"]
+    if draft.get("all_day") is True:
+        # Google counts an all-day event up to, and not including, its last date.
+        last = (end or start).date() + datetime.timedelta(days=1)
+        arguments += ["--all-day", f"--from={start.date().isoformat()}", f"--to={last.isoformat()}"]
+    else:
+        if start.tzinfo is None or (end and end.tzinfo is None):
+            raise ValueError("That time needs a timezone")
+        end = end or start + datetime.timedelta(minutes=30)
+        if end <= start:
+            raise ValueError("It ends before it starts")
+        arguments += [f"--from={start.isoformat()}", f"--to={end.isoformat()}"]
+    for name, flag in (("location", "--location"), ("notes", "--description")):
+        if (text := str(draft.get(name) or "").strip()):
+            arguments.append(f"{flag}={clipped(text, 4000)}")
+    if draft.get("meet") is True:
+        arguments.append("--with-meet")
+    if account not in calendar_accounts():
+        raise ValueError("Choose a Google account to invite from")
+    if draft.get("dry_run") is True:
+        result = run_gog(["--dry-run", *arguments])
+        return {"sent": False, "request": json.loads(result.stdout).get("request")}
+    with mail_lock:
+        sent = read_json(INVITES_SENT)
+        if sent.get(key) == "pending":
+            raise ValueError("This may already have gone out. Check your calendar")
+        if key in sent:
+            return {"sent": True, "repeat": True, **sent[key]}
+        write_json(INVITES_SENT, {**sent, key: "pending"})
+    try:
+        result = run_gog(arguments)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Google didn't answer. Check your calendar before trying again") from None
+    with mail_lock:
+        sent = read_json(INVITES_SENT)
+        if result.returncode != 0:
+            sent.pop(key, None)
+            write_json(INVITES_SENT, sent)
+            print(f"invite failed: exit {result.returncode}", flush=True)
+            raise ValueError("Google didn't make that event. No one was invited")
+        try:
+            answer = json.loads(result.stdout or "{}")
+        except ValueError:
+            answer = {}
+        made = {"id": found_in(answer, "id") or "sent", "link": found_in(answer, "htmlLink"),
+                "meet": found_in(answer, "hangoutLink"), "guests": len(guests)}
+        write_json(INVITES_SENT, {**sent, key: made})
+    return {"sent": True, **made}
 
 
 def configured_models() -> list[dict]:
@@ -3806,6 +3899,10 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.guarded(lambda: {"accounts": [{k: a[k] for k in ("email", "default")} for a in mail_accounts()]})
+        if url.path == "/calendar/accounts":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            return self.guarded(lambda: {"accounts": calendar_accounts()})
         if url.path == "/voice/status":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -3961,6 +4058,20 @@ class Handler(BaseHTTPRequestHandler):
             print(f"mail error: {type(error).__name__}", flush=True)
             self.json(502, {"error": {"message": "Gmail didn't send that. Check Sent before trying again"}})
 
+    def calendar_invite(self, header) -> None:
+        data = self.body(MAX_MAIL_BODY)
+        if not authorized(header):
+            return self.json(401, {"error": "unauthorized"})
+        try:
+            self.json(200, send_invite(json.loads(data)))
+        except json.JSONDecodeError:
+            self.json(400, {"error": {"message": "That invitation couldn't be read"}})
+        except ValueError as error:
+            self.json(400, {"error": {"message": str(error)}})
+        except Exception as error:
+            print(f"invite error: {type(error).__name__}", flush=True)
+            self.json(502, {"error": {"message": "Google didn't make that event. Check your calendar before trying again"}})
+
     def file_action(self, action) -> None:
         try:
             return self.json(200, action())
@@ -4071,6 +4182,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.control_action(path, header)
         if path == "/mail/send":
             return self.mail_send(header)
+        if path == "/calendar/invite":
+            return self.calendar_invite(header)
         if path == "/calls":
             fields = json.loads(self.body() or b"{}")
             profile = str(fields.get("profile") or "")
