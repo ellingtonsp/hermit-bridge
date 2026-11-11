@@ -381,6 +381,10 @@ def bot_details(name: str, home: pathlib.Path) -> dict:
     }
 
 
+class GatewayUnavailable(Exception):
+    """Hermes's gateway can't be reached just now, usually because it's restarting. The text is its state."""
+
+
 async def open_gateway(home: pathlib.Path):
     """A same-user socket to the gateway serving `home`. Host scope is what Hermes Desktop uses to
     act for several profiles. Returns (websocket context, client class)."""
@@ -389,7 +393,12 @@ async def open_gateway(home: pathlib.Path):
     from hermes_cli.gateway_runtime import ensure_gateway_runtime, gateway_profile_home
     from websockets.asyncio.client import connect
     served = gateway_profile_home(home)
-    endpoint = (await asyncio.to_thread(ensure_gateway_runtime, served, idle_exit=True)).endpoint
+    runtime = await asyncio.to_thread(ensure_gateway_runtime, served, idle_exit=True)
+    endpoint = getattr(runtime, "endpoint", None)
+    if endpoint is None:
+        # Hermes answers with no endpoint while its gateway starts, stops or restarts. Asking for a ticket
+        # anyway failed inside Hermes with an AttributeError, which read in the log like a bridge bug.
+        raise GatewayUnavailable(f"{getattr(runtime, 'state', '')} {getattr(runtime, 'reason_code', '') or ''}".strip())
     ticket = await asyncio.to_thread(client._session_ticket, served, endpoint, scope="host")
     url, protocols = client.gateway_ws_target(endpoint, ticket)
     return connect(url, subprotocols=protocols, open_timeout=10, max_size=16 * 1024 * 1024, proxy=None), client
@@ -735,21 +744,26 @@ def reply_push(profile: str, session_id: str, reply: str, routine: str | None = 
         push(profile, reply, {"session": session_id}, "hermit.reply", routine)
 
 
-groups_cache: dict = {"rooms": [], "at": 0.0}
+groups_cache: dict = {"rooms": [], "at": 0.0, "worker": None}
+groups_lock = threading.Lock()
 GROUPS_WAIT_SECONDS = 4
 
 
 def group_list() -> list[dict]:
     """The gateway's socket can stall for half a minute while it restarts. Callers get the last list
-    after a few seconds, and the fetch keeps going in the background to update it."""
+    after a few seconds, and the fetch keeps going in the background to update it. Only one fetch runs
+    at a time, so a phone asking every few seconds doesn't pile up sockets on a stalled gateway."""
     def fetch():
         try:
             rooms = [room_summary(r) for r in gateway_rpc("groups.list", limit=50)["rooms"]]
             groups_cache.update(rooms=rooms, at=time.time())
         except Exception as error:
             print(f"groups: {type(error).__name__}", flush=True)
-    worker = threading.Thread(target=fetch, daemon=True)
-    worker.start()
+    with groups_lock:
+        worker = groups_cache.get("worker")
+        if worker is None or not worker.is_alive():
+            worker = groups_cache["worker"] = threading.Thread(target=fetch, daemon=True)
+            worker.start()
     worker.join(GROUPS_WAIT_SECONDS)
     return groups_cache["rooms"]
 
@@ -2494,7 +2508,8 @@ def load_inbox() -> dict:
 
 def inbox_state(sessions: list[dict]) -> list[dict]:
     known = homes()
-    wanted = [(s.get("profile"), s.get("session")) for s in sessions[:MAX_INBOX_SESSIONS]]
+    sessions = sessions if isinstance(sessions, list) else []
+    wanted = [(s.get("profile"), s.get("session")) for s in sessions[:MAX_INBOX_SESSIONS] if isinstance(s, dict)]
     wanted = [(p, s) for p, s in wanted if p in known and isinstance(s, str) and s]
     with inbox_lock:
         state = load_inbox()
@@ -2518,11 +2533,17 @@ def inbox_mark(profile: str, session_id: str, unread: bool) -> None:
         write_json(INBOX, {**state, "marked": marked})
 
 
+INBOX_CLOSED_KEPT = 1000
+
+
 def inbox_close(profile: str, session_id: str, card: str, how: str) -> None:
     """You answered or dismissed a card in the app, so it stops waiting everywhere."""
     with inbox_lock:
         state = load_inbox()
         closed = {**state.get("closed", {}), f"{inbox_key(profile, session_id)}:{card}": how}
+        # A card stops waiting after a week anyway, so only the latest closings matter. Without a cap this
+        # grew by one with every card closed, and every inbox poll read through all of it for each chat.
+        closed = dict(list(closed.items())[-INBOX_CLOSED_KEPT:])
         write_json(INBOX, {**state, "closed": closed})
 
 
@@ -2549,8 +2570,7 @@ def mail_accounts() -> list[dict]:
     if mail_cache[1] and time.time() - mail_cache[0] < MAIL_ACCOUNT_SECONDS:
         return mail_cache[1]
     found = []
-    for account in json.loads(run_gog(["auth", "list"]).stdout).get("accounts", []):
-        email = account["email"]
+    for email in calendar_accounts():
         result = run_gog(["gmail", "sendas", "list", "-a", email])
         if result.returncode != 0:
             raise RuntimeError(f"gog couldn't list addresses: exit {result.returncode}")
@@ -2573,6 +2593,8 @@ def mail_addresses(value) -> list[str]:
 def send_mail(draft: dict) -> dict:
     """Sends exactly what's on the card. A card can only go out once, even if the phone retries or
     loses the reply, so anything other than a clear failure stays recorded as sent."""
+    if not isinstance(draft, dict):
+        raise ValueError("That draft couldn't be read")
     key, sender = str(draft.get("id") or ""), str(draft.get("from") or "")
     to, cc = mail_addresses(draft.get("to")), mail_addresses(draft.get("cc"))
     subject, body = str(draft.get("subject") or "").strip(), str(draft.get("body") or "")
@@ -2621,7 +2643,8 @@ def send_mail(draft: dict) -> dict:
 
 
 def calendar_accounts() -> list[str]:
-    """The Google accounts signed in on this Mac, any of which can hold a meeting and invite its guests."""
+    """The Google accounts signed in on this Mac, any of which can hold a meeting and invite its guests.
+    Mail uses the same list, so a gog that can't unlock its keyring is an error, not unreadable output."""
     result = run_gog(["auth", "list"])
     if result.returncode != 0:
         raise RuntimeError(f"gog couldn't list accounts: exit {result.returncode}")
@@ -2643,6 +2666,8 @@ def found_in(value, name: str) -> str | None:
 def send_invite(draft: dict) -> dict:
     """Makes the meeting on the card in Google Calendar, which emails its guests. Like a mail card, it goes
     out once: anything other than a clear failure stays recorded as sent."""
+    if not isinstance(draft, dict):  # otherwise it failed as an AttributeError, worded as Google refusing
+        raise ValueError("That invitation couldn't be read")
     key, account = str(draft.get("id") or ""), str(draft.get("account") or "")
     title = " ".join(str(draft.get("title") or "").split())
     guests = draft.get("guests") if isinstance(draft.get("guests"), list) else []
@@ -2943,6 +2968,8 @@ TIDINGS_KEPT = 30
 TIDINGS_KINDS = {"action": "a step the owner could take", "trip": "something about a journey or an outing",
                  "followup": "something promised, drafted or awaited that hasn't happened",
                  "headsup": "a clash, a gap or a date coming up", "link": "something worth reading"}
+# Left in the bot's folder once it has been stripped, so one that wasn't is caught before it runs.
+TIDINGS_STRIPPED = ".hermit-stripped"
 TIDINGS_GUIDE_CHARS = 500
 TIDINGS_LESSON_DAYS = 45
 TIDINGS_LESSONS = 8
@@ -2979,6 +3006,7 @@ Closed cards, never raise again: {closed}
 """
 tidings_lock = threading.Lock()
 tidings_running = threading.Event()
+tidings_start_lock = threading.Lock()
 
 
 def tidings_home() -> pathlib.Path:
@@ -3116,12 +3144,17 @@ def strip_tidings_profile(home: pathlib.Path) -> None:
                 shutil.rmtree(entry, ignore_errors=True)
     (home / "SOUL.md").write_text(TIDINGS_SOUL)
     update_profile(home, look={"title": "Tidings", "hidden": True})
+    (home / TIDINGS_STRIPPED).write_text("")
 
 
 def ensure_tidings(run=subprocess.run) -> None:
     """Makes the bot the first time Tidings is switched on. It copies the main bot for its model sign-in."""
     home = tidings_home()
     if home.is_dir():
+        # Made, but perhaps never stripped: a failure between the two would leave it with the main bot's
+        # connectors, skills and memory, and it must never run like that.
+        if not (home / TIDINGS_STRIPPED).exists():
+            strip_tidings_profile(home)
         return
     done = run([hermes_binary(), "profile", "create", TIDINGS, "--clone-from", "default", "--no-alias",
                 "--description", "Writes the cards in Hermit's Tidings feed from what the owner allows. Contacts no one."],
@@ -3389,6 +3422,7 @@ def run_tidings(run=subprocess.run) -> None:
     state = tidings_state()
     if not state["on"] or not tidings_home().is_dir():
         return
+    ensure_tidings()  # strips a bot that was made but never stripped, and stops the run if that fails
     material, bots, opens = tidings_material(state)
     if not state["asks"]:
         bots = []
@@ -3457,12 +3491,14 @@ def run_tidings(run=subprocess.run) -> None:
 
 def start_tidings(pressed: bool = False) -> bool:
     """Starts a run unless one is going. A run asked for by hand waits out a short gap since the last."""
-    state = tidings_state()
-    if not state["on"] or tidings_running.is_set():
-        return False
-    if pressed and state["ran"] and time.time() - float(state["ran"]) < TIDINGS_REFRESH_SECONDS:
-        return False
-    tidings_running.set()
+    # Checked and set together, so the hourly loop and a press at the same moment can't both start a run.
+    with tidings_start_lock:
+        state = tidings_state()
+        if not state["on"] or tidings_running.is_set():
+            return False
+        if pressed and state["ran"] and time.time() - float(state["ran"]) < TIDINGS_REFRESH_SECONDS:
+            return False
+        tidings_running.set()
 
     def work():
         try:
@@ -3496,13 +3532,24 @@ def tidings_loop() -> None:
         time.sleep(300)
 
 
-def cleanup_loop() -> None:
+def clean_uploads(now: float | None = None) -> None:
     """Uploads are working copies, so old ones go. Chats keep their text and show a file chip."""
-    while True:
-        cutoff = time.time() - UPLOAD_DAYS * 86400
-        for path in UPLOADS.glob("*") if UPLOADS.exists() else []:
+    cutoff = (now or time.time()) - UPLOAD_DAYS * 86400
+    for path in UPLOADS.glob("*") if UPLOADS.exists() else []:
+        try:
             if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
+                path.unlink(missing_ok=True)
+        except OSError as error:  # one file that can't go must not keep the rest
+            print(f"cleanup: {type(error).__name__}", flush=True)
+
+
+def cleanup_loop() -> None:
+    # Without the try, one failed pass ended this thread and uploads were never cleaned again.
+    while True:
+        try:
+            clean_uploads()
+        except Exception as error:
+            print(f"cleanup: {type(error).__name__}", flush=True)
         time.sleep(86400)
 
 
@@ -3615,6 +3662,17 @@ def apns_token(config: dict) -> str:
                       headers={"kid": config["key_id"]})
 
 
+def apns_outcome(output: str) -> tuple[str, str]:
+    """The status curl wrote last, and Apple's one-word reason when it refused, such as BadDeviceToken.
+    Only the status was logged before, so a phone that never got pushes left no clue why."""
+    body, _, status = (output or "").rstrip("\n").rpartition("\n")
+    try:
+        reason = json.loads(body).get("reason") if body.strip() else None
+    except (ValueError, AttributeError):
+        reason = None
+    return status.strip(), reason if isinstance(reason, str) and re.fullmatch(r"[A-Za-z]{1,40}", reason) else ""
+
+
 def plain_text(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[*_`#>]", "", text)
@@ -3669,14 +3727,15 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
         host = "api.sandbox.push.apple.com" if device.get("sandbox") else "api.push.apple.com"
         # macOS curl speaks HTTP/2, which APNs requires. The token stays out of the process list.
         result = subprocess.run(
-            ["curl", "-s", "--http2", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "-K", "-",
+            ["curl", "-s", "--http2", "-m", "10", "-w", "\n%{http_code}", "-K", "-",
              "-d", body, f"https://{host}/3/device/{device['token']}"],
             input=f'header = "authorization: bearer {authorization}"\n'
                   f'header = "apns-topic: {push_topic(device.get("topic"), config["topic"])}"\nheader = "apns-push-type: alert"\n',
             capture_output=True, text=True)
-        if result.stdout.strip() == "410":
+        status, reason = apns_outcome(result.stdout)
+        if status == "410":
             gone.add(device["token"])
-        print(f"push {profile}: {result.stdout.strip()}", flush=True)
+        print(f"push {profile}: {status}{' ' + reason if reason else ''}", flush=True)
     settle_devices(gone, relay_tokens)
 
 
@@ -3981,12 +4040,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def guarded(self, work) -> None:
         try:
-            self.json(200, work())
+            value = work()
         except VoiceError as error:  # written for people, so it's shown as it is
-            self.json(409, {"error": {"message": str(error)}})
+            return self.json(409, {"error": {"message": str(error)}})
         except Exception as error:  # the app shows this message, so keep it free of internals
             print(f"gateway error: {type(error).__name__}: {error}", flush=True)
-            self.json(502, {"error": {"message": "Hermes couldn't complete that"}})
+            return self.json(502, {"error": {"message": "Hermes couldn't complete that"}})
+        # Sent outside the try: a phone that hung up mid-reply isn't a Hermes failure, and writing a
+        # second reply to a closed connection only raised again.
+        self.json(200, value)
 
     def inbox(self, path: str, header) -> None:
         data = self.body()
@@ -3994,6 +4056,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(401, {"error": "unauthorized"})
         try:
             fields = json.loads(data)
+            if not isinstance(fields, dict):  # read as the request it is, or .get below ended the connection
+                raise ValueError("not an object")
             if path == "/inbox/state":
                 return self.guarded(lambda: {"items": inbox_state(fields.get("sessions") or [])})
             if fields.get("profile") not in homes() or not fields.get("session"):
