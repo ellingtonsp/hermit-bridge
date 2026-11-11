@@ -2955,7 +2955,7 @@ TIDINGS_RUN_SECONDS = 300
 TIDINGS_RETRY_SECONDS = 10
 # Raise this whenever TIDINGS_ASK or TIDINGS_SOUL changes, so a rating can be traced to the words that
 # produced its card.
-TIDINGS_PROMPT = 5
+TIDINGS_PROMPT = 6
 # Ratings and what each run read, kept on this Mac to judge and improve the prompt. Never sent anywhere.
 TIDINGS_EVALS = STATE / "tidings-evals.jsonl"
 TIDINGS_RUNS = STATE / "tidings-runs"
@@ -2964,6 +2964,11 @@ TIDINGS_DAYS = 7
 TIDINGS_CHAT_CHARS = 6000
 TIDINGS_MESSAGE_CHARS = 700
 TIDINGS_KEPT = 30
+# A closed card is remembered long after it has left the feed, so its subject doesn't come back as new.
+TIDINGS_CLOSED_DAYS = 90
+TIDINGS_CLOSED_KEPT = 400
+TIDINGS_CLOSED_SHOWN = 80
+TIDINGS_SAME_SUBJECT = 0.75
 # The kinds of card, and what each means to the bot. Any of them can be switched off.
 TIDINGS_KINDS = {"action": "a step the owner could take", "trip": "something about a journey or an outing",
                  "followup": "something promised, drafted or awaited that hasn't happened",
@@ -3000,7 +3005,7 @@ Answer with a JSON list only, at most {limit} cards, each an object with:
 Today is {today}.
 
 Open cards: {open}
-Closed cards, never raise again: {closed}
+Closed cards, never raise again under any name or wording: {closed}
 
 {material}
 """
@@ -3248,13 +3253,51 @@ def card_record(card: dict) -> dict:
             "run": card.get("run")}
 
 
+def title_words(title) -> set[str]:
+    """The words that say what a card is about. Short ones carry little, but a number can be the whole
+    difference between two cards, so numbers are kept whatever their length."""
+    text = "".join(letter.lower() if letter.isalnum() else " " for letter in str(title or ""))
+    return {word for word in text.split() if len(word) > 2 or word.isdigit()}
+
+
+def same_subject(card: dict, others: list[dict]) -> bool:
+    """Whether a card is about what one of the others was. The bot picks each card's key and can pick a new
+    one for an old subject, so the key matching isn't enough: nearly the same title counts too."""
+    mine = title_words(card.get("title"))
+    for other in others:
+        if card.get("key") and card.get("key") == other.get("key"):
+            return True
+        theirs = title_words(other.get("title"))
+        if mine and theirs and len(mine & theirs) / len(mine | theirs) >= TIDINGS_SAME_SUBJECT:
+            return True
+    return False
+
+
+def closed_tidings(state: dict, now: float | None = None) -> dict:
+    """What's been closed and is still remembered, newest first, each with the key and title it had. One
+    closed before those were kept takes them from its card while the card is still in the feed."""
+    cards = {card.get("id"): card for card in state["cards"]}
+    since = (now or time.time()) - TIDINGS_CLOSED_DAYS * 86400
+    kept = {}
+    for card, entry in state["closed"].items():
+        entry = dict(entry) if isinstance(entry, dict) else {"how": "dismissed", "at": 0}
+        found = cards.get(card) or {}
+        entry.setdefault("key", found.get("key"))
+        entry.setdefault("title", found.get("title"))
+        # One with no date is from before dates were kept, and is remembered while its card is in the feed.
+        if float(entry.get("at") or 0) > since or card in cards:
+            kept[card] = entry
+    newest = sorted(kept.items(), key=lambda item: float(item[1].get("at") or 0), reverse=True)
+    return dict(newest[:TIDINGS_CLOSED_KEPT])
+
+
 def close_tiding(card: str, how: str) -> dict:
     with tidings_lock:
         state = tidings_state()
         found = next((entry for entry in state["cards"] if entry.get("id") == card), None)
         if found and card not in state["closed"]:
             how = "done" if how == "done" else "dismissed"
-            state["closed"][card] = {"how": how, "at": time.time()}
+            state["closed"][card] = {"how": how, "at": time.time(), "key": found.get("key"), "title": found.get("title")}
             save_tidings(state)
             tidings_log("outcome", how=how, **card_record(found))
     return tidings_view(state)
@@ -3430,7 +3473,8 @@ def run_tidings(run=subprocess.run) -> None:
     run_id = time.strftime("%Y%m%d-%H%M%S")
     if material and state["kinds"]:
         open_cards = [card for card in state["cards"] if card.get("id") not in state["closed"]]
-        closed = [card.get("key") for card in state["cards"] if card.get("id") in state["closed"]]
+        closed = [{"key": entry.get("key"), "title": entry.get("title")}
+                  for entry in list(closed_tidings(state).values())[:TIDINGS_CLOSED_SHOWN]]
         # Everything the question is made from, kept with the run so a new wording can be tried on it later.
         asked = {"today": time.strftime("%A %B %d, %Y"), "web": state["web"], "bots": bots,
                  "kinds": state["kinds"], "limit": state["limit"], "guide": state["guide"],
@@ -3468,14 +3512,21 @@ def run_tidings(run=subprocess.run) -> None:
     with tidings_lock:
         state = tidings_state()  # switches may have changed while the bot was thinking
         now = time.time()
-        have = {card.get("id") for card in state["cards"]}
+        state["closed"] = closed_tidings(state, now)
         allowed = set(state["allowed"])
-        fresh = [card for card in cards if card["id"] not in have and card["kind"] in state["kinds"]
-                 and ("action" not in card or (state["asks"] and card["action"]["bot"] in allowed))]
+        # Nothing already in the feed, and nothing closed, comes back, whatever the bot called it this time.
+        known = state["cards"] + [entry | {"id": card} for card, entry in state["closed"].items()]
+        have = {card.get("id") for card in known}
+        fresh, repeats = [], 0
+        for card in cards:
+            if card["kind"] not in state["kinds"] or ("action" in card and not (state["asks"] and card["action"]["bot"] in allowed)):
+                continue
+            if card["id"] in have or same_subject(card, known + fresh):
+                repeats += 1
+            else:
+                fresh.append(card)
         kept = [card for card in state["cards"] if now - float(card.get("at") or 0) < TIDINGS_DAYS * 86400]
         state["cards"] = (fresh + kept)[:TIDINGS_KEPT]
-        ids = {card["id"] for card in state["cards"]}
-        state["closed"] = {card: how for card, how in state["closed"].items() if card in ids}
         state["ran"], state["problem"] = now, problem
         save_tidings(state)
     if asked:
@@ -3483,10 +3534,10 @@ def run_tidings(run=subprocess.run) -> None:
         keep_tidings_run(run_id, asked | {"prompt": TIDINGS_PROMPT, "model": model, "answer": answer}, state["keep"])
         tidings_log("run", run=run_id, prompt=TIDINGS_PROMPT, model=model.get("model"), web=asked["web"],
                     kinds=asked["kinds"], limit=asked["limit"], guided=bool(asked["guide"]),
-                    lessons=len(asked["lessons"].splitlines()),
+                    lessons=len(asked["lessons"].splitlines()), repeats=repeats,
                     sources=bots + [name for name in TIDINGS_SOURCES if state[name]], problem=problem,
                     cards=[card_record(card) for card in fresh])
-    print(f"tidings: {len(cards)} cards, {len(fresh)} new", flush=True)
+    print(f"tidings: {len(cards)} cards, {len(fresh)} new, {repeats} already raised", flush=True)
 
 
 def start_tidings(pressed: bool = False) -> bool:
