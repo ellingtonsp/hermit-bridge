@@ -773,7 +773,7 @@ def on_pre_llm_call(user_message=None, session_id=None, **_kwargs):
 
 
 def _setup_arguments(parser):
-    parser.add_argument("action", choices=["setup"])
+    parser.add_argument("action", choices=["setup", "bridge"], help="setup connects the app; bridge runs its service")
     parser.add_argument("--check", action="store_true", help="report what's ready and change nothing")
     parser.add_argument("--yes", action="store_true", help="don't ask before each change")
     parser.add_argument("--url", help="your own https:// address, instead of Tailscale")
@@ -781,13 +781,27 @@ def _setup_arguments(parser):
 
 
 def _run_setup(args):
-    import pathlib, subprocess, sys
-    home = pathlib.Path.home() / ".hermes"
-    python = home / "hermes-agent/venv/bin/python3"
-    command = [str(python if python.exists() else sys.executable), str(pathlib.Path(__file__).parent / "bridge/hermit_setup.py")]
-    command += [flag for flag, on in (("--check", args.check), ("--yes", args.yes), ("--no-restart", args.no_restart)) if on]
-    command += ["--url", args.url] if args.url else []
-    return subprocess.call(command)
+    """`hermes hermit setup` and `hermes hermit bridge`. An older Hermes has a venv whose Python runs them. A
+    newer one keeps its packages where only its own launcher finds them, and this is already running inside
+    that launcher, so they run right here."""
+    import os, pathlib, runpy, subprocess, sys
+    folder = pathlib.Path(__file__).parent / "bridge"
+    script = folder / ("hermes_app_bridge.py" if args.action == "bridge" else "hermit_setup.py")
+    flags = [] if args.action == "bridge" else [
+        flag for flag, on in (("--check", args.check), ("--yes", args.yes), ("--no-restart", args.no_restart)) if on
+    ] + (["--url", args.url] if args.url else [])
+    python = pathlib.Path.home() / ".hermes/hermes-agent/venv/bin/python3"
+    if python.exists():
+        if args.action == "bridge":
+            os.execv(str(python), [str(python), str(script)])
+        return subprocess.call([str(python), str(script), *flags])
+    sys.argv = [str(script), *flags]
+    sys.path.insert(0, str(folder))
+    try:
+        runpy.run_path(str(script), run_name="__main__")
+    except SystemExit as done:
+        return done.code if isinstance(done.code, int) else int(bool(done.code))
+    return 0
 
 
 def register(ctx):

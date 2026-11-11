@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Connects Hermit to the Hermes on this Mac. Run through bridge/install.sh.
+"""Connects Hermit to the Hermes on this computer, a Mac or a Linux machine. Run through `hermes hermit setup`,
+or bridge/install.sh from a clone.
 
 --check only reports. Otherwise each change is listed and confirmed first. Nothing leaves this Mac, and
 the pairing code it prints is short-lived and holds no keys.
@@ -28,6 +29,10 @@ HTTPS_PORT = 8444
 BRIDGE_PORT = 8650
 API_PORT = "8642"
 BREW_FOLDERS = ("/opt/homebrew/bin", "/usr/local/bin")
+UNIT = "hermit-bridge.service"
+IS_MAC = sys.platform == "darwin"
+# What to call the machine Hermes runs on, in everything setup prints.
+HERE = "Mac" if IS_MAC else "computer"
 
 
 @dataclass
@@ -41,7 +46,7 @@ class Check:
 def find_tool(name: str, *extra: str) -> str | None:
     if found := shutil.which(name):
         return found
-    for folder in (*BREW_FOLDERS, *extra):
+    for folder in (*BREW_FOLDERS, str(pathlib.Path.home() / ".local/bin"), *extra):
         if os.access(path := os.path.join(folder, name), os.X_OK):
             return path
     return None
@@ -95,9 +100,56 @@ def tailnet_host(status: dict) -> str | None:
     return ((status.get("Self") or {}).get("DNSName") or "").rstrip(".") or None
 
 
-def launch_agent(python: str, bridge: str, log: str) -> bytes:
-    return plistlib.dumps({"Label": LABEL, "ProgramArguments": [python, bridge], "RunAtLoad": True,
+def launch_agent(python: str, bridge: str, log: str, command: list[str] | None = None) -> bytes:
+    return plistlib.dumps({"Label": LABEL, "ProgramArguments": command or [python, bridge], "RunAtLoad": True,
                            "KeepAlive": True, "StandardOutPath": log, "StandardErrorPath": log})
+
+
+def bridge_command(home: pathlib.Path, bridge: str, hermes: str | None) -> list[str]:
+    """How the service starts the bridge. An older Hermes has a venv whose Python can run it directly. A
+    newer one keeps its packages where only its own launcher finds them, so the bridge is started through
+    Hermes (`hermes hermit bridge`), which also survives Hermes moving things in an update."""
+    python = home / "hermes-agent/venv/bin/python3"
+    if python.exists():
+        return [str(python), bridge]
+    if hermes and (REPO / "plugin.yaml").exists():
+        return [hermes, "hermit", "bridge"]
+    return [sys.executable, bridge]
+
+
+def systemd_quote(word: str) -> str:
+    """One word of a unit's command: quoted, with systemd's own specials (backslash, quote, percent) escaped."""
+    for special, escaped in (("\\", "\\\\"), ('"', '\\"'), ("%", "%%")):
+        word = word.replace(special, escaped)
+    return f'"{word}"'
+
+
+def systemd_unit(command: list[str], log: str) -> str:
+    """A service of the user's own, so it needs no root and can't touch anything the user can't."""
+    return "\n".join([
+        "[Unit]", "Description=Hermit bridge: connects the Hermit app to Hermes", "After=network-online.target", "",
+        "[Service]", "ExecStart=" + " ".join(systemd_quote(word) for word in command),
+        "Restart=always", "RestartSec=2", f"StandardOutput=append:{log}", f"StandardError=append:{log}",
+        # Hermes's own modules can restart whoever imports them to finish an install. Not in a service.
+        "Environment=HERMES_DISABLE_LAZY_INSTALLS=1", "",
+        "[Install]", "WantedBy=default.target", ""])
+
+
+def user_systemd_works() -> bool:
+    try:
+        return subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def lingers() -> bool:
+    """Whether this user's services keep running with nobody logged in, which a server needs."""
+    import getpass
+    try:
+        name = getpass.getuser()
+    except (KeyError, OSError):
+        return False
+    return pathlib.Path("/var/lib/systemd/linger", name).exists()
 
 
 def pairing_code(home: pathlib.Path, url: str) -> str:
@@ -117,10 +169,11 @@ def current_host() -> str | None:
 
 
 def platform_problem(platform: str) -> str | None:
-    """The bridge runs as a macOS launch agent, so anything else has to stop before changes are made."""
-    if platform == "darwin":
+    """The bridge runs as a launch agent on a Mac and a systemd user service on Linux. Anything else has to
+    stop before changes are made."""
+    if platform == "darwin" or platform.startswith("linux"):
         return None
-    return "  MISSING  Mac: Hermit's setup only works with Hermes running on a Mac for now. Nothing was changed."
+    return "  MISSING  System: Hermit's setup works with Hermes on a Mac or on Linux. Nothing was changed."
 
 
 def checks(home: pathlib.Path, public_url: str | None = None) -> list[Check]:
@@ -130,13 +183,20 @@ def checks(home: pathlib.Path, public_url: str | None = None) -> list[Check]:
     host = current_host()
     reach = (Check("Your address", True, public_url) if public_url
              else Check("Tailscale", bool(host), host or "Install Tailscale and sign in, or pass --url with your own HTTPS address."))
-    return [
+    found_checks = [
         Check("Hermes", found["compatible"], version if found["compatible"] else found["problem"]),
         reach,
         Check("Node", bool(find_tool("node", *nvm_folders())), "Draws bot faces", required=False),
-        Check("rsvg-convert", bool(find_tool("rsvg-convert")), "Draws bot faces: brew install librsvg", required=False),
+        Check("rsvg-convert", bool(find_tool("rsvg-convert")),
+              "Draws bot faces: " + ("brew install librsvg" if IS_MAC else "install librsvg2-bin"), required=False),
         Check("gog", bool(find_tool("gog")), "Sends email from cards", required=False),
     ]
+    if not IS_MAC:
+        works = user_systemd_works()
+        found_checks.append(Check("systemd", works, "Runs the bridge as your own service" if works else
+                                  "Your user has no systemd session. Log in over SSH, or run `loginctl enable-linger $USER` first."))
+        found_checks.append(Check("Stays running", lingers(), "After you log out. If it says optional, an administrator runs: loginctl enable-linger <your user>", required=False))
+    return found_checks
 
 
 def nvm_folders() -> list[str]:
@@ -245,12 +305,23 @@ def bridge_answers(tries: int = 30, pause: float = 1, sleep=time.sleep, fetch=No
     return False
 
 
-def install_bridge(python: str, tailscale: str | None, api_port: str) -> None:
+def install_bridge(python: str, tailscale: str | None, api_port: str, hermes: str | None = None) -> None:
     (HOME / "logs").mkdir(exist_ok=True)
-    agent = pathlib.Path.home() / f"Library/LaunchAgents/{LABEL}.plist"
-    agent.parent.mkdir(parents=True, exist_ok=True)
-    agent.write_bytes(launch_agent(python, str(REPO / "bridge/hermes_app_bridge.py"), str(HOME / "logs/app-bridge.log")))
-    reload_service(f"gui/{os.getuid()}", agent)
+    bridge, log = str(REPO / "bridge/hermes_app_bridge.py"), str(HOME / "logs/app-bridge.log")
+    command = bridge_command(HOME, bridge, hermes)
+    if IS_MAC:
+        agent = pathlib.Path.home() / f"Library/LaunchAgents/{LABEL}.plist"
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.write_bytes(launch_agent(python, bridge, log, command))
+        reload_service(f"gui/{os.getuid()}", agent)
+    else:
+        unit = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config") / "systemd/user" / UNIT
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(systemd_unit(command, log))
+        run("systemctl", "--user", "daemon-reload")
+        run("systemctl", "--user", "enable", UNIT)
+        # Restart, not start: a bridge already running has to pick up the new copy.
+        run("systemctl", "--user", "restart", UNIT)
     if not tailscale:
         return
     run(tailscale, "serve", "--bg", f"--https={HTTPS_PORT}", f"http://127.0.0.1:{api_port}")
@@ -258,7 +329,7 @@ def install_bridge(python: str, tailscale: str | None, api_port: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Connect Hermit to the Hermes on this Mac.")
+    parser = argparse.ArgumentParser(description=f"Connect Hermit to the Hermes on this {HERE}.")
     parser.add_argument("--check", action="store_true", help="report what's ready and change nothing")
     parser.add_argument("--yes", action="store_true", help="don't ask before each change")
     parser.add_argument("--url", help="your own https:// address, instead of Tailscale")
@@ -301,7 +372,8 @@ def main() -> int:
     python = str(HOME / "hermes-agent/venv/bin/python3")
     if confirm(f"Install the Hermit bridge, reachable at {public_url or host}?", options.yes):
         try:
-            install_bridge(python if os.path.exists(python) else sys.executable, None if public_url else tailscale_binary(), API_PORT)
+            install_bridge(python if os.path.exists(python) else sys.executable, None if public_url else tailscale_binary(),
+                           API_PORT, hermes)
         except subprocess.CalledProcessError as error:
             print(f"\n  MISSING  Bridge: couldn't start it ({error.cmd[0]} exit {error.returncode}). Run setup again.")
             return 1
@@ -309,7 +381,7 @@ def main() -> int:
             print("\n  MISSING  Bridge: it didn't start. See ~/.hermes/logs/app-bridge.log, then run setup again.")
             return 1
     if public_url:
-        print(f"\nPoint {public_url} at this Mac: / to 127.0.0.1:{API_PORT}, /app to 127.0.0.1:{BRIDGE_PORT}, and")
+        print(f"\nPoint {public_url} at this {HERE}: / to 127.0.0.1:{API_PORT}, /app to 127.0.0.1:{BRIDGE_PORT}, and")
         print("/p/<profile> to any standalone profile. Your API keys are the only protection on a public address.")
     import hermes_app_bridge as bridge
     url = public_url or f"https://{host}:{HTTPS_PORT}"

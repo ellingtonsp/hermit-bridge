@@ -39,7 +39,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import jwt
-import yaml
+try:
+    import yaml
+except ImportError:
+    # A newer Hermes ships ruamel.yaml and no PyYAML. The bridge reads and writes plain mappings, so
+    # the two calls it uses are all that has to be stood in for.
+    import io
+    from ruamel.yaml import YAML as _RuamelYAML
+
+    class yaml:  # noqa: N801, the name the rest of the file imports
+        @staticmethod
+        def safe_load(text):
+            return _RuamelYAML(typ="safe", pure=True).load(text)
+
+        @staticmethod
+        def safe_dump(value, sort_keys=True, allow_unicode=False, **_):
+            writer = _RuamelYAML(typ="safe", pure=True)
+            writer.default_flow_style = False
+            writer.allow_unicode = allow_unicode
+            writer.sort_base_mapping_type_on_output = sort_keys
+            out = io.StringIO()
+            writer.dump(value, out)
+            return out.getvalue()
 
 HOME = pathlib.Path.home() / ".hermes"
 STATE = HOME / "app-bridge"
@@ -67,9 +88,16 @@ UPLOADS = STATE / "uploads"
 BREW_FOLDERS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 
+# Where a person's own tools live when a service starts them with a bare PATH: Homebrew on a Mac, and the
+# folders Hermes and other installers use in a home folder on any system.
+TOOL_FOLDERS = (*BREW_FOLDERS, str(pathlib.Path.home() / ".local/bin"), str(HOME / "bin"))
+IS_MAC = sys.platform == "darwin"
+SERVICE_UNIT = "hermit-bridge.service"
+
+
 def tool_path(name: str) -> str:
-    """launchd starts the bridge with a bare PATH, so Homebrew's folders are checked too."""
-    for folder in BREW_FOLDERS:
+    """A service starts the bridge with a bare PATH, so the folders tools are installed to are checked too."""
+    for folder in TOOL_FOLDERS:
         if os.access(path := os.path.join(folder, name), os.X_OK):
             return path
     return shutil.which(name) or name
@@ -102,7 +130,10 @@ MAIL_ACCOUNT_SECONDS = 600
 MAX_MAIL_BODY = 100_000
 EMAIL = re.compile(r"[^@\s,<>]+@[^@\s,<>]+\.[^@\s,<>]+")
 MAX_PUSH_IMAGE = 2_400
-BLOBATAR = HOME / "hermes-agent/node_modules/blobatar/dist/blob.js"
+# Hermes Desktop's own copy when it's installed, so faces match it exactly. A Hermes with no Desktop,
+# as on a server, has none, and the copy kept beside the bridge draws the same faces.
+BLOBATAR = next((path for path in (HOME / "hermes-agent/node_modules/blobatar/dist/blob.js",) if path.exists()),
+                pathlib.Path(__file__).with_name("third_party") / "blobatar/blob.js")
 RENDERER = pathlib.Path(__file__).with_name("render_faces.mjs")
 # Silhouette names and traits, matching Hermes Desktop's BLOB_KIND_TRAIT.
 FACE_KINDS = {"round": 0.11, "organic": 0.35, "boxy": 0.54, "capsule": 0.65, "nub": 0.745,
@@ -181,13 +212,26 @@ def update_script(hermes: str, plugin: str, domain: str, labels: list[str]) -> s
     return "sleep 1; " + shlex.quote(hermes) + " plugins update " + shlex.quote(plugin) + " && { " + "; ".join(restarts) + "; }"
 
 
+def linux_update_script(hermes: str, plugin: str) -> str:
+    """On Linux Hermes restarts its own gateways, however they were installed, and systemd restarts the bridge.
+    The bridge goes last, because that ends this process."""
+    return ("sleep 1; " + shlex.quote(hermes) + " plugins update " + shlex.quote(plugin) + " && { "
+            + shlex.quote(hermes) + " gateway restart --all --yes; systemctl --user restart " + SERVICE_UNIT + "; }")
+
+
+def hermes_binary() -> str:
+    """Hermes's own command. An older install keeps it in a venv, and a newer one on the PATH."""
+    bundled = HOME / "hermes-agent/venv/bin/hermes"
+    return str(bundled) if bundled.exists() else tool_path("hermes")
+
+
 def start_bridge_update() -> dict:
     if not (PLUGIN_ROOT / ".git").exists():
-        raise ValueError("This plugin was installed by hand, so update it on the Mac.")
-    bundled = HOME / "hermes-agent/venv/bin/hermes"
-    hermes = str(bundled) if bundled.exists() else tool_path("hermes")
-    script = update_script(hermes, PLUGIN_ROOT.name, f"gui/{os.getuid()}",
-                           restart_labels(pathlib.Path.home() / "Library/LaunchAgents"))
+        raise ValueError("This plugin was installed by hand, so update it on the computer Hermes runs on.")
+    hermes = hermes_binary()
+    script = (update_script(hermes, PLUGIN_ROOT.name, f"gui/{os.getuid()}",
+                            restart_labels(pathlib.Path.home() / "Library/LaunchAgents"))
+              if IS_MAC else linux_update_script(hermes, PLUGIN_ROOT.name))
     # Hermes's own commands should behave as they would from a terminal.
     env = {name: value for name, value in os.environ.items() if name != "HERMES_DISABLE_LAZY_INSTALLS"}
     with (HOME / "logs/hermit-update.log").open("ab") as log:
@@ -2050,8 +2094,7 @@ def ready_bot(name: str, home: pathlib.Path, run=subprocess.run) -> bool:
     """Gives a bot made after setup what setup gave the others: Hermit's plugin, switched on, with its
     card tool. Hermes loads an enabled plugin into the running gateway, so nothing restarts."""
     source = plugin_source()
-    bundled = HOME / "hermes-agent/venv/bin/hermes"
-    hermes = str(bundled) if bundled.exists() else tool_path("hermes")
+    hermes = hermes_binary()
     if source is None or not hermes:
         return False
     plugin, target = source
@@ -2648,6 +2691,10 @@ def calendar_accounts() -> list[str]:
     """The Google accounts signed in on this Mac, any of which can hold a meeting and invite its guests.
     Mail uses the same list, so a gog that can't unlock its keyring is an error, not unreadable output."""
     result = run_gog(["auth", "list"])
+    if result.returncode == 127:
+        # The shell's "no such command": gog isn't installed, so there are no Google accounts. That's an
+        # ordinary state, as on a server set up without it, and not a failure.
+        return []
     if result.returncode != 0:
         raise RuntimeError(f"gog couldn't list accounts: exit {result.returncode}")
     return [account["email"] for account in json.loads(result.stdout).get("accounts", []) if account.get("email")]
@@ -3120,11 +3167,6 @@ def tidings_view(state: dict | None = None) -> dict:
             "hours": state["hours"], "limit": state["limit"], "days": state["days"], "keep": state["keep"],
             "chat": state["chat"] if state["chat"] in known else None, "lead": state["lead"],
             "cards": [card for card in state["cards"] if card.get("id") not in state["closed"]] if state["on"] else []}
-
-
-def hermes_binary() -> str:
-    bundled = HOME / "hermes-agent/venv/bin/hermes"
-    return str(bundled) if bundled.exists() else tool_path("hermes")
 
 
 def hermes_env() -> dict:
@@ -3960,11 +4002,22 @@ def speech_status() -> dict:
             "openai": {"available": OPENAI_KEY.exists()}}
 
 
+def hermes_python() -> str:
+    """A Python that can import Hermes. An older install has a venv for it. A newer one keeps its packages
+    where only Hermes's own launcher knows, and there the bridge is already running inside that launcher,
+    so this very Python is the one, with its import path handed on (see `speech_env`)."""
+    bundled = HOME / "hermes-agent/venv/bin/python3"
+    return str(bundled) if bundled.exists() else sys.executable
+
+
 def speech_env() -> dict:
-    """launchd starts the bridge with a bare PATH, and a voice the owner set up as a command usually leans
-    on Homebrew's tools, ffmpeg above all. Without this a voice that works in a terminal fails here."""
-    path = ":".join([*BREW_FOLDERS, os.environ.get("PATH", "/usr/bin:/bin")])
-    return hermes_env() | {"HERMES_HOME": str(HOME), "PATH": path}
+    """A service starts the bridge with a bare PATH, and a voice the owner set up as a command usually leans
+    on tools of their own, ffmpeg above all. Without this a voice that works in a terminal fails here."""
+    path = ":".join([*TOOL_FOLDERS, os.environ.get("PATH", "/usr/bin:/bin")])
+    env = hermes_env() | {"HERMES_HOME": str(HOME), "PATH": path}
+    if hermes_python() == sys.executable:
+        env["PYTHONPATH"] = os.pathsep.join(entry for entry in sys.path if entry and os.path.exists(entry))
+    return env
 
 
 def speak_on_mac(text: str, run=subprocess.run) -> tuple[bytes, str]:
@@ -3972,7 +4025,7 @@ def speak_on_mac(text: str, run=subprocess.run) -> tuple[bytes, str]:
     with tempfile.TemporaryDirectory(prefix="hermit-speech.") as folder:
         work = pathlib.Path(folder)
         (work / "say.txt").write_text(text)
-        done = run([str(HOME / "hermes-agent/venv/bin/python3"), "-c", SPEECH_SCRIPT, str(HOME / "hermes-agent"),
+        done = run([hermes_python(), "-c", SPEECH_SCRIPT, str(HOME / "hermes-agent"),
                     str(work / "say.txt"), str(work / "said.wav")], capture_output=True, text=True,
                    stdin=subprocess.DEVNULL, timeout=SPEECH_SECONDS, env=speech_env())
         made, said = None, ""
@@ -4290,7 +4343,8 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/status":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
-            return self.json(200, {"push": True, "hermes": hermes_compatibility()})
+            # What it runs on, so the app can say "your Mac" or "your server" and hide what only a Mac can do.
+            return self.json(200, {"push": True, "hermes": hermes_compatibility(), "platform": "mac" if IS_MAC else "linux"})
         if match := re.fullmatch(r"/apps/([A-Za-z0-9_-]{20,80})/(.*)", url.path):
             # No key here by design: the ticket in the address is the permission. See open_mini_app.
             if match.group(2).startswith("api/"):
@@ -4395,7 +4449,12 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header, profile):
                 return self.json(401, {"error": "unauthorized"})
             seed = re.sub(r"[^a-z0-9]", "", (query.get("seed") or [""])[0])[:16] or secrets.token_hex(4)
-            images = render_faces([{"seed": seed, "trait": trait} for trait in FACE_KINDS.values()])
+            try:
+                images = render_faces([{"seed": seed, "trait": trait} for trait in FACE_KINDS.values()])
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                # Without Node or rsvg-convert there are no faces to offer, which isn't a broken connection.
+                print(f"faces: {type(error).__name__}", flush=True)
+                return self.json(503, {"error": {"message": "Faces can't be drawn here. Setup lists what's missing."}})
             return self.json(200, {"seed": seed, "faces": [
                 {"kind": kind, "png": base64.b64encode(image).decode()}
                 for kind, image in zip(FACE_KINDS, images)]})
