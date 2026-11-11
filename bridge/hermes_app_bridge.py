@@ -5407,6 +5407,10 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    # How many connections may wait to be picked up. Python's five was enough while the app only asked the
+    # bridge for a few things at a time. With a device key every bot's request comes here, sixteen at once
+    # on each refresh, and the ones past the fifth were refused before the bridge ever saw them.
+    request_queue_size = 128
 
     def handle_error(self, request, client_address):
         """A phone that drops a connection mid-reply is normal on mobile, so it isn't logged as a crash."""
