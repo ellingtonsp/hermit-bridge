@@ -2837,17 +2837,21 @@ TIDINGS_RUN_SECONDS = 300
 TIDINGS_RETRY_SECONDS = 10
 # Raise this whenever TIDINGS_ASK or TIDINGS_SOUL changes, so a rating can be traced to the words that
 # produced its card.
-TIDINGS_PROMPT = 3
+TIDINGS_PROMPT = 4
 # Ratings and what each run read, kept on this Mac to judge and improve the prompt. Never sent anywhere.
 TIDINGS_EVALS = STATE / "tidings-evals.jsonl"
 TIDINGS_RUNS = STATE / "tidings-runs"
-TIDINGS_RUN_DAYS = 60
 TIDINGS_NOTE_CHARS = 500
 TIDINGS_DAYS = 7
 TIDINGS_CHAT_CHARS = 6000
 TIDINGS_MESSAGE_CHARS = 700
 TIDINGS_KEPT = 30
-TIDINGS_KINDS = ("action", "trip", "followup", "headsup", "link")
+# The kinds of card, and what each means to the bot. Any of them can be switched off.
+TIDINGS_KINDS = {"action": "a step the owner could take", "trip": "something about a journey or an outing",
+                 "followup": "something promised, drafted or awaited that hasn't happened",
+                 "headsup": "a clash, a gap or a date coming up", "link": "something worth reading"}
+TIDINGS_GUIDE_CHARS = 500
+TIDINGS_LIMITS = {"limit": (1, 10, 6), "days": (1, 14, 7), "keep": (0, 365, 60)}
 TIDINGS_SOUL = """You write the cards in the owner's Tidings feed in Hermit.
 
 Each run you are given notes from the places the owner has allowed, and you answer with a JSON list of
@@ -2863,16 +2867,14 @@ in the lists of open and closed cards, and anything you would be guessing at. No
 
 Answer with a JSON list only, at most {limit} cards, each an object with:
 - "key": a short stable name for the subject, in lowercase with dashes, so it isn't raised twice
-- "kind": one of {kinds}
+- "kind": one of these, and no other kind of card: {kinds}
 - "title": under 60 characters, plain words
 - "body": one or two short sentences
 - "from": the sources it draws on, by the first word or two of their headings below
 - "link": a web address, only one that appears in the material{web}
 - "about": the ids in square brackets of the Calendar or Reminders lines the card is about, if any
 - "place": optional, the street address or named place the card is about, as it appears in the material
-- "action": optional, {{"label": under 24 characters, "bot": a bot's name from the brackets, "message": what to
-  ask that bot to do, written as the owner would say it}}
-
+{action}{guide}
 Today is {today}.
 
 Open cards: {open}
@@ -2888,6 +2890,29 @@ def tidings_home() -> pathlib.Path:
     return HOME / "profiles" / TIDINGS
 
 
+TIDINGS_ACTION = """- "action": optional, {"label": under 24 characters, "bot": a bot's name from the brackets, "message": what to
+  ask that bot to do, written as the owner would say it}
+"""
+TIDINGS_GUIDE = """
+The owner's own words on what they want from this feed, which outrank the advice above:
+{guide}
+"""
+
+
+def tidings_number(value, name: str) -> int:
+    low, high, usual = TIDINGS_LIMITS[name]
+    return min(max(value, low), high) if isinstance(value, int) and not isinstance(value, bool) else usual
+
+
+def tidings_hours(value) -> list[int] | None:
+    """The hours of the day it looks, or None when that isn't one to four whole hours."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 4:
+        return None
+    if not all(isinstance(hour, int) and not isinstance(hour, bool) and 0 <= hour <= 23 for hour in value):
+        return None
+    return sorted(set(value))
+
+
 def tidings_state() -> dict:
     saved = read_json(TIDINGS_STATE) if TIDINGS_STATE.exists() else {}
     model = saved.get("model") if isinstance(saved.get("model"), dict) else None
@@ -2896,7 +2921,16 @@ def tidings_state() -> dict:
             "allowed": [name for name in saved.get("allowed") or [] if isinstance(name, str)],
             "model": model, "cards": [card for card in saved.get("cards") or [] if isinstance(card, dict)],
             "closed": saved.get("closed") if isinstance(saved.get("closed"), dict) else {},
-            "ran": saved.get("ran"), "problem": saved.get("problem")}
+            "ran": saved.get("ran"), "problem": saved.get("problem"),
+            # What it writes, how much and when. All of it has a usual value, so an older file still reads.
+            "kinds": [kind for kind in TIDINGS_KINDS if kind in saved["kinds"]] if isinstance(saved.get("kinds"), list)
+            else list(TIDINGS_KINDS),
+            "asks": saved.get("asks") is not False, "thumbs": saved.get("thumbs") is not False,
+            "guide": saved.get("guide") if isinstance(saved.get("guide"), str) else "",
+            "hours": tidings_hours(saved.get("hours")) or list(TIDINGS_HOURS),
+            "chat": saved.get("chat") if isinstance(saved.get("chat"), str) else None,
+            "lead": "open" if saved.get("lead") == "open" else "ask",
+            **{name: tidings_number(saved.get(name), name) for name in TIDINGS_LIMITS}}
 
 
 def save_tidings(state: dict) -> None:
@@ -2920,6 +2954,9 @@ def tidings_view(state: dict | None = None) -> dict:
             "model": state["model"], "defaultModel": default_model(),
             "ready": tidings_home().is_dir(), "running": tidings_running.is_set(),
             "ran": state["ran"], "problem": state["problem"],
+            "kinds": state["kinds"], "asks": state["asks"], "thumbs": state["thumbs"], "guide": state["guide"],
+            "hours": state["hours"], "limit": state["limit"], "days": state["days"], "keep": state["keep"],
+            "chat": state["chat"] if state["chat"] in known else None, "lead": state["lead"],
             "cards": [card for card in state["cards"] if card.get("id") not in state["closed"]] if state["on"] else []}
 
 
@@ -2972,9 +3009,25 @@ def ensure_tidings(run=subprocess.run) -> None:
 def change_tidings(fields: dict) -> dict:
     with tidings_lock:
         state = tidings_state()
-        for name in ("on", "web", "calendar", "reminders"):
+        for name in ("on", "web", "calendar", "reminders", "asks", "thumbs"):
             if isinstance(fields.get(name), bool):
                 state[name] = fields[name]
+        if isinstance(fields.get("kinds"), list):
+            state["kinds"] = [kind for kind in TIDINGS_KINDS if kind in fields["kinds"]]
+        if isinstance(fields.get("guide"), str):
+            state["guide"] = clipped(fields["guide"].strip(), TIDINGS_GUIDE_CHARS)
+        for name in TIDINGS_LIMITS:
+            if name in fields:
+                state[name] = tidings_number(fields[name], name)
+        if "hours" in fields:
+            hours = tidings_hours(fields["hours"])
+            if not hours:
+                raise VoiceError("Pick one to four times of day.")
+            state["hours"] = hours
+        if "chat" in fields:
+            state["chat"] = fields["chat"] if isinstance(fields["chat"], str) and fields["chat"] in homes() else None
+        if fields.get("lead") in ("ask", "open"):
+            state["lead"] = fields["lead"]
         if isinstance(fields.get("allowed"), list):
             known = homes()
             state["allowed"] = sorted({name for name in fields["allowed"] if isinstance(name, str) and name in known})
@@ -2989,6 +3042,7 @@ def change_tidings(fields: dict) -> dict:
         if state["on"]:
             ensure_tidings()
         save_tidings(state)
+        prune_tidings_runs(state["keep"])
         # Switching a source off also forgets what a device had sent for it.
         kept = {name: value for name, value in tidings_context().items() if state["on"] and state[name]}
         if kept != tidings_context():
@@ -3052,7 +3106,7 @@ def rate_tiding(card: str, rating, note) -> dict:
     with tidings_lock:
         state = tidings_state()
         found = next((entry for entry in state["cards"] if entry.get("id") == card), None)
-        if found:
+        if found and state["thumbs"]:
             found["rating"] = rating if rating in ("up", "down") else None
             words = clipped(" ".join(str(note).split()), TIDINGS_NOTE_CHARS) if isinstance(note, str) and found["rating"] == "down" else ""
             found["note"] = words or None
@@ -3061,13 +3115,20 @@ def rate_tiding(card: str, rating, note) -> dict:
     return tidings_view(state)
 
 
-def keep_tidings_run(run_id: str, record: dict) -> None:
-    """What a run read and answered, so a new prompt can be tried on the same material later."""
-    TIDINGS_RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
-    cutoff = time.time() - TIDINGS_RUN_DAYS * 86400
-    for old in TIDINGS_RUNS.glob("*.json"):
-        if old.stat().st_mtime < cutoff:
+def prune_tidings_runs(days: int) -> None:
+    """Forgets what runs read once it's older than the owner keeps it. None is kept at zero days."""
+    cutoff = time.time() - days * 86400
+    for old in TIDINGS_RUNS.glob("*.json") if TIDINGS_RUNS.is_dir() else []:
+        if days == 0 or old.stat().st_mtime < cutoff:
             old.unlink(missing_ok=True)
+
+
+def keep_tidings_run(run_id: str, record: dict, days: int) -> None:
+    """What a run read and answered, so a new prompt can be tried on the same material later."""
+    prune_tidings_runs(days)
+    if days == 0:
+        return
+    TIDINGS_RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = TIDINGS_RUNS / f"{run_id}.json"
     write_json(path, record)
     os.chmod(path, 0o600)
@@ -3104,7 +3165,7 @@ def tidings_material(state: dict, now: float | None = None) -> tuple[str, list[s
     """Everything the bot may read this run, the bots it may hand a card's action to, and what each
     Calendar or Reminders line's id opens on a device."""
     known = homes()
-    since = (now or time.time()) - TIDINGS_DAYS * 86400
+    since = (now or time.time()) - state["days"] * 86400
     parts, bots = [], []
     for name in state["allowed"]:
         if name not in known:
@@ -3130,7 +3191,8 @@ def tidings_material(state: dict, now: float | None = None) -> tuple[str, list[s
     return "\n\n".join(parts), bots, opens
 
 
-def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: str, opens: dict | None = None) -> list[dict]:
+def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: str, opens: dict | None = None,
+                  kinds: list[str] | None = None, limit: int = TIDINGS_LIMITS["limit"][2]) -> list[dict]:
     """The bot's answer as cards, keeping only what the app can show and nothing it wasn't allowed."""
     start, end = text.find("["), text.rfind("]")
     try:
@@ -3143,10 +3205,11 @@ def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: s
             continue
         key = re.sub(r"[^a-z0-9]+", "-", str(entry.get("key") or entry.get("title") or "").lower()).strip("-")[:60]
         title = clipped(str(entry.get("title") or "").strip(), 80)
-        if not key or not title:
+        kind = entry.get("kind") if entry.get("kind") in TIDINGS_KINDS else "action"
+        if not key or not title or kind not in (TIDINGS_KINDS if kinds is None else kinds):
             continue
         card = {"id": hashlib.sha256(key.encode()).hexdigest()[:16], "key": key, "title": title,
-                "kind": entry.get("kind") if entry.get("kind") in TIDINGS_KINDS else "action",
+                "kind": kind,
                 "body": clipped(str(entry.get("body") or "").strip(), 320), "at": time.time(),
                 "from": [str(source)[:40] for source in entry.get("from") or [] if isinstance(source, str)][:4]
                 if isinstance(entry.get("from"), list) else []}
@@ -3169,10 +3232,7 @@ def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: s
             card["action"] = {"label": clipped(str(action.get("label") or "Ask").strip(), 30), "bot": action["bot"],
                               "message": clipped(str(action["message"]).strip(), 600)}
         cards.append(card)
-    return cards[:TIDINGS_NEW]
-
-
-TIDINGS_NEW = 6
+    return cards[:limit]
 
 
 def tidings_command(state: dict, query: pathlib.Path) -> list[str]:
@@ -3191,17 +3251,23 @@ def run_tidings(run=subprocess.run) -> None:
     if not state["on"] or not tidings_home().is_dir():
         return
     material, bots, opens = tidings_material(state)
+    if not state["asks"]:
+        bots = []
     problem, cards, answer, asked = None, [], "", None
     run_id = time.strftime("%Y%m%d-%H%M%S")
-    if material:
+    if material and state["kinds"]:
         open_cards = [card for card in state["cards"] if card.get("id") not in state["closed"]]
         closed = [card.get("key") for card in state["cards"] if card.get("id") in state["closed"]]
         ask = TIDINGS_ASK.format(
-            limit=TIDINGS_NEW, kinds=", ".join(TIDINGS_KINDS), today=time.strftime("%A %B %d, %Y"),
+            limit=state["limit"], today=time.strftime("%A %B %d, %Y"),
+            kinds=", ".join(f"{kind} ({TIDINGS_KINDS[kind]})" for kind in state["kinds"]),
+            action=TIDINGS_ACTION if bots else "",
+            guide=TIDINGS_GUIDE.format(guide=state["guide"]) if state["guide"] else "",
             web=", or one you found by searching" if state["web"] else "",
             open=json.dumps([{"key": card.get("key"), "title": card.get("title")} for card in open_cards]),
             closed=json.dumps(closed), material=material)
         asked = {"today": time.strftime("%A %B %d, %Y"), "web": state["web"], "bots": bots,
+                 "kinds": state["kinds"], "limit": state["limit"], "guide": state["guide"],
                  "open": [card.get("key") for card in open_cards], "closed": closed, "material": material}
         handle, name = tempfile.mkstemp(prefix="tidings.", suffix=".txt")
         query = pathlib.Path(name)
@@ -3222,7 +3288,7 @@ def run_tidings(run=subprocess.run) -> None:
                 problem = "Tidings couldn't run. Check its model in Settings."
             else:
                 answer = done.stdout
-                cards = tidings_cards(answer, bots, state["web"], material, opens)
+                cards = tidings_cards(answer, bots, state["web"], material, opens, state["kinds"], state["limit"])
                 for card in cards:
                     card["run"] = run_id
         except (OSError, subprocess.SubprocessError) as error:
@@ -3235,8 +3301,8 @@ def run_tidings(run=subprocess.run) -> None:
         now = time.time()
         have = {card.get("id") for card in state["cards"]}
         allowed = set(state["allowed"])
-        fresh = [card for card in cards if card["id"] not in have
-                 and ("action" not in card or card["action"]["bot"] in allowed)]
+        fresh = [card for card in cards if card["id"] not in have and card["kind"] in state["kinds"]
+                 and ("action" not in card or (state["asks"] and card["action"]["bot"] in allowed))]
         kept = [card for card in state["cards"] if now - float(card.get("at") or 0) < TIDINGS_DAYS * 86400]
         state["cards"] = (fresh + kept)[:TIDINGS_KEPT]
         ids = {card["id"] for card in state["cards"]}
@@ -3245,8 +3311,9 @@ def run_tidings(run=subprocess.run) -> None:
         save_tidings(state)
     if asked:
         model = state["model"] or default_model() or {}
-        keep_tidings_run(run_id, asked | {"prompt": TIDINGS_PROMPT, "model": model, "answer": answer})
+        keep_tidings_run(run_id, asked | {"prompt": TIDINGS_PROMPT, "model": model, "answer": answer}, state["keep"])
         tidings_log("run", run=run_id, prompt=TIDINGS_PROMPT, model=model.get("model"), web=asked["web"],
+                    kinds=asked["kinds"], limit=asked["limit"], guided=bool(asked["guide"]),
                     sources=bots + [name for name in TIDINGS_SOURCES if state[name]], problem=problem,
                     cards=[card_record(card) for card in fresh])
     print(f"tidings: {len(cards)} cards, {len(fresh)} new", flush=True)
@@ -3272,10 +3339,10 @@ def start_tidings(pressed: bool = False) -> bool:
     return True
 
 
-def tidings_due(ran: float | None, now: float) -> bool:
+def tidings_due(ran: float | None, now: float, hours=TIDINGS_HOURS) -> bool:
     """True once one of the day's hours has passed since the last run."""
     today = time.localtime(now)
-    for hour in reversed(TIDINGS_HOURS):
+    for hour in sorted(hours, reverse=True):
         slot = time.mktime((today.tm_year, today.tm_mon, today.tm_mday, hour, 0, 0, 0, 0, -1))
         if now >= slot:
             return not ran or float(ran) < slot
@@ -3286,7 +3353,7 @@ def tidings_loop() -> None:
     while True:
         try:
             state = tidings_state()
-            if state["on"] and tidings_due(state["ran"], time.time()):
+            if state["on"] and tidings_due(state["ran"], time.time(), state["hours"]):
                 start_tidings()
         except Exception as error:
             print(f"tidings loop: {type(error).__name__}", flush=True)
