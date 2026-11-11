@@ -2837,7 +2837,7 @@ TIDINGS_RUN_SECONDS = 300
 TIDINGS_RETRY_SECONDS = 10
 # Raise this whenever TIDINGS_ASK or TIDINGS_SOUL changes, so a rating can be traced to the words that
 # produced its card.
-TIDINGS_PROMPT = 2
+TIDINGS_PROMPT = 3
 # Ratings and what each run read, kept on this Mac to judge and improve the prompt. Never sent anywhere.
 TIDINGS_EVALS = STATE / "tidings-evals.jsonl"
 TIDINGS_RUNS = STATE / "tidings-runs"
@@ -2869,6 +2869,7 @@ Answer with a JSON list only, at most {limit} cards, each an object with:
 - "from": the sources it draws on, by the first word or two of their headings below
 - "link": a web address, only one that appears in the material{web}
 - "about": the ids in square brackets of the Calendar or Reminders lines the card is about, if any
+- "place": optional, the street address or named place the card is about, as it appears in the material
 - "action": optional, {{"label": under 24 characters, "bot": a bot's name from the brackets, "message": what to
   ask that bot to do, written as the owner would say it}}
 
@@ -3152,6 +3153,9 @@ def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: s
         link = str(entry.get("link") or "").strip()
         if link.startswith("https://") and len(link) < 500 and (allow_new_links or link in material):
             card["link"] = link
+        place = " ".join(str(entry.get("place") or "").split()) if isinstance(entry.get("place"), str) else ""
+        if place:
+            card["place"] = clipped(place, 120)
         # One thing to open from each of Calendar and Reminders is plenty for a card.
         about = {}
         for ref in entry.get("about") if isinstance(entry.get("about"), list) else []:
