@@ -1,9 +1,9 @@
 {
  "version": "1.0",
- "build": 19,
- "file": "Hermit-1.0-19.dmg",
- "sha256": "9f2ea357642e15fd07b4f2c81f629c8d1fc27f34d5c30e157f429fbe9979b98d",
- "notes": "Tidings feed with settings, thumbs and its own bot. Summaries: one for your inbox and one when you come back to a chat, read aloud by your device, your Mac's voice or ChatGPT. Meeting invitations from Calendar cards. Waiting on You view. One text size setting for the whole app. File links open from any screen. Smoother streaming. A key of its own for each device, with a Devices screen. Works with Hermes on Linux. A fuller demo. Fixes for VNC links, Calendar and Reminders buttons, and scrolling.",
- "size": 21534911,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-19/Hermit-1.0-19.dmg"
+ "build": 20,
+ "file": "Hermit-1.0-20.dmg",
+ "sha256": "c6546c4eb128b725a8665bf90713b81e357ed279016a68a9754f9627658e4438",
+ "notes": "Tidings feed with settings, thumbs and its own bot. Summaries: one for your inbox and one when you come back to a chat, read aloud by your device, your Mac's voice or ChatGPT. Meeting invitations from Calendar cards. Waiting on You view. One text size setting for the whole app. File links open from any screen. Smoother streaming. A key of its own for each device, with a Devices screen. Works with Hermes on Linux. A fuller demo. Fixes for VNC links, Calendar and Reminders buttons, scrolling, and a reply's last lines fading out in build 19.",
+ "size": 21534304,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-20/Hermit-1.0-20.dmg"
 }
