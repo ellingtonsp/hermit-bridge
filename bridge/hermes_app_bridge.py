@@ -272,15 +272,156 @@ def api_key(home: pathlib.Path) -> str | None:
     return None
 
 
+# A key of its own for each device. The profile keys Hermes itself uses are the same on every device that
+# was ever paired, so a lost phone could only be shut out by changing them for all. A device key is made at
+# pairing, kept here only as a hash, opens every bot (as the pairing code did), and can be taken away by
+# itself. It works at the bridge, which passes a device's requests on to Hermes with the real key, so a
+# device holding one never holds a profile key at all.
+ACCESS = STATE / "access.json"
+DEVICE_PREFIX = "hd_"
+DEVICE_SEEN_SECONDS = 600
+DEVICES_KEPT = 40
+access_lock = threading.Lock()
+# Who is asking, for the request this thread is serving. Empty for anything not arriving through a proxy.
+request_state = threading.local()
+# Wrong keys from one address before it's shut out for a while. A real key can't be guessed, so this is to
+# make trying pointless and to keep it out of the way, not the lock itself.
+AUTH_FAILURES, AUTH_WINDOW_SECONDS, AUTH_LOCK_SECONDS = 20, 300, 600
+auth_lock = threading.Lock()
+auth_failures: dict[str, list[float]] = {}
+auth_locked: dict[str, float] = {}
+
+
+def load_access() -> dict:
+    try:
+        saved = read_json(ACCESS) if ACCESS.exists() else {}
+    except (OSError, ValueError):
+        saved = {}
+    devices = saved.get("devices") if isinstance(saved.get("devices"), dict) else {}
+    return {"devices": {name: entry for name, entry in devices.items() if isinstance(entry, dict)},
+            # Once on, the profile keys stop working here, and only device keys open the bridge.
+            "only": saved.get("only") is True}
+
+
+def save_access(state: dict) -> None:
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_json(ACCESS, state)
+    ACCESS.chmod(0o600)
+
+
+def key_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def new_device(name: str) -> tuple[str, str]:
+    """A device's id and its key. The key is shown once, here, and only its hash is kept."""
+    token = DEVICE_PREFIX + secrets.token_urlsafe(32)
+    device = secrets.token_hex(6)
+    with access_lock:
+        state = load_access()
+        state["devices"][device] = {"name": clipped(" ".join(str(name or "").split()) or "A device", 60),
+                                    "hash": key_hash(token), "made": time.time(), "seen": time.time()}
+        # The oldest go when there are too many, so the list can't grow for ever.
+        newest = sorted(state["devices"].items(), key=lambda item: float(item[1].get("seen") or 0), reverse=True)
+        state["devices"] = dict(newest[:DEVICES_KEPT])
+        save_access(state)
+    print(f"access: a key made for {state['devices'][device]['name']!r}", flush=True)
+    return device, token
+
+
+def device_for(token: str) -> str | None:
+    """Which device a key belongs to. Noting that it was seen is rare, so most requests write nothing."""
+    wanted = key_hash(token)
+    with access_lock:
+        state = load_access()
+        for device, entry in state["devices"].items():
+            if hmac.compare_digest(str(entry.get("hash") or ""), wanted):
+                if time.time() - float(entry.get("seen") or 0) > DEVICE_SEEN_SECONDS:
+                    entry["seen"] = time.time()
+                    save_access(state)
+                return device
+    return None
+
+
+def revoke_device(device: str) -> bool:
+    with access_lock:
+        state = load_access()
+        if state["devices"].pop(device, None) is None:
+            return False
+        save_access(state)
+    print("access: a device's key taken away", flush=True)
+    return True
+
+
+def devices_view(header: str | None) -> dict:
+    token = (header or "").removeprefix("Bearer ").strip()
+    mine = device_for(token) if token.startswith(DEVICE_PREFIX) else None
+    state = load_access()
+    return {"only": state["only"], "devices": [
+        {"id": device, "name": entry.get("name"), "made": entry.get("made"), "seen": entry.get("seen"), "this": device == mine}
+        for device, entry in sorted(state["devices"].items(), key=lambda item: -float(item[1].get("seen") or 0))]}
+
+
+def client_locked(client: str, now: float | None = None) -> bool:
+    now = now or time.time()
+    with auth_lock:
+        until = auth_locked.get(client)
+        if until and until <= now:
+            del auth_locked[client]
+        return bool(until and until > now)
+
+
+def note_wrong_key(client: str, now: float | None = None) -> None:
+    now = now or time.time()
+    with auth_lock:
+        recent = [at for at in auth_failures.get(client, []) if now - at < AUTH_WINDOW_SECONDS] + [now]
+        auth_failures[client] = recent
+        if len(recent) >= AUTH_FAILURES:
+            auth_locked[client] = now + AUTH_LOCK_SECONDS
+            del auth_failures[client]
+            print("access: an address shut out for a while after too many wrong keys", flush=True)
+        # Addresses that tried once and went away aren't remembered for ever.
+        for other in [name for name, tries in auth_failures.items() if now - tries[-1] > AUTH_WINDOW_SECONDS]:
+            del auth_failures[other]
+
+
 def authorized(header: str | None, profile: str | None = None) -> bool:
-    """A profile's data needs that profile's key. Shared routes accept any paired key."""
+    """A device's own key opens every bot. A profile's key, which older copies of the app hold, opens that
+    profile's data, and any of them opens the shared routes."""
     token = (header or "").removeprefix("Bearer ").strip()
     if not token:
         return False
+    client = getattr(request_state, "client", None)
+    if client and client_locked(client):
+        return False
     targets = homes()
-    if profile is not None:
-        targets = {profile: targets[profile]} if profile in targets else {}
-    return any(hmac.compare_digest(token, key) for key in map(api_key, targets.values()) if key)
+    if token.startswith(DEVICE_PREFIX):
+        known = device_for(token) is not None
+        allowed = known and (profile is None or profile in targets)
+    else:
+        keys = {name: key for name, home in targets.items() if (key := api_key(home))}
+        known = any(hmac.compare_digest(token, key) for key in keys.values()) and not load_access()["only"]
+        allowed = known and any(hmac.compare_digest(token, key) for name, key in keys.items() if profile in (None, name))
+    if not known and client:
+        note_wrong_key(client)
+    return allowed
+
+
+def env_value(home: pathlib.Path, name: str) -> str | None:
+    env = home / ".env"
+    for line in env.read_text().splitlines() if env.exists() else []:
+        if line.startswith(name + "="):
+            return line.split("=", 1)[1].strip().strip("'\"") or None
+    return None
+
+
+def api_address(profile: str) -> tuple[int, str]:
+    """Where a profile's own API listens on this computer: the port, and the path its requests go under.
+    The main bot and the others share one listener, and a standalone bot has its own."""
+    home = homes()[profile]
+    if profile != "default" and is_standalone(home):
+        return int(env_value(home, "API_SERVER_PORT") or 0), ""
+    return int(env_value(HOME, "API_SERVER_PORT") or 8642), "" if profile == "default" else f"/p/{profile}"
 
 
 voice_lock = threading.Lock()
@@ -4314,11 +4455,79 @@ def udp_loop() -> None:
             print(f"event error: {type(error).__name__}", flush=True)
 
 
+PROXY_BODY = 8_000_000
+PROXY_HEADERS = ("Content-Type", "Accept", "Idempotency-Key")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_args):
         pass
+
+    def parse_request(self) -> bool:
+        """Notes who is asking before anything is checked. The bridge only listens on this computer, so a
+        request from outside arrives through a proxy here, which says where it came from. The last address
+        in that list is the one the proxy itself saw, and the only one a sender can't make up."""
+        request_state.client = None
+        if not super().parse_request():
+            return False
+        forwarded = [part.strip() for part in (self.headers.get("X-Forwarded-For") or "").split(",") if part.strip()]
+        if forwarded and ipaddress.ip_address(self.client_address[0]).is_loopback:
+            request_state.client = forwarded[-1][:64]
+        return True
+
+    def hermes_proxy(self) -> bool:
+        """Passes a request under /hermes/<profile>/ to that profile's own API, with its real key put in.
+        This is how a device that holds only its own key talks to Hermes. True when it was one of these."""
+        url = urlparse(self.path)
+        match = re.fullmatch(r"/hermes/([a-z0-9_-]+)(/.*)", url.path)
+        if not match:
+            self.body(PROXY_BODY)
+            self.json(404, {"error": "not found"})
+            return True
+        profile, rest = match.groups()
+        data = self.body(PROXY_BODY) if self.command != "GET" else b""
+        if profile not in homes() or not authorized(self.headers.get("Authorization"), profile):
+            self.json(401, {"error": {"message": "unauthorized"}})
+            return True
+        if len(data) > PROXY_BODY:
+            self.json(413, {"error": {"message": "That's too large to send."}})
+            return True
+        port, prefix = api_address(profile)
+        key = api_key(homes()[profile])
+        headers = {name: self.headers[name] for name in PROXY_HEADERS if self.headers.get(name)}
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=900)
+        try:
+            connection.request(self.command, prefix + rest + (f"?{url.query}" if url.query else ""), body=data or None,
+                               headers={**headers, "Authorization": f"Bearer {key}"})
+            answer = connection.getresponse()
+        except (OSError, http.client.HTTPException) as error:
+            connection.close()
+            print(f"hermes proxy: {type(error).__name__}", flush=True)
+            self.json(502, {"error": {"message": "Hermes isn't answering."}})
+            return True
+        try:
+            self.send_response(answer.status)
+            for name in ("Content-Type", "Cache-Control"):
+                if answer.getheader(name):
+                    self.send_header(name, answer.getheader(name))
+            length = answer.getheader("Content-Length")
+            if length is not None:
+                self.send_header("Content-Length", length)
+            else:
+                # A stream: no length is known, so the end of it is the end of the connection.
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            while chunk := answer.read1(16384):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
+        finally:
+            connection.close()
+        return True
 
     def reply(self, status: int, body: bytes = b"", kind: str = "application/json") -> None:
         self.send_response(status)
@@ -4336,6 +4545,12 @@ class Handler(BaseHTTPRequestHandler):
         header = self.headers.get("Authorization")
         if url.path == "/health":
             return self.json(200, {"status": "ok"})
+        if urlparse(self.path).path.startswith("/hermes/"):
+            return self.hermes_proxy()
+        if url.path == "/access/devices":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            return self.json(200, devices_view(header))
         if url.path == "/bots":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -4734,6 +4949,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_PUT(self):
+        if urlparse(self.path).path.startswith("/hermes/"):
+            return self.hermes_proxy()
         if match := re.fullmatch(r"/apps/([A-Za-z0-9_-]{20,80})/(api/.*)", urlparse(self.path).path):
             return self.app_api(match.group(1), match.group(2))
         return self.json(404, {"error": "not found"})
@@ -4757,13 +4974,52 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(401, {"error": {"message": "This needs the default bot's key."}})
             fields = json.loads(self.body(65536) or b"{}")
             have = fields.get("have") if isinstance(fields.get("have"), list) else []
-            return self.json(200, new_bots([str(name) for name in have][:500]))
+            found = new_bots([str(name) for name in have][:500])
+            if (header or "").removeprefix("Bearer ").strip().startswith(DEVICE_PREFIX):
+                # Its own key already opens them, so it's told they exist and handed nothing more.
+                found["bots"] = [{"profile": bot["profile"]} for bot in found["bots"]]
+            return self.json(200, found)
         if path == "/pair/claim":
             fields = json.loads(self.body(4096) or b"{}")
             claimed = claim_pair_code(str(fields.get("code") or ""))
             if claimed is None:
                 return self.json(401, {"error": {"message": "That code didn't work. Ask your bot for a new one."}})
+            if isinstance(fields.get("device"), dict):
+                # An app that names itself gets a key of its own, and no profile keys at all.
+                device, token = new_device(str(fields["device"].get("name") or ""))
+                claimed = {"url": claimed["url"], "device": device, "token": token,
+                           "bots": [{"profile": bot["profile"]} for bot in claimed["bots"]]}
             return self.json(200, claimed)
+        if urlparse(self.path).path.startswith("/hermes/"):
+            return self.hermes_proxy()
+        if path in ("/access/enroll", "/access/revoke", "/access/settings"):
+            data = self.body(4096)
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            try:
+                fields = json.loads(data or b"{}")
+            except ValueError:
+                fields = None
+            if not isinstance(fields, dict):
+                return self.json(400, {"error": {"message": "That request couldn't be read"}})
+            holds_device_key = (header or "").removeprefix("Bearer ").strip().startswith(DEVICE_PREFIX)
+            if path == "/access/enroll":
+                # A device paired before device keys existed trades the keys it holds for one of its own.
+                device, token = new_device(str(fields.get("name") or ""))
+                return self.json(200, {"device": device, "token": token, "bots": [{"profile": name} for name in homes()]})
+            if path == "/access/revoke":
+                if not revoke_device(str(fields.get("id") or "")):
+                    return self.json(404, {"error": {"message": "That device isn't in the list."}})
+                return self.json(200, devices_view(header))
+            if isinstance(fields.get("only"), bool):
+                if fields["only"] and not holds_device_key:
+                    # Or the device asking would shut itself out with the very request that asked.
+                    return self.json(409, {"error": {"message": "Give this device its own key first."}})
+                with access_lock:
+                    state = load_access()
+                    state["only"] = fields["only"]
+                    save_access(state)
+            return self.json(200, devices_view(header))
         if path == "/devices":
             return self.register_device(header)
         if path == "/updates/bridge":
