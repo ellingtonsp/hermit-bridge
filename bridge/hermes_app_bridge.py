@@ -3960,6 +3960,13 @@ def speech_status() -> dict:
             "openai": {"available": OPENAI_KEY.exists()}}
 
 
+def speech_env() -> dict:
+    """launchd starts the bridge with a bare PATH, and a voice the owner set up as a command usually leans
+    on Homebrew's tools, ffmpeg above all. Without this a voice that works in a terminal fails here."""
+    path = ":".join([*BREW_FOLDERS, os.environ.get("PATH", "/usr/bin:/bin")])
+    return hermes_env() | {"HERMES_HOME": str(HOME), "PATH": path}
+
+
 def speak_on_mac(text: str, run=subprocess.run) -> tuple[bytes, str]:
     """Hermes's own configured voice. Whatever it makes is handed over in a form an iPhone can play."""
     with tempfile.TemporaryDirectory(prefix="hermit-speech.") as folder:
@@ -3967,8 +3974,8 @@ def speak_on_mac(text: str, run=subprocess.run) -> tuple[bytes, str]:
         (work / "say.txt").write_text(text)
         done = run([str(HOME / "hermes-agent/venv/bin/python3"), "-c", SPEECH_SCRIPT, str(HOME / "hermes-agent"),
                     str(work / "say.txt"), str(work / "said.wav")], capture_output=True, text=True,
-                   stdin=subprocess.DEVNULL, timeout=SPEECH_SECONDS, env=hermes_env() | {"HERMES_HOME": str(HOME)})
-        made = None
+                   stdin=subprocess.DEVNULL, timeout=SPEECH_SECONDS, env=speech_env())
+        made, said = None, ""
         for line in reversed(done.stdout.splitlines()):
             try:
                 answer = json.loads(line)
@@ -3976,10 +3983,13 @@ def speak_on_mac(text: str, run=subprocess.run) -> tuple[bytes, str]:
                 continue
             if isinstance(answer, dict) and answer.get("success") and answer.get("file_path"):
                 made = pathlib.Path(str(answer["file_path"]))
+            elif isinstance(answer, dict):
+                # Why Hermes's voice failed, for the log only. The first line is enough to tell.
+                said = clipped(str(answer.get("error") or "").split("\\n")[0].split("\n")[0], 200)
             break
         # Only a file made in this folder, whatever the tool says it wrote.
         if done.returncode != 0 or made is None or made.parent.resolve() != work.resolve() or not made.is_file():
-            print(f"speech: hermes exit {done.returncode}", flush=True)
+            print(f"speech: hermes exit {done.returncode}{': ' + said if said else ''}", flush=True)
             raise VoiceError("The Mac's voice didn't answer. Check Hermes's voice on your Mac.")
         if made.suffix.lower() not in SPEECH_TYPES:
             # Hermes's voices mostly make Ogg, which iOS can't play.
