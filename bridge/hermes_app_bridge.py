@@ -2835,6 +2835,14 @@ TIDINGS_HOURS = (7, 16)
 TIDINGS_REFRESH_SECONDS = 900
 TIDINGS_RUN_SECONDS = 300
 TIDINGS_RETRY_SECONDS = 10
+# Raise this whenever TIDINGS_ASK or TIDINGS_SOUL changes, so a rating can be traced to the words that
+# produced its card.
+TIDINGS_PROMPT = 2
+# Ratings and what each run read, kept on this Mac to judge and improve the prompt. Never sent anywhere.
+TIDINGS_EVALS = STATE / "tidings-evals.jsonl"
+TIDINGS_RUNS = STATE / "tidings-runs"
+TIDINGS_RUN_DAYS = 60
+TIDINGS_NOTE_CHARS = 500
 TIDINGS_DAYS = 7
 TIDINGS_CHAT_CHARS = 6000
 TIDINGS_MESSAGE_CHARS = 700
@@ -2860,6 +2868,7 @@ Answer with a JSON list only, at most {limit} cards, each an object with:
 - "body": one or two short sentences
 - "from": the sources it draws on, by the first word or two of their headings below
 - "link": a web address, only one that appears in the material{web}
+- "about": the ids in square brackets of the Calendar or Reminders lines the card is about, if any
 - "action": optional, {{"label": under 24 characters, "bot": a bot's name from the brackets, "message": what to
   ask that bot to do, written as the owner would say it}}
 
@@ -3000,20 +3009,67 @@ def take_tidings_context(fields: dict) -> dict:
         for name in TIDINGS_SOURCES:
             lines = fields.get(name)
             if state["on"] and state[name] and isinstance(lines, list):
-                context[name] = {"at": time.time(), "lines": [clipped(" ".join(str(line).split()), 200) for line in lines
-                                                              if isinstance(line, str) and line.strip()][:TIDINGS_CONTEXT_LINES]}
+                # Beside each line, what the device needs to show that event or reminder again.
+                opens = fields.get(name + "_open")
+                opens = opens if isinstance(opens, list) and len(opens) == len(lines) else [""] * len(lines)
+                kept = [(clipped(" ".join(line.split()), 200), opened[:200] if isinstance(opened, str) else "")
+                        for line, opened in zip(lines, opens) if isinstance(line, str) and line.strip()][:TIDINGS_CONTEXT_LINES]
+                context[name] = {"at": time.time(), "lines": [line for line, _ in kept], "open": [opened for _, opened in kept]}
         TIDINGS_CONTEXT.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_json(TIDINGS_CONTEXT, context)
     return {"kept": sorted(context)}
 
 
+def tidings_log(event: str, **fields) -> None:
+    """One line per run, rating and outcome. Append-only, so the history of a card can be read back."""
+    TIDINGS_EVALS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(TIDINGS_EVALS, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "a") as file:
+        file.write(json.dumps({"type": event, "at": time.time(), **fields}) + "\n")
+
+
+def card_record(card: dict) -> dict:
+    return {"card": card.get("id"), "key": card.get("key"), "title": card.get("title"), "kind": card.get("kind"),
+            "run": card.get("run")}
+
+
 def close_tiding(card: str, how: str) -> dict:
     with tidings_lock:
         state = tidings_state()
-        if any(entry.get("id") == card for entry in state["cards"]):
-            state["closed"][card] = {"how": "done" if how == "done" else "dismissed", "at": time.time()}
+        found = next((entry for entry in state["cards"] if entry.get("id") == card), None)
+        if found and card not in state["closed"]:
+            how = "done" if how == "done" else "dismissed"
+            state["closed"][card] = {"how": how, "at": time.time()}
             save_tidings(state)
+            tidings_log("outcome", how=how, **card_record(found))
     return tidings_view(state)
+
+
+def rate_tiding(card: str, rating, note) -> dict:
+    """A thumb on a card, and a few words about a thumbs down. The card keeps its thumb, and the log keeps
+    every change, with the run that wrote the card."""
+    with tidings_lock:
+        state = tidings_state()
+        found = next((entry for entry in state["cards"] if entry.get("id") == card), None)
+        if found:
+            found["rating"] = rating if rating in ("up", "down") else None
+            words = clipped(" ".join(str(note).split()), TIDINGS_NOTE_CHARS) if isinstance(note, str) and found["rating"] == "down" else ""
+            found["note"] = words or None
+            save_tidings(state)
+            tidings_log("rating", rating=found["rating"], note=found["note"], **card_record(found))
+    return tidings_view(state)
+
+
+def keep_tidings_run(run_id: str, record: dict) -> None:
+    """What a run read and answered, so a new prompt can be tried on the same material later."""
+    TIDINGS_RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cutoff = time.time() - TIDINGS_RUN_DAYS * 86400
+    for old in TIDINGS_RUNS.glob("*.json"):
+        if old.stat().st_mtime < cutoff:
+            old.unlink(missing_ok=True)
+    path = TIDINGS_RUNS / f"{run_id}.json"
+    write_json(path, record)
+    os.chmod(path, 0o600)
 
 
 def tidings_chat(home: pathlib.Path, since: float) -> str:
@@ -3043,8 +3099,9 @@ def tidings_chat(home: pathlib.Path, since: float) -> str:
     return "\n".join(reversed(lines))
 
 
-def tidings_material(state: dict, now: float | None = None) -> tuple[str, list[str]]:
-    """Everything the bot may read this run, and the bots it may hand a card's action to."""
+def tidings_material(state: dict, now: float | None = None) -> tuple[str, list[str], dict]:
+    """Everything the bot may read this run, the bots it may hand a card's action to, and what each
+    Calendar or Reminders line's id opens on a device."""
     known = homes()
     since = (now or time.time()) - TIDINGS_DAYS * 86400
     parts, bots = [], []
@@ -3057,15 +3114,22 @@ def tidings_material(state: dict, now: float | None = None) -> tuple[str, list[s
             parts.append(f"## {title} [bot: {name}]\n{said}")
             bots.append(name)
     context = tidings_context()
+    opens = {}
     for name, heading in TIDINGS_SOURCES.items():
         sent = context.get(name) or {}
         fresh = (now or time.time()) - float(sent.get("at") or 0) < TIDINGS_CONTEXT_DAYS * 86400
         if state[name] and fresh and sent.get("lines"):
-            parts.append(f"## {heading}\n" + "\n".join(sent["lines"]))
-    return "\n\n".join(parts), bots
+            values = sent.get("open") if isinstance(sent.get("open"), list) else []
+            lines = []
+            for index, line in enumerate(sent["lines"]):
+                ref = f"{name[0]}{index + 1}"
+                opens[ref] = {"kind": name, "value": values[index] if index < len(values) else ""}
+                lines.append(f"[{ref}] {line}")
+            parts.append(f"## {heading}\n" + "\n".join(lines))
+    return "\n\n".join(parts), bots, opens
 
 
-def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: str) -> list[dict]:
+def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: str, opens: dict | None = None) -> list[dict]:
     """The bot's answer as cards, keeping only what the app can show and nothing it wasn't allowed."""
     start, end = text.find("["), text.rfind("]")
     try:
@@ -3088,6 +3152,14 @@ def tidings_cards(text: str, bots: list[str], allow_new_links: bool, material: s
         link = str(entry.get("link") or "").strip()
         if link.startswith("https://") and len(link) < 500 and (allow_new_links or link in material):
             card["link"] = link
+        # One thing to open from each of Calendar and Reminders is plenty for a card.
+        about = {}
+        for ref in entry.get("about") if isinstance(entry.get("about"), list) else []:
+            found_open = (opens or {}).get(str(ref).strip("[] ").lower())
+            if found_open:
+                about.setdefault(found_open["kind"], found_open)
+        if about:
+            card["open"] = list(about.values())
         action = entry.get("action")
         if isinstance(action, dict) and action.get("bot") in bots and str(action.get("message") or "").strip():
             card["action"] = {"label": clipped(str(action.get("label") or "Ask").strip(), 30), "bot": action["bot"],
@@ -3114,8 +3186,9 @@ def run_tidings(run=subprocess.run) -> None:
     state = tidings_state()
     if not state["on"] or not tidings_home().is_dir():
         return
-    material, bots = tidings_material(state)
-    problem, cards = None, []
+    material, bots, opens = tidings_material(state)
+    problem, cards, answer, asked = None, [], "", None
+    run_id = time.strftime("%Y%m%d-%H%M%S")
     if material:
         open_cards = [card for card in state["cards"] if card.get("id") not in state["closed"]]
         closed = [card.get("key") for card in state["cards"] if card.get("id") in state["closed"]]
@@ -3124,6 +3197,8 @@ def run_tidings(run=subprocess.run) -> None:
             web=", or one you found by searching" if state["web"] else "",
             open=json.dumps([{"key": card.get("key"), "title": card.get("title")} for card in open_cards]),
             closed=json.dumps(closed), material=material)
+        asked = {"today": time.strftime("%A %B %d, %Y"), "web": state["web"], "bots": bots,
+                 "open": [card.get("key") for card in open_cards], "closed": closed, "material": material}
         handle, name = tempfile.mkstemp(prefix="tidings.", suffix=".txt")
         query = pathlib.Path(name)
         try:
@@ -3142,7 +3217,10 @@ def run_tidings(run=subprocess.run) -> None:
             if done.returncode != 0:
                 problem = "Tidings couldn't run. Check its model in Settings."
             else:
-                cards = tidings_cards(done.stdout, bots, state["web"], material)
+                answer = done.stdout
+                cards = tidings_cards(answer, bots, state["web"], material, opens)
+                for card in cards:
+                    card["run"] = run_id
         except (OSError, subprocess.SubprocessError) as error:
             print(f"tidings: run {type(error).__name__}", flush=True)
             problem = "Tidings couldn't run. Check its model in Settings."
@@ -3161,6 +3239,12 @@ def run_tidings(run=subprocess.run) -> None:
         state["closed"] = {card: how for card, how in state["closed"].items() if card in ids}
         state["ran"], state["problem"] = now, problem
         save_tidings(state)
+    if asked:
+        model = state["model"] or default_model() or {}
+        keep_tidings_run(run_id, asked | {"prompt": TIDINGS_PROMPT, "model": model, "answer": answer})
+        tidings_log("run", run=run_id, prompt=TIDINGS_PROMPT, model=model.get("model"), web=asked["web"],
+                    sources=bots + [name for name in TIDINGS_SOURCES if state[name]], problem=problem,
+                    cards=[card_record(card) for card in fresh])
     print(f"tidings: {len(cards)} cards, {len(fresh)} new", flush=True)
 
 
@@ -3946,6 +4030,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(200, tidings_view() | {"started": started})
             if path == "/tidings/context":
                 return self.json(200, take_tidings_context(fields))
+            if path == "/tidings/rate":
+                return self.json(200, rate_tiding(str(fields.get("id") or ""), fields.get("rating"), fields.get("note")))
             if path == "/tidings/close":
                 return self.json(200, close_tiding(str(fields.get("id") or ""), str(fields.get("how") or "")))
             return self.json(404, {"error": "not found"})
