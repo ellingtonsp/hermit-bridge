@@ -1,9 +1,9 @@
 {
  "version": "1.0",
- "build": 21,
- "file": "Hermit-1.0-21.dmg",
- "sha256": "4835017b7a043fbcac823f65c357791d0bca25ba3463bcec495f7cc0fa3ce60e",
- "notes": "Build 21: the inbox says when a newer plugin is out and offers Tidings, chat is smoother with the end-of-reply jump and card wobble fixed, and a Call Bot shortcut starts a call with a bot.",
- "size": 21603949,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-21/Hermit-1.0-21.dmg"
+ "build": 22,
+ "file": "Hermit-1.0-22.dmg",
+ "sha256": "091041386d1e7ba5198bd2211e686400f59333b1c78b43a4fb967203c736382a",
+ "notes": "Dictation on your Mac and with Whisper now hears you on the iPhone. Calls on Hermes on your Mac are louder, stop when you talk over them, and no longer say a job failed just before giving its result.",
+ "size": 24217374,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-22/Hermit-1.0-22.dmg"
 }
