@@ -3101,10 +3101,50 @@ def voice_background(home: pathlib.Path, session_id: str, status: str = "") -> s
     return "\n\n".join(parts) or None
 
 
-def voice_config(model: str, voice: str, instructions: str) -> dict:
+# A voice service has a name of its own, and GPT-Live answered "I'm ChatGPT" on a call as a bot: Hermes's persona
+# opens "You are Hermes", the app's briefing named the bot only in passing, and nothing told it which name wins.
+# So the bot's name is said first and again last, where a voice model weighs it most. It may still say what
+# carries its voice when someone really asks, since that's true.
+CALL_NAME = re.compile(r"on a phone call as (.{1,80}?), speaking for")
+
+
+def call_name(header: str | None, fields: dict) -> str | None:
+    """The bot's name as the caller sees it: what the app's briefing calls it, or its title on this computer."""
+    if found := CALL_NAME.search(str(fields.get("instructions") or "")):
+        return " ".join(found.group(1).split()) or None
+    profile = voice_profile(header, fields.get("profile"))
+    if not profile:
+        return None
+    return bot_info(profile, homes()[profile]).get("title") or None
+
+
+def call_identity(name: str | None) -> tuple[str, str]:
+    """What opens and what closes a call's instructions, so the voice is the bot and says so."""
+    if not name:
+        return "", ""
+    opening = (f"Your name is {name}. On this call you are {name}, the caller's own assistant, and you speak as "
+               f"{name} from the first word to the last. You are not ChatGPT, not Hermes and not a general assistant: "
+               f"never introduce yourself as, or call yourself, ChatGPT, GPT, Hermes, an OpenAI model or an AI "
+               f"language model. If the caller asks who or what you are, you're {name}. Only if they ask what "
+               f"technology carries your voice may you say which service it is, and you're still {name}.")
+    closing = f"Remember: you are {name}. Never call yourself ChatGPT or anything else."
+    return opening, closing
+
+
+def named_instructions(persona: str, instructions: str, name: str | None, rules: str = "") -> str:
+    """A call's whole instructions: who it is, how a voice behaves, the rules of this kind of call, the briefing
+    and background, and who it is once more."""
+    opening, closing = call_identity(name)
+    if name:
+        # Hermes's persona names itself. On a call for a bot, that bot is who's speaking.
+        persona = re.sub(r"\AYou are Hermes\b", f"You are {name}", persona.strip(), count=1)
+    return "\n\n".join(part for part in (opening, persona.strip(), rules, instructions.strip(), closing) if part)
+
+
+def voice_config(model: str, voice: str, instructions: str, name: str | None = None) -> dict:
     hermes_on_path()
     from tools.voice_live import LIVE_PERSONA
-    return {"model": model, "instructions": f"{LIVE_PERSONA}\n\n{instructions}".strip(),
+    return {"model": model, "instructions": named_instructions(LIVE_PERSONA, instructions, name),
             "audio": {"output": {"voice": voice}}, "delegation": {"type": "client"}}
 
 
@@ -3125,14 +3165,14 @@ def post_json(url: str, headers: dict, body: dict) -> tuple[int, str, str]:
         return error.code, "", ""
 
 
-def start_voice_session(billing: str, sdp: str, instructions: str, voice: str | None) -> dict:
+def start_voice_session(billing: str, sdp: str, instructions: str, voice: str | None, name: str | None = None) -> dict:
     """Exchanges the phone's WebRTC offer, so credentials stay on the Mac and audio goes direct.
     The two services are deliberately separate, and a failure on one never falls back to the other."""
     if billing == "subscription":
         token, account = codex_credentials()
         status, answer, location = post_json(CODEX_LIVE_URL, {
             "Authorization": f"Bearer {token}", "ChatGPT-Account-Id": account, "OpenAI-Alpha": "quicksilver=v2",
-        }, {"sdp": sdp, "session": voice_config("gpt-live-1-codex", voice or "cove", instructions)})
+        }, {"sdp": sdp, "session": voice_config("gpt-live-1-codex", voice or "cove", instructions, name)})
         if not 200 <= status < 300:
             raise VoiceError(f"Your Codex subscription refused the call ({status})")
         call = urllib.parse.urlparse(location).path.rstrip("/").rsplit("/", 1)[-1]
@@ -3143,7 +3183,7 @@ def start_voice_session(billing: str, sdp: str, instructions: str, voice: str | 
         raise VoiceError("Add an OpenAI API key first")
     status, answer, _ = post_json(f"{OPENAI_BASE}/live/sessions", {
         "Authorization": f"Bearer {OPENAI_KEY.read_text().strip()}",
-    }, {"session": voice_config("gpt-live-1", voice or "marin", instructions), "transport": {"type": "webrtc", "sdp": sdp}})
+    }, {"session": voice_config("gpt-live-1", voice or "marin", instructions, name), "transport": {"type": "webrtc", "sdp": sdp}})
     if not 200 <= status < 300:
         raise VoiceError(f"OpenAI refused the call ({status})")
     parsed = json.loads(answer)
@@ -3234,8 +3274,8 @@ def live_persona() -> str:
                 "facts, and don't guess the result while waiting.")
 
 
-def front_instructions(persona: str, instructions: str) -> str:
-    return "\n\n".join(part for part in (persona.strip(), FRONT_RULES, instructions.strip()) if part)
+def front_instructions(persona: str, instructions: str, name: str | None = None) -> str:
+    return named_instructions(persona, instructions, name, FRONT_RULES)
 
 
 def front_update(text: str) -> str:
@@ -3751,7 +3791,7 @@ def start_local_call(header: str | None, fields: dict, persona: str | None = Non
     persona = live_persona() if persona is None else persona
     prune_local_calls()
     call = {"id": secrets.token_urlsafe(18), "profile": voice_profile(header, profile or None) or profile,
-            "model": model, "system": front_instructions(persona, call_instructions(header, fields, share)),
+            "model": model, "system": front_instructions(persona, call_instructions(header, fields, share), call_name(header, fields)),
             "messages": [], "started": time.time(), "used": time.time(), "lock": threading.Lock()}
     with local_calls_lock:
         if len(local_calls) >= LOCAL_CALLS_MAX:
@@ -6178,7 +6218,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(403, {"error": {"message": "Voice calls are off for this bot"}})
         instructions = call_instructions(header, fields, share)
         try:
-            self.json(200, start_voice_session(billing, sdp, instructions, voice))
+            # Reading a summary aloud is no bot's call, so it takes no bot's name.
+            name = None if reading else call_name(header, fields)
+            self.json(200, start_voice_session(billing, sdp, instructions, voice, name))
         except VoiceError as error:
             self.json(502, {"error": {"message": str(error)}})
         except Exception as error:
