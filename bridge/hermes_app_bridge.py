@@ -3417,11 +3417,18 @@ def tidings_context() -> dict:
 
 def take_tidings_context(fields: dict) -> dict:
     """What a device sends from Calendar and Reminders. Only a source that's switched on is kept, and the
-    last device to send wins."""
+    last device to send wins. A device that has stopped sharing a source takes back what it sent, and only
+    that: the lines may be another device's by now, and a phone with Calendar off mustn't empty them."""
+    sender = fields.get("device") if isinstance(fields.get("device"), str) else ""
+    sender = sender[:64]
     with tidings_lock:
         state = tidings_state()
         context = tidings_context()
+        withdrawn = fields.get("withdrawn") if isinstance(fields.get("withdrawn"), list) else []
         for name in TIDINGS_SOURCES:
+            if name in withdrawn and sender and (context.get(name) or {}).get("from") == sender:
+                del context[name]
+                continue
             lines = fields.get(name)
             if state["on"] and state[name] and isinstance(lines, list):
                 # Beside each line, what the device needs to show that event or reminder again.
@@ -3429,7 +3436,8 @@ def take_tidings_context(fields: dict) -> dict:
                 opens = opens if isinstance(opens, list) and len(opens) == len(lines) else [""] * len(lines)
                 kept = [(clipped(" ".join(line.split()), 200), opened[:200] if isinstance(opened, str) else "")
                         for line, opened in zip(lines, opens) if isinstance(line, str) and line.strip()][:TIDINGS_CONTEXT_LINES]
-                context[name] = {"at": time.time(), "lines": [line for line, _ in kept], "open": [opened for _, opened in kept]}
+                context[name] = {"at": time.time(), "lines": [line for line, _ in kept], "open": [opened for _, opened in kept],
+                                 **({"from": sender} if sender else {})}
         TIDINGS_CONTEXT.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_json(TIDINGS_CONTEXT, context)
     return {"kept": sorted(context)}
@@ -3835,6 +3843,42 @@ def integration_on(name: str) -> bool:
         return read_json(INTEGRATIONS).get(name) is True
     except (OSError, ValueError):
         return False
+
+
+integrations_lock = threading.Lock()
+# What each copy of an older app last sent, to tell a switch it changed from one it only repeated.
+integration_senders: dict[str, dict] = {}
+
+
+def integrations_view() -> dict:
+    return {key: integration_on(key) for key in MAC_INTEGRATIONS + KEPT_INTEGRATIONS}
+
+
+def take_integrations(fields: dict, sender: str) -> dict:
+    """These switches are the Mac's, and every copy of the app shows them. An app says which one the owner
+    just changed, and only that one is saved. Before 0.33.5 each copy sent all of its own switches every
+    time it synced, so a phone, a Mac or a simulator that still had Notes off switched it off for the rest
+    within the minute. An older app still sends everything, so for it only what differs from what the same
+    copy sent last time counts as a change, and its first word after the bridge starts changes nothing."""
+    sent = {key: fields.get(key) is True for key in MAC_INTEGRATIONS + KEPT_INTEGRATIONS if key in fields or key in MAC_INTEGRATIONS}
+    with integrations_lock:
+        first = not INTEGRATIONS.exists()
+        settings = integrations_view()
+        if isinstance(fields.get("changed"), list):
+            changed = [key for key in fields["changed"] if key in sent]
+        else:
+            before = integration_senders.get(sender)
+            integration_senders[sender] = sent
+            if len(integration_senders) > 200:
+                integration_senders.pop(next(iter(integration_senders)))
+            changed = list(sent) if first else [key for key in sent if before is not None and before.get(key) != sent[key]]
+        if changed or first:
+            settings.update({key: sent[key] for key in changed})
+            INTEGRATIONS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json(INTEGRATIONS, settings)
+            if changed and not first:
+                print("integrations: " + ", ".join(f"{key} {'on' if sent[key] else 'off'}" for key in changed), flush=True)
+    return settings
 
 
 def recap_chat(home: pathlib.Path, session_id: str) -> tuple[str, str, int]:
@@ -4269,18 +4313,50 @@ def save_devices(devices: list[dict]) -> None:
     DEVICES.chmod(0o600)
 
 
-def settle_devices(gone: set[str], relay_tokens: dict[str, str]) -> None:
+# Apple's reasons that mean a registration will never work again: the token belongs to no install, or to
+# another app or environment. Anything else, such as a throttle or a bad payload, says nothing about it.
+PUSH_DEAD = {"BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"}
+# A registration goes after this many such refusals in a row. An app that is still installed registers
+# again the next time it opens, so nothing is lost if Apple was wrong.
+PUSH_REFUSALS = 3
+
+
+def settle_devices(gone: set[str], relay_tokens: dict[str, str], refused: set[str] = frozenset(),
+                   reached: set[str] = frozenset()) -> None:
     """Records what a round of pushes learned, on the list as it is now: dead tokens go, and new relay
     tokens are kept. A phone may have registered or changed its mutes while the pushes were going out, and
     saving the list read before them would undo that."""
-    if not gone and not relay_tokens:
+    if not gone and not relay_tokens and not refused and not reached:
         return
     with devices_lock:
-        devices = [device for device in load_devices() if device["token"] not in gone]
-        for device in devices:
-            if device["token"] in relay_tokens and not device.get("relay_token"):
-                device["relay_token"] = relay_tokens[device["token"]]
-        save_devices(devices)
+        before = load_devices()
+        devices = []
+        for device in before:
+            device = dict(device)
+            token = device["token"]
+            if token in gone:
+                continue
+            if token in refused:
+                device["refused"] = int(device.get("refused") or 0) + 1
+                if device["refused"] >= PUSH_REFUSALS:
+                    print("push: a registration Apple kept refusing was removed", flush=True)
+                    continue
+            elif token in reached:
+                device.pop("refused", None)
+            if token in relay_tokens and not device.get("relay_token"):
+                device["relay_token"] = relay_tokens[token]
+            devices.append(device)
+        if devices != before:
+            save_devices(devices)
+
+
+def same_install(old: dict, new: dict) -> bool:
+    """Whether two registrations are one copy of the app. Apple gives an install a new token now and then,
+    and the old one kept working for a while, so the same push reached the phone twice. The key an install
+    seals its notifications with stays the same for its life, and Hermit Dev has one of its own."""
+    if old["token"] == new["token"]:
+        return True
+    return bool(new.get("push_key")) and old.get("push_key") == new["push_key"] and old.get("topic") == new.get("topic")
 
 
 def use_relay() -> bool:
@@ -4392,6 +4468,8 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
     body = json.dumps(payload)
     authorization = None if relay else apns_token(config)
     gone: set[str] = set()
+    refused: set[str] = set()
+    reached: set[str] = set()
     relay_tokens: dict[str, str] = {}
     for device in load_devices():
         if is_muted(device, profile, routine):
@@ -4416,8 +4494,12 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
         status, reason = apns_outcome(result.stdout)
         if status == "410":
             gone.add(device["token"])
+        elif reason in PUSH_DEAD:
+            refused.add(device["token"])
+        elif status == "200":
+            reached.add(device["token"])
         print(f"push {profile}: {status}{' ' + reason if reason else ''}", flush=True)
-    settle_devices(gone, relay_tokens)
+    settle_devices(gone, relay_tokens, refused, reached)
 
 
 def publish(session_id: str, event: dict) -> bool:
@@ -4751,6 +4833,10 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, voice_status())
+        if url.path == "/integrations":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            return self.json(200, integrations_view())
         if url.path == "/groups":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -5133,12 +5219,11 @@ class Handler(BaseHTTPRequestHandler):
                 fields = json.loads(data or b"{}")
             except ValueError:
                 return self.json(400, {"error": {"message": "That request couldn't be read"}})
-            settings = {key: fields.get(key) is True for key in MAC_INTEGRATIONS}
-            for key in KEPT_INTEGRATIONS:
-                settings[key] = fields[key] is True if key in fields else integration_on(key)
-            INTEGRATIONS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            write_json(INTEGRATIONS, settings)
-            return self.json(200, settings)
+            if not isinstance(fields, dict):
+                return self.json(400, {"error": {"message": "That request couldn't be read"}})
+            sender = hashlib.sha256("\n".join(self.headers.get(name) or "" for name in
+                                              ("Authorization", "User-Agent", "X-Forwarded-For")).encode()).hexdigest()
+            return self.json(200, take_integrations(fields, sender))
         if path == "/live/register":
             return self.live_register(header)
         if path == "/inbox/state" or path == "/inbox/read" or path == "/inbox/close":
@@ -5411,8 +5496,30 @@ class Handler(BaseHTTPRequestHandler):
                  "muted_routines": muted_routines, "muted_until": muted_until,
                  **({"push_key": push_key} if re.fullmatch(r"[A-Za-z0-9+/]{43}=", push_key) else {})}
         with devices_lock:
-            save_devices([d for d in load_devices() if d["token"] != token] + [entry])
+            save_devices([d for d in load_devices() if not same_install(d, entry)] + [entry])
         self.json(200, {"ok": True, "push": True})
+
+
+class Stamped:
+    """Puts the time before each line of the log. The log had none, so a refused push or a failed run
+    couldn't be matched to what the owner saw, or to a time in Hermes's own logs."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.fresh = True
+        self.lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        with self.lock:
+            for piece in text.splitlines(keepends=True):
+                if self.fresh:
+                    self.stream.write(time.strftime("%Y-%m-%d %H:%M:%S "))
+                self.stream.write(piece)
+                self.fresh = piece.endswith("\n")
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 class Server(ThreadingHTTPServer):
@@ -5434,6 +5541,7 @@ if __name__ == "__main__":
     # Hermes's own modules can restart whoever imports them under a bare Python to finish an install.
     # That Python has none of the bridge's packages, so the bridge died mid-request and launchd restarted it.
     os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
+    sys.stdout, sys.stderr = Stamped(sys.stdout), Stamped(sys.stderr)
     threading.Thread(target=udp_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
     threading.Thread(target=feed_loop, daemon=True).start()
