@@ -1,5 +1,5 @@
 name: hermit
-version: "0.33.2"
+version: "0.33.3"
 description: Connect the Hermit iPhone, iPad and Mac app to your Hermes agents
 provides_tools:
   - hermes_card

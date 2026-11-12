@@ -446,10 +446,17 @@ def set_voice_prefs(profile: str, changes: dict) -> None:
         write_json(VOICE_PREFS, state)
 
 
-def voice_allowance(header: str | None) -> tuple[bool, bool]:
+def voice_allowance(header: str | None, named: str | None = None) -> tuple[bool, bool]:
     """(calls, context) for the bot whose key made the request, so no client can name a different bot.
-    If bots share a key, the strictest setting wins."""
+    If bots share a key, the strictest setting wins. A device's own key opens every bot, so it gets the
+    setting of the bot the app named."""
     token = (header or "").removeprefix("Bearer ").strip()
+    if token.startswith(DEVICE_PREFIX):
+        # A device key matches no bot's key. Calls from a phone that held one were all refused as off.
+        if not named or named not in homes() or device_for(token) is None:
+            return False, False
+        prefs = voice_prefs(named)
+        return prefs["voiceCalls"], prefs["voiceContext"]
     prefs = [voice_prefs(name) for name, home in homes().items()
              if token and (key := api_key(home)) and hmac.compare_digest(token, key)]
     return (bool(prefs) and all(p["voiceCalls"] for p in prefs), bool(prefs) and all(p["voiceContext"] for p in prefs))
@@ -457,8 +464,11 @@ def voice_allowance(header: str | None) -> tuple[bool, bool]:
 
 def voice_profile(header: str | None, named: str | None = None) -> str | None:
     """The bot whose key made the request. If several bots share that key, the one the app named, as
-    long as it's among them, so a client still can't reach a bot whose key it doesn't hold."""
+    long as it's among them, so a client still can't reach a bot whose key it doesn't hold. A device's own
+    key opens every bot, so it's the one the app named."""
     token = (header or "").removeprefix("Bearer ").strip()
+    if token.startswith(DEVICE_PREFIX):
+        return named if named in homes() and device_for(token) is not None else None
     matches = [name for name, home in homes().items()
                if token and (key := api_key(home)) and hmac.compare_digest(token, key)]
     if len(matches) == 1:
@@ -5329,7 +5339,7 @@ class Handler(BaseHTTPRequestHandler):
         voice = fields.get("voice") or None
         if voice is not None and voice not in VOICES[billing]:
             return self.json(400, {"error": {"message": "That voice isn't available on this service"}})
-        calls, share = voice_allowance(header)
+        calls, share = voice_allowance(header, fields.get("profile"))
         # Reading a summary aloud isn't a call with a bot: it needs no bot's leave, character or memory.
         reading = fields.get("purpose") == "read"
         if reading:
