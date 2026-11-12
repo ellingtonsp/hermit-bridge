@@ -1,9 +1,9 @@
 {
  "version": "1.0",
- "build": 20,
- "file": "Hermit-1.0-20.dmg",
- "sha256": "c6546c4eb128b725a8665bf90713b81e357ed279016a68a9754f9627658e4438",
- "notes": "Tidings feed with settings, thumbs and its own bot. Summaries: one for your inbox and one when you come back to a chat, read aloud by your device, your Mac's voice or ChatGPT. Meeting invitations from Calendar cards. Waiting on You view. One text size setting for the whole app. File links open from any screen. Smoother streaming. A key of its own for each device, with a Devices screen. Works with Hermes on Linux. A fuller demo. Fixes for VNC links, Calendar and Reminders buttons, scrolling, and a reply's last lines fading out in build 19.",
- "size": 21534304,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-20/Hermit-1.0-20.dmg"
+ "build": 21,
+ "file": "Hermit-1.0-21.dmg",
+ "sha256": "4835017b7a043fbcac823f65c357791d0bca25ba3463bcec495f7cc0fa3ce60e",
+ "notes": "Build 21: the inbox says when a newer plugin is out and offers Tidings, chat is smoother with the end-of-reply jump and card wobble fixed, and a Call Bot shortcut starts a call with a bot.",
+ "size": 21603949,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-21/Hermit-1.0-21.dmg"
 }
