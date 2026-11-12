@@ -14,6 +14,7 @@ import glob
 import hashlib
 import hmac
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -35,6 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -120,9 +122,9 @@ INTEGRATIONS = STATE / "integrations.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
-KEPT_INTEGRATIONS = ("recaps", "macCalls")
+KEPT_INTEGRATIONS = ("recaps", "macCalls", "macDictation")
 # Switches that are on until someone turns them off.
-ON_UNLESS_OFF = ("macCalls",)
+ON_UNLESS_OFF = ("macCalls", "macDictation")
 # Works for anyone. Rules for your own workspaces go in links.json.
 BASE_LINK_RULES = [{"pattern": r"\b([\w.-]+/[\w.-]+)#(\d+)\b", "url": "https://github.com/$1/issues/$2"}]
 WORKING_SECONDS = 180
@@ -3031,7 +3033,8 @@ def voice_status() -> dict:
     except Exception as error:  # a config Hermes can't read mustn't hide the other services
         print(f"voice status: {type(error).__name__}", flush=True)
         mac = {"available": False, "reason": "Hermes's settings on your Mac couldn't be read", "models": [], "model": None}
-    return {"subscription": subscription, "api": {"available": OPENAI_KEY.exists(), "reason": None}, "mac": mac}
+    return {"subscription": subscription, "api": {"available": OPENAI_KEY.exists(), "reason": None}, "mac": mac,
+            "dictation": dictation_status()}
 
 
 # How much of each thing a call is given. Together about 4,000 words at most, which a voice model
@@ -3465,6 +3468,116 @@ def speak_through_worker(text: str, worker: VoiceWorker | None = None, run=subpr
             print(f"local call: speaking failed: {clipped(str(answer.get('error') or ''), 160)}", flush=True)
             raise VoiceError("The Mac's voice didn't answer. Check Hermes's voice on your Mac.")
         return playable_sound(made, work, run)
+
+
+# Dictation through the Mac: the app records, finds the pauses, and sends each finished stretch here to be written
+# out by Hermes's own speech-to-text, the same hearing a call on the Mac uses. The audio is only ever in a temporary
+# folder while it's heard, and nothing is kept.
+DICTATION_SECONDS = 60
+DICTATION_AUDIO_MAX = 44 + 16_000 * 2 * DICTATION_SECONDS
+dictation_idle_timer: threading.Timer | None = None
+dictation_idle_lock = threading.Lock()
+# How the last stretch went since the bridge started: True, False, or None before any.
+last_dictation: dict = {}
+
+
+def host_word() -> str:
+    return "Mac" if IS_MAC else "server"
+
+
+def mac_dictation_on() -> bool:
+    """On unless switched off in the app, like calls on the Mac: it reaches nothing the bot can't already."""
+    return integration_on("macDictation")
+
+
+def dictation_status() -> dict:
+    """Whether this computer can write out dictation, from Hermes's settings alone, so it's quick to ask."""
+    try:
+        stt = read_yaml(HOME / "config.yaml").get("stt")
+    except Exception:
+        stt = None
+    stt = stt if isinstance(stt, dict) else {}
+    provider = str(stt.get("provider") or "").strip() or None
+    reason = None
+    if not mac_dictation_on():
+        reason = "Switched off in Integrations"
+    elif not (HOME / "hermes-agent/tools/transcription_tools.py").exists():
+        reason = f"Update Hermes on your {host_word()} first"
+    elif stt.get("enabled") is False:
+        reason = f"Turn on Hermes's speech-to-text on your {host_word()} first"
+    return {"available": reason is None, "reason": reason, "provider": provider}
+
+
+def wav_seconds(audio: bytes) -> float:
+    """How long a WAV file plays, or ValueError if it isn't one. Only WAV is taken, so its length is known."""
+    try:
+        with wave.open(io.BytesIO(audio)) as sound:
+            rate, frames = sound.getframerate(), sound.getnframes()
+    except (wave.Error, EOFError) as error:
+        raise ValueError("not a WAV file") from error
+    if rate <= 0:
+        raise ValueError("not a WAV file")
+    return frames / rate
+
+
+def stop_voice_when_idle() -> None:
+    """The speech worker holds Hermes's hearing in memory, so it's stopped once dictation and calls go quiet."""
+    global dictation_idle_timer
+    with dictation_idle_lock:
+        if dictation_idle_timer is not None:
+            dictation_idle_timer.cancel()
+        dictation_idle_timer = threading.Timer(LOCAL_CALL_IDLE + 5, prune_local_calls)
+        dictation_idle_timer.daemon = True
+        dictation_idle_timer.start()
+
+
+def dictate(audio: bytes, hear=None) -> dict:
+    """One stretch of dictation, written out. Raises VoiceError, worded for the person, when it can't be."""
+    status = dictation_status()
+    if not status["available"]:
+        raise VoiceError(status["reason"])
+    seconds = wav_seconds(audio)
+    if seconds > DICTATION_SECONDS:
+        raise ValueError("too long")
+    started = time.time()
+    try:
+        text = (hear or hear_on_mac)(audio)
+    except VoiceError:
+        last_dictation["worked"] = False
+        raise VoiceError(f"Hermes's speech-to-text on your {host_word()} didn't work. Check it's set up there.")
+    finally:
+        stop_voice_when_idle()
+    last_dictation["worked"] = True
+    return {"text": text, "seconds": round(time.time() - started, 2)}
+
+
+def check_dictation(worker=None) -> dict:
+    """The quick status, then the speech worker started and asked to hear a moment of quiet, so the first words
+    don't wait for it. Silence isn't a fair test of the hearing itself, since some speech-to-text reports
+    nothing heard as a failure, so `worked` says how the last real stretch went instead."""
+    status = dictation_status() | {"worked": last_dictation.get("worked")}
+    if not status["available"]:
+        return status
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermit-hear.") as folder:
+            path = pathlib.Path(folder) / "quiet.wav"
+            path.write_bytes(wav_silence(0.5))
+            (worker or voice_worker).ask({"op": "hear", "path": str(path)})
+    except VoiceError:
+        status |= {"available": False, "reason": f"Hermes's speech-to-text on your {host_word()} didn't start"}
+    finally:
+        stop_voice_when_idle()
+    return status
+
+
+def wav_silence(seconds: float) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as sound:
+        sound.setnchannels(1)
+        sound.setsampwidth(2)
+        sound.setframerate(16_000)
+        sound.writeframes(b"\0\0" * int(16_000 * seconds))
+    return out.getvalue()
 
 
 class GarbledToolCall(VoiceError):
@@ -5389,6 +5502,11 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.guarded(lambda: {"accounts": calendar_accounts()})
+        if url.path == "/dictation/status":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            check = (query.get("check") or [""])[0] == "1"
+            return self.json(200, check_dictation() if check else dictation_status())
         if url.path == "/voice/status":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -5794,6 +5912,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.voice_session(header)
         if path.startswith("/voice/local/"):
             return self.local_call_action(path, header)
+        if path == "/dictation":
+            return self.dictation(header)
         if path == "/uploads":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -5975,6 +6095,26 @@ class Handler(BaseHTTPRequestHandler):
         OPENAI_KEY.touch(mode=0o600)
         OPENAI_KEY.write_text(key)
         self.json(200, {"ok": True})
+
+    def dictation(self, header: str | None) -> None:
+        """One stretch of dictation as 16 kHz WAV, written out by Hermes's speech-to-text. Any device key works,
+        since it's the device's owner speaking, not a bot."""
+        if not authorized(header):
+            return self.json(401, {"error": "unauthorized"})
+        if not (self.headers.get("Content-Type") or "").startswith("audio/"):
+            return self.json(400, {"error": {"message": "Send the audio as WAV"}})
+        audio = self.body(DICTATION_AUDIO_MAX)
+        if len(audio) > DICTATION_AUDIO_MAX:
+            return self.json(413, {"error": {"message": "That was too long to write out in one go"}})
+        try:
+            return self.json(200, dictate(audio))
+        except VoiceError as error:  # written for people, so it's shown as it is
+            return self.json(409, {"error": {"message": str(error)}})
+        except ValueError:
+            return self.json(400, {"error": {"message": "That audio couldn't be read"}})
+        except Exception as error:
+            print(f"dictation error: {type(error).__name__}", flush=True)
+            return self.json(502, {"error": {"message": "Dictation couldn't be written out just now."}})
 
     def local_call_action(self, path: str, header: str | None) -> None:
         """A call heard and spoken on the Mac: start, a turn from the caller, an update to put into words, end."""
