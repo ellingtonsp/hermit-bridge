@@ -120,7 +120,9 @@ INTEGRATIONS = STATE / "integrations.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
-KEPT_INTEGRATIONS = ("recaps",)
+KEPT_INTEGRATIONS = ("recaps", "macCalls")
+# Switches that are on until someone turns them off.
+ON_UNLESS_OFF = ("macCalls",)
 # Works for anyone. Rules for your own workspaces go in links.json.
 BASE_LINK_RULES = [{"pattern": r"\b([\w.-]+/[\w.-]+)#(\d+)\b", "url": "https://github.com/$1/issues/$2"}]
 WORKING_SECONDS = 180
@@ -3024,7 +3026,12 @@ def voice_status() -> dict:
     except Exception as error:
         reason = str(error) if isinstance(error, VoiceError) else "Sign in to OpenAI Codex in Hermes first"
         subscription = {"available": False, "reason": reason}
-    return {"subscription": subscription, "api": {"available": OPENAI_KEY.exists(), "reason": None}}
+    try:
+        mac = mac_call_status()
+    except Exception as error:  # a config Hermes can't read mustn't hide the other services
+        print(f"voice status: {type(error).__name__}", flush=True)
+        mac = {"available": False, "reason": "Hermes's settings on your Mac couldn't be read", "models": [], "model": None}
+    return {"subscription": subscription, "api": {"available": OPENAI_KEY.exists(), "reason": None}, "mac": mac}
 
 
 # How much of each thing a call is given. Together about 4,000 words at most, which a voice model
@@ -3138,6 +3145,490 @@ def start_voice_session(billing: str, sdp: str, instructions: str, voice: str | 
         raise VoiceError(f"OpenAI refused the call ({status})")
     parsed = json.loads(answer)
     return {"billing": billing, "session": parsed.get("session"), "transport": parsed.get("transport")}
+
+
+def call_instructions(header: str | None, fields: dict, share: bool) -> str:
+    """The app's briefing, with the bot's character, memory and the end of its chat when context is shared.
+    Built here from the bot's own files and its real thread. An older app only sends `context`, a few
+    messages it had loaded, which is used when there's nothing better."""
+    instructions = str(fields.get("instructions") or "")[:64000]
+    context = str(fields.get("context") or "")[:MAX_VOICE_CONTEXT]
+    if not share:
+        return instructions
+    profile, session_id = voice_profile(header, fields.get("profile")), str(fields.get("session") or "")
+    background = None
+    if profile and (not session_id or session_title(homes()[profile], session_id) is not None):
+        background = voice_background(homes()[profile], session_id, str(fields.get("status") or ""))
+    # An app that doesn't say which chat still gets the bot's character and memory, with the few
+    # messages it sent standing in for the thread.
+    pieces = [background, context if not (background and session_id) else None]
+    if extra := "\n\n".join(piece for piece in pieces if piece):
+        instructions = f"{instructions}\n\n{extra}"
+    return instructions
+
+
+# Calls through the Mac. Hermes's own speech-to-text and voice do the hearing and speaking, and a small model
+# between them talks with the caller and hands real work to the bot, the way GPT-Live does: it never just reads
+# out what it heard or what the bot wrote. The app finds where a sentence ends and sends it whole.
+LOCAL_CALL_SECONDS = 35 * 60
+LOCAL_CALL_IDLE = 10 * 60
+LOCAL_CALLS_MAX = 4
+LOCAL_HISTORY = 40
+LOCAL_AUDIO_MAX = 4_000_000
+FRONT_TOKENS = 160
+FRONT_SECONDS = 60
+FRONT_DEFAULT = "omlx/Qwen3.5-4B-4bit"
+# Names on a provider's list that hear, speak or embed rather than talk.
+NOT_CHAT = re.compile(r"kokoro|embed|parakeet|whisper|tts|stt|rerank|voxtral|speech|audio", re.I)
+FRONT_TOOLS = [{"type": "function", "function": {
+    "name": "delegate",
+    "description": "Hand the caller's request to the Hermes agent, which does the real work and knows the facts. "
+                   "Use it for anything to do, check, find, make, send, fix, schedule or remember, any question that "
+                   "needs facts, current information or the caller's own data, and any change to work already asked for.",
+    "parameters": {"type": "object", "properties": {"request": {
+        "type": "string", "description": "What the caller wants, in their own words, with every detail they gave."}},
+        "required": ["request"]}}}]
+FRONT_RULES = (
+    "How this call works: you are only the voice. You can't do anything yourself, and you know nothing about the "
+    "caller's messages, calendar, reminders, files, accounts, plans, the news or the weather. The Hermes agent "
+    "can, and the delegate tool is the only way to reach it. Saying you're checking, setting, booking or looking "
+    "without calling delegate does nothing, and misleads the caller.\n\n"
+    "So whenever the caller wants anything done, checked, found, set, booked, sent, changed or remembered, or "
+    "asks anything that needs facts, call delegate in that same reply, with their request in their own words and "
+    "every detail they gave, and say in a few words that you're on it. Never answer those yourself and never "
+    "guess a result. Answer without the tool only for greetings, small talk, a short clarifying question, or "
+    "repeating something already said on this call.\n\n"
+    "For example, these all go to delegate: \"Can you see if Sam got back to me?\", \"Remind me to water the "
+    "plants at six.\", \"What's the weather tomorrow?\", \"Did my package come?\", \"Actually, make it seven.\" "
+    "These you answer yourself: \"Hi, how are you?\", \"Can you hear me?\", \"Thanks, that's all.\"\n\n"
+    "You hear the caller through speech recognition, so expect the odd misheard word, and everything you write "
+    "is read aloud. Write only what should be spoken: one or two short sentences in plain words, with no "
+    "markdown, lists, emoji or links.\n\n"
+    "A message that starts with [Update] comes from the agent and the app, not from the caller. Turn it into your "
+    "own short spoken words for the caller. A progress update means the work isn't finished, so never say it is. "
+    "A result: tell the caller what it says, briefly, keeping names, numbers and times exact. Never call delegate "
+    "for an update."
+)
+FRONT_HANDED = "Handed to the agent. It's working on it now. Progress and the result will arrive as [Update] messages."
+# Said when the model hands work over without a word of its own, so the caller is never left in silence.
+CHECKING_LINES = ("Let me check on that.", "On it, one moment.", "Sure, give me a second.", "Okay, checking now.")
+local_calls: dict[str, dict] = {}
+local_calls_lock = threading.Lock()
+
+
+def live_persona() -> str:
+    """Hermes's own GPT-Live persona, so a call sounds the same whichever service carries it. A Hermes too old
+    to have one gets its delegation rules in short."""
+    try:
+        hermes_on_path()
+        from tools.voice_live import LIVE_PERSONA
+        return LIVE_PERSONA
+    except ImportError:
+        return ("You are Hermes, a calm and friendly voice assistant. Speak naturally and be clear and direct. "
+                "Delegate to the Hermes agent whenever the caller wants anything done or asks anything that needs "
+                "facts, and don't guess the result while waiting.")
+
+
+def front_instructions(persona: str, instructions: str) -> str:
+    return "\n\n".join(part for part in (persona.strip(), FRONT_RULES, instructions.strip()) if part)
+
+
+def front_update(text: str) -> str:
+    return f"[Update] {' '.join(str(text).split())[:MAX_VOICE_CONTEXT]}"
+
+
+def is_local_address(base_url: str) -> bool:
+    host = urllib.parse.urlparse(base_url).hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private
+
+
+def provider_key(entry: dict) -> str:
+    """A provider's key as Hermes's config gives it: written out, or named as a variable in the environment or
+    ~/.hermes/.env. It stays in this process and is never logged or returned."""
+    names = [str(entry.get(field)) for field in ("key_env", "api_key_env") if entry.get(field)]
+    written = str(entry.get("api_key") or "")
+    if match := re.fullmatch(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}", written):
+        names.insert(0, match.group(1))
+    elif written:
+        return written
+    for name in names:
+        if value := os.getenv(name) or env_value(HOME, name):
+            return value
+    return ""
+
+
+def front_providers() -> dict[str, dict]:
+    """Hermes's own OpenAI-compatible providers, by name. Nothing is set up twice: the call uses what Hermes uses."""
+    providers = read_yaml(HOME / "config.yaml").get("custom_providers")
+    found = {}
+    for entry in providers if isinstance(providers, list) else []:
+        if not isinstance(entry, dict) or not entry.get("name") or not str(entry.get("base_url") or "").startswith("http"):
+            continue
+        if str(entry.get("api_mode") or "chat_completions") != "chat_completions":
+            continue
+        found[str(entry["name"])] = entry
+    return found
+
+
+def front_models() -> list[dict]:
+    """Models a call can talk with: those Hermes lists for its OpenAI-compatible providers. Ones on this computer
+    or its network come first, since they keep the whole call at home."""
+    listed = []
+    for name, entry in front_providers().items():
+        models = entry.get("models")
+        for model in models if isinstance(models, (dict, list)) else []:
+            if isinstance(model, str) and not NOT_CHAT.search(model):
+                listed.append({"id": f"{name}/{model}", "name": model, "provider": name,
+                               "local": is_local_address(str(entry["base_url"]))})
+    return sorted(listed, key=lambda model: not model["local"])
+
+
+def front_default(models: list[dict]) -> str | None:
+    ids = [model["id"] for model in models]
+    return FRONT_DEFAULT if FRONT_DEFAULT in ids else next((model["id"] for model in models if model["local"]), None) \
+        or (ids[0] if ids else None)
+
+
+def mac_calls_on() -> bool:
+    """On unless switched off in the app. It reaches nothing outside the Mac that the bot can't already."""
+    return integration_on("macCalls")
+
+
+def mac_call_status() -> dict:
+    models = front_models()
+    stt = read_yaml(HOME / "config.yaml").get("stt")
+    stt = stt if isinstance(stt, dict) else {}
+    reason = None
+    if not mac_calls_on():
+        reason = "Switched off in Integrations"
+    elif not all((HOME / "hermes-agent/tools" / name).exists() for name in ("transcription_tools.py", "tts_tool.py")):
+        reason = "Update Hermes on your Mac first"
+    elif stt.get("enabled") is False:
+        reason = "Turn on Hermes's speech-to-text on your Mac first"
+    elif not models:
+        reason = "Hermes has no model this can talk with yet"
+    return {"available": reason is None, "reason": reason, "models": models, "model": front_default(models)}
+
+
+class VoiceWorker:
+    """One Python that keeps Hermes's speech tools loaded, so a turn doesn't pay for starting one. Asked one
+    thing at a time, restarted if it dies or hangs, and stopped when calls have gone quiet."""
+    SCRIPT = r"""
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+answers = os.fdopen(os.dup(1), "w", buffering=1)
+os.dup2(2, 1)  # whatever Hermes prints goes to the log, never into the answers
+from tools.transcription_tools import transcribe_audio
+from tools.tts_tool import text_to_speech_tool
+for line in sys.stdin:
+    try:
+        job = json.loads(line)
+        if job.get("op") == "hear":
+            answer = transcribe_audio(job["path"])
+        else:
+            answer = json.loads(text_to_speech_tool(text=job["text"], output_path=job["path"]))
+    except Exception as error:
+        answer = {"success": False, "error": type(error).__name__}
+    answers.write(json.dumps(answer if isinstance(answer, dict) else {"success": False}, default=str) + "\n")
+"""
+
+    def __init__(self, spawn=subprocess.Popen):
+        self.spawn = spawn
+        self.lock = threading.Lock()
+        self.process = None
+        self.answers: queue.Queue = queue.Queue()
+        self.used = 0.0
+
+    def ask(self, job: dict, timeout: float = 60) -> dict:
+        with self.lock:
+            self.used = time.time()
+            if self.process is None or self.process.poll() is not None:
+                self.start()
+            try:
+                self.process.stdin.write(json.dumps(job) + "\n")
+                self.process.stdin.flush()
+                answer = self.answers.get(timeout=timeout)
+            except (OSError, ValueError, queue.Empty):
+                answer = None
+            if not isinstance(answer, dict):
+                self.stop_locked()
+                raise VoiceError("Your Mac's voice didn't answer.")
+            self.used = time.time()
+            return answer
+
+    def start(self) -> None:
+        self.answers = queue.Queue()
+        self.process = self.spawn([hermes_python(), "-c", self.SCRIPT, str(HOME / "hermes-agent")],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, env=speech_env())
+        process, answers = self.process, self.answers
+
+        def read():
+            for line in process.stdout:
+                try:
+                    answers.put(json.loads(line))
+                except ValueError:
+                    continue
+            answers.put(None)
+        threading.Thread(target=read, daemon=True).start()
+
+    def stop_locked(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+        self.process = None
+
+    def stop_if_idle(self, seconds: float) -> None:
+        with self.lock:
+            if self.process is not None and time.time() - self.used > seconds:
+                self.stop_locked()
+
+
+voice_worker = VoiceWorker()
+
+
+def hear_on_mac(audio: bytes, worker: VoiceWorker | None = None) -> str:
+    """Hermes's own speech-to-text, with whatever the owner set up for it."""
+    with tempfile.TemporaryDirectory(prefix="hermit-hear.") as folder:
+        path = pathlib.Path(folder) / "heard.wav"
+        path.write_bytes(audio)
+        answer = (worker or voice_worker).ask({"op": "hear", "path": str(path)})
+    if not answer.get("success"):
+        print(f"local call: hearing failed: {clipped(str(answer.get('error') or ''), 160)}", flush=True)
+        raise VoiceError("Your Mac couldn't make out that audio. Check Hermes's speech-to-text on your Mac.")
+    return " ".join(str(answer.get("transcript") or "").split())
+
+
+def speak_through_worker(text: str, worker: VoiceWorker | None = None, run=subprocess.run) -> tuple[bytes, str]:
+    with tempfile.TemporaryDirectory(prefix="hermit-say.") as folder:
+        work = pathlib.Path(folder)
+        answer = (worker or voice_worker).ask({"op": "speak", "text": text, "path": str(work / "said.wav")})
+        made = pathlib.Path(str(answer.get("file_path") or ""))
+        # Only a file made in this folder, whatever the tool says it wrote.
+        if not answer.get("success") or made.parent.resolve() != work.resolve() or not made.is_file():
+            print(f"local call: speaking failed: {clipped(str(answer.get('error') or ''), 160)}", flush=True)
+            raise VoiceError("The Mac's voice didn't answer. Check Hermes's voice on your Mac.")
+        return playable_sound(made, work, run)
+
+
+class GarbledToolCall(VoiceError):
+    """The model tried to call a tool and the server couldn't read the call."""
+
+
+def front_request(model_id: str, messages: list, tools: list | None, max_tokens: int = FRONT_TOKENS,
+                  post=None) -> dict:
+    """One answer from the call's model, through the provider Hermes already uses for it."""
+    provider, _, model = model_id.partition("/")
+    entry = front_providers().get(provider)
+    if not entry or not model:
+        raise VoiceError("That model isn't set up in Hermes on your Mac")
+    base = str(entry["base_url"]).rstrip("/")
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.5}
+    if tools:
+        body["tools"] = tools
+    if is_local_address(base):
+        # Local servers think out loud first unless told not to, which costs seconds on a call.
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    headers = {"Content-Type": "application/json"}
+    if key := provider_key(entry):
+        headers["Authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(f"{base}/chat/completions", data=json.dumps(body).encode(), method="POST",
+                                     headers=headers)
+    for attempt in range(2):
+        try:
+            if post:
+                return post(request)
+            with urllib.request.build_opener(NoRedirects).open(request, timeout=FRONT_SECONDS) as response:
+                return json.loads(response.read(2_000_000))
+        except urllib.error.HTTPError as error:
+            try:
+                said = error.read(4000).decode("utf-8", "replace")
+            except (OSError, AttributeError):
+                said = ""
+            # oMLX, for one, refuses a whole answer when a small model garbles its tool call.
+            if "invalid_tool_call" in said:
+                raise GarbledToolCall("The call's model garbled its answer")
+            # A local server busy with something else now and then fails one request. Once more is enough.
+            if error.code >= 500 and attempt == 0:
+                continue
+            raise VoiceError(f"The call's model refused ({error.code})")
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            raise VoiceError("The call's model didn't answer. Check that it's running on your Mac.")
+    raise VoiceError("The call's model didn't answer. Check that it's running on your Mac.")
+
+
+def front_answer(response: dict) -> tuple[str, str | None, list]:
+    """(what to say, the request to hand over if any, the tool calls as the model wrote them)."""
+    choice = ((response.get("choices") or [{}])[0] or {}).get("message") or {}
+    text = str(choice.get("content") or "")
+    calls = [call for call in choice.get("tool_calls") or [] if isinstance(call, dict)]
+    # A server that doesn't read tool calls itself leaves them in the text.
+    for raw in re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.S):
+        try:
+            found = json.loads(raw)
+        except ValueError:
+            continue
+        arguments = found.get("arguments")
+        calls.append({"id": f"call_{uuid.uuid4().hex[:8]}", "type": "function", "function": {
+            "name": found.get("name"), "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments or {})}})
+    text = re.sub(r"<think>.*?(</think>|$)|<tool_call>.*?(</tool_call>|$)", "", text, flags=re.S)
+    say = " ".join(re.sub(r"[*_#`>]+", "", text).split())
+    request = None
+    for call in calls:
+        function = call.get("function") or {}
+        if function.get("name") != "delegate":
+            continue
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except ValueError:
+            arguments = {}
+        request = " ".join(str((arguments if isinstance(arguments, dict) else {}).get("request") or "").split())
+        break
+    delegations = [call for call in calls if (call.get("function") or {}).get("name") == "delegate"]
+    return say, request, delegations[:1]
+
+
+def front_history(messages: list) -> list:
+    """The newest part of the call, starting at something the caller said, so no answer is cut from its question."""
+    recent = messages[-LOCAL_HISTORY:]
+    while recent and recent[0].get("role") != "user":
+        recent = recent[1:]
+    return recent
+
+
+def front_turn(call: dict, said: str, update: bool = False, post=None) -> tuple[str, str | None]:
+    """The model's spoken answer to the caller or to an update, and the request it hands over, if any."""
+    call["messages"].append({"role": "user", "content": front_update(said) if update else said})
+    messages = [{"role": "system", "content": call["system"]}, *front_history(call["messages"])]
+    try:
+        say, request, delegations = front_answer(front_request(call["model"], messages, FRONT_TOOLS, post=post))
+    except GarbledToolCall:
+        if update:
+            # An update never hands work over, so asking again without the tool can only give words.
+            say, request, delegations = front_answer(front_request(call["model"], messages, None, post=post))
+        else:
+            # Delegate is its only tool, so a garbled call still says what it meant: hand over what was said.
+            say, request, delegations = "", said, [{"id": f"call_{uuid.uuid4().hex[:8]}"}]
+    if update or not delegations:
+        # An update never starts work, whatever the model tried.
+        request = None
+        call["messages"].append({"role": "assistant", "content": say})
+        return say, None
+    if not request:
+        # Handing over without saying what: what the caller just said is the request.
+        request = said
+    if not say:
+        say = CHECKING_LINES[len(call["messages"]) % len(CHECKING_LINES)]
+    call_id = str(delegations[0].get("id") or f"call_{uuid.uuid4().hex[:8]}")
+    call["messages"].append({"role": "assistant", "content": say, "tool_calls": [{
+        "id": call_id, "type": "function",
+        "function": {"name": "delegate", "arguments": json.dumps({"request": request})}}]})
+    call["messages"].append({"role": "tool", "tool_call_id": call_id, "content": FRONT_HANDED})
+    return say, request
+
+
+def prune_local_calls(now: float | None = None) -> None:
+    now = now or time.time()
+    with local_calls_lock:
+        for key in [key for key, call in local_calls.items()
+                    if now - call["started"] > LOCAL_CALL_SECONDS or now - call["used"] > LOCAL_CALL_IDLE]:
+            local_calls.pop(key, None)
+        quiet = not local_calls
+    if quiet:
+        voice_worker.stop_if_idle(LOCAL_CALL_IDLE)
+
+
+def warm_local_call(call: dict) -> None:
+    """A local server unloads a model that sits idle, and loading one takes seconds. Hermes's own voice and
+    hearing are loaded here while the call connects. The call's model needs no separate warming: the app's
+    greeting cue arrives straight after the start and loads it with the call's instructions. A second request
+    at the same moment only made both read the instructions at once (4.4 s for the greeting, measured)."""
+    def voice():
+        try:
+            with tempfile.TemporaryDirectory(prefix="hermit-warm.") as folder:
+                said = voice_worker.ask({"op": "speak", "text": "Hello.", "path": str(pathlib.Path(folder) / "said.wav")})
+                made = pathlib.Path(str(said.get("file_path") or ""))
+                if said.get("success") and made.parent.resolve() == pathlib.Path(folder).resolve() and made.is_file():
+                    voice_worker.ask({"op": "hear", "path": str(made)})
+        except VoiceError:
+            pass
+    threading.Thread(target=voice, daemon=True).start()
+
+
+def start_local_call(header: str | None, fields: dict, persona: str | None = None) -> dict:
+    profile = str(fields.get("profile") or "")
+    calls, share = voice_allowance(header, profile or None)
+    if not calls:
+        raise PermissionError("Voice calls are off for this bot")
+    status = mac_call_status()
+    if not status["available"]:
+        raise VoiceError(status["reason"])
+    model = str(fields.get("model") or "") or status["model"]
+    if model not in {entry["id"] for entry in status["models"]}:
+        raise VoiceError("That model isn't set up in Hermes on your Mac")
+    persona = live_persona() if persona is None else persona
+    prune_local_calls()
+    call = {"id": secrets.token_urlsafe(18), "profile": voice_profile(header, profile or None) or profile,
+            "model": model, "system": front_instructions(persona, call_instructions(header, fields, share)),
+            "messages": [], "started": time.time(), "used": time.time(), "lock": threading.Lock()}
+    with local_calls_lock:
+        if len(local_calls) >= LOCAL_CALLS_MAX:
+            raise VoiceError("Too many calls are open on your Mac. Hang up one and try again.")
+        local_calls[call["id"]] = call
+    warm_local_call(call)
+    return {"call": call["id"], "model": model}
+
+
+def local_call(fields: dict, header: str | None) -> dict:
+    """The open call this request belongs to, if the key that asks may reach that bot."""
+    with local_calls_lock:
+        call = local_calls.get(str(fields.get("call") or ""))
+    if not call or not authorized(header, call["profile"] or None):
+        raise LookupError("That call has ended")
+    if not mac_calls_on():
+        raise PermissionError("Calls on your Mac are switched off")
+    call["used"] = time.time()
+    return call
+
+
+def local_call_turn(call: dict, *, audio: bytes | None = None, text: str | None = None, update: str | None = None,
+                    speak=None, hear=None, post=None) -> dict:
+    """One exchange: what was heard, what the model says back, any request it hands over, and that answer as sound."""
+    timing = {}
+    with call["lock"]:
+        heard = None
+        if audio is not None:
+            started = time.time()
+            heard = (hear or hear_on_mac)(audio)
+            timing["hear"] = round(time.time() - started, 2)
+            if not heard:
+                return {"heard": "", "say": "", "delegate": None, "timing": timing}
+        elif text is not None:
+            heard = " ".join(text.split())[:2000]
+        started = time.time()
+        if update is not None:
+            say, request = front_turn(call, update, update=True, post=post)
+        else:
+            say, request = front_turn(call, heard or "", post=post)
+        timing["think"] = round(time.time() - started, 2)
+    answer = {"heard": heard, "say": say, "delegate": request, "timing": timing}
+    if say:
+        started = time.time()
+        sound, kind = (speak or speak_through_worker)(clipped(say, SPEECH_CHARS))
+        timing["speak"] = round(time.time() - started, 2)
+        answer |= {"audio": base64.b64encode(sound).decode(), "audioType": kind}
+    return answer
+
+
+def end_local_call(call_id: str) -> None:
+    with local_calls_lock:
+        local_calls.pop(call_id, None)
+    prune_local_calls()
 
 
 # Tidings: a feed of cards written by a bot of its own, from what the owner lets it read. The bot runs as
@@ -3840,9 +4331,10 @@ recap_lock = threading.Lock()
 
 def integration_on(name: str) -> bool:
     try:
-        return read_json(INTEGRATIONS).get(name) is True
+        value = read_json(INTEGRATIONS).get(name)
     except (OSError, ValueError):
         return False
+    return value is not False if name in ON_UNLESS_OFF else value is True
 
 
 integrations_lock = threading.Lock()
@@ -4239,16 +4731,20 @@ def speak_on_mac(text: str, run=subprocess.run) -> tuple[bytes, str]:
         if done.returncode != 0 or made is None or made.parent.resolve() != work.resolve() or not made.is_file():
             print(f"speech: hermes exit {done.returncode}{': ' + said if said else ''}", flush=True)
             raise VoiceError("The Mac's voice didn't answer. Check Hermes's voice on your Mac.")
-        if made.suffix.lower() not in SPEECH_TYPES:
-            # Hermes's voices mostly make Ogg, which iOS can't play.
-            playable = work / "said.m4a"
-            turned = run([tool_path("ffmpeg"), "-loglevel", "error", "-y", "-i", str(made), "-c:a", "aac", "-b:a", "64k",
-                          str(playable)], capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
-            if turned.returncode != 0 or not playable.is_file():
-                print(f"speech: ffmpeg exit {turned.returncode}", flush=True)
-                raise VoiceError("The Mac's voice made a sound file this device can't play. It needs ffmpeg on the Mac.")
-            made = playable
-        return made.read_bytes(), SPEECH_TYPES[made.suffix.lower()]
+        return playable_sound(made, work, run)
+
+
+def playable_sound(made: pathlib.Path, work: pathlib.Path, run=subprocess.run) -> tuple[bytes, str]:
+    """The sound as it is when an iPhone can play it. Hermes's voices mostly make Ogg, which iOS can't."""
+    if made.suffix.lower() not in SPEECH_TYPES:
+        playable = work / "said.m4a"
+        turned = run([tool_path("ffmpeg"), "-loglevel", "error", "-y", "-i", str(made), "-c:a", "aac", "-b:a", "64k",
+                      str(playable)], capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        if turned.returncode != 0 or not playable.is_file():
+            print(f"speech: ffmpeg exit {turned.returncode}", flush=True)
+            raise VoiceError("The Mac's voice made a sound file this device can't play. It needs ffmpeg on the Mac.")
+        made = playable
+    return made.read_bytes(), SPEECH_TYPES[made.suffix.lower()]
 
 
 def speak_with_openai(text: str) -> tuple[bytes, str]:
@@ -5232,6 +5728,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.save_voice_key(header)
         if path == "/voice/session":
             return self.voice_session(header)
+        if path.startswith("/voice/local/"):
+            return self.local_call_action(path, header)
         if path == "/uploads":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -5414,6 +5912,49 @@ class Handler(BaseHTTPRequestHandler):
         OPENAI_KEY.write_text(key)
         self.json(200, {"ok": True})
 
+    def local_call_action(self, path: str, header: str | None) -> None:
+        """A call heard and spoken on the Mac: start, a turn from the caller, an update to put into words, end."""
+        if not authorized(header):
+            return self.json(401, {"error": "unauthorized"})
+        try:
+            audio = None
+            if path == "/voice/local/turn" and (self.headers.get("Content-Type") or "").startswith("audio/"):
+                audio = self.body(LOCAL_AUDIO_MAX)
+                if len(audio) > LOCAL_AUDIO_MAX:
+                    return self.json(413, {"error": {"message": "That was too long to hear in one go"}})
+                fields = {"call": (parse_qs(urlparse(self.path).query).get("call") or [""])[0]}
+            else:
+                fields = json.loads(self.body(262144) or b"{}")
+                if not isinstance(fields, dict):
+                    raise ValueError
+            if path == "/voice/local/start":
+                return self.json(200, start_local_call(header, fields))
+            call = local_call(fields, header)
+            if path == "/voice/local/end":
+                end_local_call(call["id"])
+                return self.json(200, {})
+            if path == "/voice/local/turn":
+                if audio is not None:
+                    return self.json(200, local_call_turn(call, audio=audio))
+                return self.json(200, local_call_turn(call, text=str(fields.get("text") or "")))
+            if path == "/voice/local/say":
+                text = str(fields.get("text") or "").strip()
+                if not text:
+                    raise ValueError
+                return self.json(200, local_call_turn(call, update=text))
+            return self.json(404, {"error": "not found"})
+        except PermissionError as error:
+            return self.json(403, {"error": {"message": str(error)}})
+        except LookupError as error:
+            return self.json(404, {"error": {"message": str(error)}})
+        except VoiceError as error:  # written for people, so it's shown as it is
+            return self.json(409, {"error": {"message": str(error)}})
+        except ValueError:
+            return self.json(400, {"error": {"message": "That request couldn't be read"}})
+        except Exception as error:
+            print(f"local call error: {type(error).__name__}", flush=True)
+            return self.json(502, {"error": {"message": "The call couldn't go on just now."}})
+
     def voice_session(self, header: str | None) -> None:
         if not authorized(header):
             return self.json(401, {"error": "unauthorized"})
@@ -5431,20 +5972,7 @@ class Handler(BaseHTTPRequestHandler):
             calls, share = True, False
         if not calls:
             return self.json(403, {"error": {"message": "Voice calls are off for this bot"}})
-        instructions = str(fields.get("instructions") or "")[:64000]
-        context = str(fields.get("context") or "")[:MAX_VOICE_CONTEXT]
-        if share:
-            # Built here from the bot's own files and its real thread. An older app only sends `context`,
-            # a few messages it had loaded, which is used when there's nothing better.
-            profile, session_id = voice_profile(header, fields.get("profile")), str(fields.get("session") or "")
-            background = None
-            if profile and (not session_id or session_title(homes()[profile], session_id) is not None):
-                background = voice_background(homes()[profile], session_id, str(fields.get("status") or ""))
-            # An app that doesn't say which chat still gets the bot's character and memory, with the few
-            # messages it sent standing in for the thread.
-            pieces = [background, context if not (background and session_id) else None]
-            if extra := "\n\n".join(piece for piece in pieces if piece):
-                instructions = f"{instructions}\n\n{extra}"
+        instructions = call_instructions(header, fields, share)
         try:
             self.json(200, start_voice_session(billing, sdp, instructions, voice))
         except VoiceError as error:
