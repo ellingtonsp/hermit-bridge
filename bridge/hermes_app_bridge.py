@@ -3179,6 +3179,8 @@ FRONT_TOKENS = 160
 FRONT_SECONDS = 60
 FRONT_DEFAULT = "omlx/Qwen3.5-4B-4bit"
 # Names on a provider's list that hear, speak or embed rather than talk.
+# Before the id of a model reached through Hermes itself, where the others name one of its OpenAI-style servers.
+HERMES_MODEL = "hermes:"
 NOT_CHAT = re.compile(r"kokoro|embed|parakeet|whisper|tts|stt|rerank|voxtral|speech|audio", re.I)
 FRONT_TOOLS = [{"type": "function", "function": {
     "name": "delegate",
@@ -3286,6 +3288,23 @@ def front_models() -> list[dict]:
             if isinstance(model, str) and not NOT_CHAT.search(model):
                 listed.append({"id": f"{name}/{model}", "name": model, "provider": name,
                                "local": is_local_address(str(entry["base_url"]))})
+    # Then the models the bots themselves run on, Hermes's default first. These go through Hermes's own
+    # way of asking a model, so anything it's signed in to works, not only servers that speak OpenAI's API.
+    # Without them a call on the Mac could only ever think on the Mac, which hearing and speaking there
+    # never required.
+    def same(provider: str, name: str) -> tuple:
+        # Hermes writes one provider two ways, "ollama-cloud" and "custom:ollama-cloud".
+        return provider.removeprefix("custom:"), name
+    offered = {same(model["provider"], model["name"]) for model in listed}
+    default = default_model()
+    own = ([default] if default else []) + configured_models()
+    for entry in own:
+        key = same(entry["provider"], entry["model"])
+        if key in offered or NOT_CHAT.search(entry["model"]) or not model_choice_ok(entry["model"], entry["provider"]):
+            continue
+        offered.add(key)
+        listed.append({"id": f"{HERMES_MODEL}{entry['provider']}/{entry['model']}", "name": entry["model"],
+                       "provider": entry["provider"], "local": False, "default": entry == default})
     return sorted(listed, key=lambda model: not model["local"])
 
 
@@ -3300,9 +3319,27 @@ def mac_calls_on() -> bool:
     return integration_on("macCalls")
 
 
+def speech_part(config: dict, section: str, fallback: str | None) -> dict:
+    """What Hermes hears or speaks with, for the app to name: the provider it's set to, and that provider's
+    model and voice. A provider the owner made up as a command keeps its settings under `providers`."""
+    chosen = config.get(section)
+    chosen = chosen if isinstance(chosen, dict) else {}
+    provider = chosen.get("provider") or fallback
+    made = chosen.get("providers") if isinstance(chosen.get("providers"), dict) else {}
+    own = made.get(provider) if isinstance(made.get(provider), dict) else chosen.get(provider)
+    own = own if isinstance(own, dict) else {}
+
+    def named(*keys):
+        value = next((own[key] for key in keys if isinstance(own.get(key), str) and own[key].strip()), None)
+        return clipped(value, 80) if value else None
+    return {"provider": clipped(str(provider), 80) if provider else None, "model": named("model", "model_id"),
+            "voice": named("voice", "voice_id")}
+
+
 def mac_call_status() -> dict:
     models = front_models()
-    stt = read_yaml(HOME / "config.yaml").get("stt")
+    config = read_yaml(HOME / "config.yaml")
+    stt = config.get("stt")
     stt = stt if isinstance(stt, dict) else {}
     reason = None
     if not mac_calls_on():
@@ -3313,7 +3350,9 @@ def mac_call_status() -> dict:
         reason = "Turn on Hermes's speech-to-text on your Mac first"
     elif not models:
         reason = "Hermes has no model this can talk with yet"
-    return {"available": reason is None, "reason": reason, "models": models, "model": front_default(models)}
+    # Hermes picks a way to hear by itself when none is set, and speaks with Edge's voice.
+    return {"available": reason is None, "reason": reason, "models": models, "model": front_default(models),
+            "hears": speech_part(config, "stt", None), "speaks": speech_part(config, "tts", "edge")}
 
 
 class VoiceWorker:
@@ -3331,6 +3370,15 @@ for line in sys.stdin:
         job = json.loads(line)
         if job.get("op") == "hear":
             answer = transcribe_audio(job["path"])
+        elif job.get("op") == "think":
+            from agent.auxiliary_client import call_llm
+            reply = call_llm(provider=job["provider"], model=job["model"], messages=job["messages"],
+                             tools=job.get("tools") or None, max_tokens=job.get("max_tokens"), timeout=job.get("timeout"))
+            message = reply.choices[0].message
+            calls = [{"id": call.id, "type": "function",
+                      "function": {"name": str(call.function.name or "").rsplit("__", 1)[-1], "arguments": call.function.arguments}}
+                     for call in (getattr(message, "tool_calls", None) or [])]
+            answer = {"success": True, "choices": [{"message": {"content": message.content or "", "tool_calls": calls}}]}
         else:
             answer = json.loads(text_to_speech_tool(text=job["text"], output_path=job["path"]))
     except Exception as error:
@@ -3366,7 +3414,10 @@ for line in sys.stdin:
         self.answers = queue.Queue()
         self.process = self.spawn([hermes_python(), "-c", self.SCRIPT, str(HOME / "hermes-agent")],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                  text=True, env=speech_env())
+                                  # A worker imports Hermes's own model code, and Hermes restarts whoever
+                                  # imports that to finish an install, under a Python that has none of its
+                                  # packages. The worker then died on its first request for a model.
+                                  text=True, env=speech_env() | {"HERMES_DISABLE_LAZY_INSTALLS": "1"})
         process, answers = self.process, self.answers
 
         def read():
@@ -3423,6 +3474,19 @@ class GarbledToolCall(VoiceError):
 def front_request(model_id: str, messages: list, tools: list | None, max_tokens: int = FRONT_TOKENS,
                   post=None) -> dict:
     """One answer from the call's model, through the provider Hermes already uses for it."""
+    if model_id.startswith(HERMES_MODEL):
+        provider, _, model = model_id[len(HERMES_MODEL):].partition("/")
+        if not model or not model_choice_ok(model, provider):
+            raise VoiceError("That model isn't set up in Hermes on your Mac")
+        job = {"op": "think", "provider": provider, "model": model, "messages": messages, "tools": tools,
+               "max_tokens": max_tokens, "timeout": FRONT_SECONDS}
+        if post:
+            return post(job)
+        answer = voice_worker.ask(job, timeout=FRONT_SECONDS + 5)
+        if not answer.get("success"):
+            print(f"voice: the call's model failed: {clipped(str(answer.get('error') or ''), 60)}", flush=True)
+            raise VoiceError("The call's model didn't answer. Check that Hermes is signed in to it on your Mac.")
+        return answer
     provider, _, model = model_id.partition("/")
     entry = front_providers().get(provider)
     if not entry or not model:
