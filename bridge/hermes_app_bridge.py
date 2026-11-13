@@ -2525,6 +2525,8 @@ TERMINAL_SESSION = re.compile(r"[A-Za-z0-9_-]{0,40}")
 TERMINAL_KINDS = ("local", "ssh", "mosh")
 # Multiplexers a connection can attach to. herdr shows images from its panes, which the app draws.
 TERMINAL_MUXES = ("", "tmux", "herdr")
+# Put ahead of the far end's own PATH, read there, so Homebrew's programs are found on a Mac or Linux box.
+REMOTE_PATH = "PATH=/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
 terminal_lock = threading.Lock()
 terminals: dict[str, "Terminal"] = {}
 
@@ -2607,9 +2609,12 @@ def terminal_command(host: dict) -> list[str]:
         return [pwd.getpwuid(os.getuid()).pw_shell or "/bin/zsh", "-l"]
     target = f"{host['user']}@{host['host']}" if host.get("user") else host["host"]
     if host["kind"] == "mosh":
-        return [terminal_program("mosh"), f"--ssh=ssh -p {int(host['port'])}", target] + (["--"] + attach if attach else [])
+        # ssh runs mosh-server without a login shell, so Homebrew's folders aren't on its PATH on a Mac.
+        # mosh-server passes the PATH on to what it starts, so herdr and tmux are found too.
+        return [terminal_program("mosh"), f"--ssh=ssh -p {int(host['port'])}", f"--server={REMOTE_PATH} mosh-server",
+                target] + (["--"] + attach if attach else [])
     return [terminal_program("ssh"), "-t", "-p", str(int(host["port"])), "-o", "ServerAliveInterval=30", target] \
-        + ([" ".join(attach)] if attach else [])
+        + ([f"{REMOTE_PATH} " + " ".join(attach)] if attach else [])
 
 
 def terminal_env() -> dict:
