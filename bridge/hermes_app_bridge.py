@@ -385,9 +385,39 @@ def devices_view(header: str | None) -> dict:
     token = (header or "").removeprefix("Bearer ").strip()
     mine = device_for(token) if token.startswith(DEVICE_PREFIX) else None
     state = load_access()
-    return {"only": state["only"], "devices": [
-        {"id": device, "name": entry.get("name"), "made": entry.get("made"), "seen": entry.get("seen"), "this": device == mine}
+    return {"only": state["only"], "terminalApproving": can_approve_terminal(mine), "devices": [
+        {"id": device, "name": entry.get("name"), "made": entry.get("made"), "seen": entry.get("seen"), "this": device == mine,
+         "terminal": entry.get("terminal") is True}
         for device, entry in sorted(state["devices"].items(), key=lambda item: -float(item[1].get("seen") or 0))]}
+
+
+def terminal_devices() -> set[str]:
+    return {device for device, entry in load_access()["devices"].items() if entry.get("terminal") is True}
+
+
+def can_approve_terminal(device: str | None) -> bool:
+    """A device the terminal is allowed on can allow it on others. Before any is, the first to ask allows
+    itself, so a newly paired device, from a bot's pairing code or a leaked key, never gets a shell on its own."""
+    if device is None:
+        return False
+    allowed = terminal_devices()
+    return device in allowed or not allowed
+
+
+def set_terminal_device(asking: str, device: str, on: bool) -> None:
+    with access_lock:
+        state = load_access()
+        allowed = {item for item, entry in state["devices"].items() if entry.get("terminal") is True}
+        if not (asking in allowed or (not allowed and device == asking)):
+            raise PermissionError("Allow the terminal from a device it's already allowed on.")
+        if device not in state["devices"]:
+            raise KeyError(device)
+        if on:
+            state["devices"][device]["terminal"] = True
+        else:
+            state["devices"][device].pop("terminal", None)
+        save_access(state)
+    print(f"access: terminal {'allowed' if on else 'taken away'} for {state['devices'][device].get('name')!r}", flush=True)
 
 
 def client_locked(client: str, now: float | None = None) -> bool:
@@ -2518,6 +2548,8 @@ TERMINAL_HOSTS = STATE / "terminal-hosts.json"
 TERMINAL_BUFFER = 1_000_000
 TERMINAL_LIMIT = 8
 TERMINAL_KEPT_SECONDS = 3600
+# A plain shell nobody has typed in for this long is closed. tmux and herdr sessions live on by themselves.
+TERMINAL_IDLE_SECONDS = 12 * 3600
 TERMINAL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 TERMINAL_HOST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 TERMINAL_USER = re.compile(r"[A-Za-z0-9._-]{0,64}")
@@ -2531,9 +2563,26 @@ terminal_lock = threading.Lock()
 terminals: dict[str, "Terminal"] = {}
 
 
-def terminal_allowed(header: str | None) -> bool:
+def terminal_device(header: str | None) -> str | None:
+    """The device asking, when it may use the terminal: its own key, the switch on, and allowed in Devices."""
     token = (header or "").removeprefix("Bearer ").strip()
-    return token.startswith(DEVICE_PREFIX) and authorized(header) and integration_on("terminal")
+    if not token.startswith(DEVICE_PREFIX) or not authorized(header) or not integration_on("terminal"):
+        return None
+    device = device_for(token)
+    return device if device in terminal_devices() else None
+
+
+def terminal_allowed(header: str | None) -> bool:
+    return terminal_device(header) is not None
+
+
+def terminal_refusal(header: str | None) -> str:
+    token = (header or "").removeprefix("Bearer ").strip()
+    if not integration_on("terminal"):
+        return "Turn on Terminal in Settings, under Integrations."
+    if token.startswith(DEVICE_PREFIX) and authorized(header):
+        return "Allow the terminal on this device in Settings, under Devices."
+    return "The terminal needs this device's own key."
 
 
 def terminal_hosts() -> list[dict]:
@@ -2640,6 +2689,7 @@ class Terminal:
         self.created = time.time()
         self.ended: float | None = None
         self.code: int | None = None
+        self.typed = time.time()
         self.buffer = bytearray()
         self.start = 0
         self.changed = threading.Condition()
@@ -2693,6 +2743,7 @@ class Terminal:
 
     def write(self, data: bytes) -> None:
         if self.ended is None:
+            self.typed = time.time()
             os.write(self.master, data)
 
     def resize(self, cols: int, rows: int) -> None:
@@ -2756,13 +2807,42 @@ def terminal_paste_image(terminal: "Terminal", image: bytes) -> None:
 
 def terminal_list() -> list[dict]:
     with terminal_lock:
+        for terminal in terminals.values():
+            idle = time.time() - terminal.typed > TERMINAL_IDLE_SECONDS
+            if terminal.ended is None and idle and not terminal.host.get("mux"):
+                print(f"terminal: closed {terminal.host.get('name')!r}, idle for 12 hours", flush=True)
+                terminal.close()
         for ident, terminal in list(terminals.items()):
             if terminal.ended and time.time() - terminal.ended > TERMINAL_KEPT_SECONDS:
                 terminals.pop(ident)
         return [terminal.view() for terminal in sorted(terminals.values(), key=lambda item: item.created)]
 
 
-def terminal_open(fields: dict) -> dict:
+def terminal_reaper() -> None:
+    while True:
+        time.sleep(600)
+        try:
+            terminal_list()
+        except Exception as error:  # a reaper that died would leave idle shells open for good
+            print(f"terminal: reaper {type(error).__name__}: {error}", flush=True)
+
+
+terminal_reaper_started = False
+
+
+def announce_terminal(device: str, host: dict) -> None:
+    """Every device hears that a session opened, and from where, so one opened by someone else stands out."""
+    name = load_access()["devices"].get(device, {}).get("name") or "A device"
+    profile = "default" if "default" in homes() else next(iter(homes()), None)
+    if profile is None or not (use_relay() or APNS_CONFIG.exists()):
+        return
+    try:
+        push(profile, f"{name} opened {host.get('name') or 'a session'}.", {"terminal": True}, title="Terminal")
+    except Exception as error:  # the session opens whether or not the notice goes out
+        print(f"terminal: notice failed: {type(error).__name__}", flush=True)
+
+
+def terminal_open(fields: dict, device: str | None = None) -> dict:
     host = next((item for item in terminal_hosts() if item.get("id") == fields.get("host")), None)
     if host is None:
         raise ValueError("That connection isn't saved on the Mac.")
@@ -2772,7 +2852,14 @@ def terminal_open(fields: dict) -> dict:
             raise ValueError(f"{TERMINAL_LIMIT} sessions are open. Close one first.")
         terminal = Terminal(host, int(fields.get("cols") or 80), int(fields.get("rows") or 24))
         terminals[terminal.id] = terminal
-    print(f"terminal: opened {host['kind']} {host['name']}", flush=True)
+        global terminal_reaper_started
+        if not terminal_reaper_started:
+            terminal_reaper_started = True
+            threading.Thread(target=terminal_reaper, daemon=True).start()
+    who = load_access()["devices"].get(device or "", {}).get("name") or "a device"
+    print(f"terminal: {who!r} opened {host['kind']} {host['name']!r}", flush=True)
+    if device:
+        threading.Thread(target=announce_terminal, args=(device, host), daemon=True).start()
     return terminal.view()
 
 
@@ -4315,7 +4402,8 @@ def tidings_hours(value) -> list[int] | None:
 def tidings_state() -> dict:
     saved = read_json(TIDINGS_STATE) if TIDINGS_STATE.exists() else {}
     model = saved.get("model") if isinstance(saved.get("model"), dict) else None
-    return {"on": saved.get("on") is True, "web": saved.get("web") is True,
+    # On unless switched off. Before any bot or source is chosen a run reads nothing and asks nothing.
+    return {"on": saved.get("on") is not False, "web": saved.get("web") is True,
             "calendar": saved.get("calendar") is True, "reminders": saved.get("reminders") is True,
             "allowed": [name for name in saved.get("allowed") or [] if isinstance(name, str)],
             "model": model, "cards": [card for card in saved.get("cards") or [] if isinstance(card, dict)],
@@ -5498,11 +5586,11 @@ def small_avatar(home: pathlib.Path) -> str | None:
 
 
 def push(profile: str, reply: str, data: dict | None = None, category: str | None = None,
-         routine: str | None = None) -> None:
+         routine: str | None = None, title: str | None = None) -> None:
     """`category` picks the buttons the app shows: Allow and Deny, a question's choices, or Reply."""
     relay = use_relay()
     config = None if relay else json.loads(APNS_CONFIG.read_text())
-    title = bot_info(profile, homes()[profile])["title"] or profile.replace("-", " ").title()
+    title = title or bot_info(profile, homes()[profile])["title"] or profile.replace("-", " ").title()
     payload = {"aps": {"alert": {"title": title, "body": plain_text(reply)}, "sound": "default", "badge": badge_count(),
                        "thread-id": profile, "mutable-content": 1}, "profile": profile, **(data or {})}
     if category:
@@ -5778,7 +5866,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, {"hits": search_messages((query.get("q") or [""])[0])})
         if url.path.startswith("/terminal/"):
             if not terminal_allowed(header):
-                return self.json(403, {"error": {"message": "Turn on Terminal in Settings, under Integrations."}})
+                return self.json(403, {"error": {"message": terminal_refusal(header)}})
             if url.path == "/terminal/hosts":
                 return self.json(200, {"hosts": terminal_hosts()})
             if url.path == "/terminal/sessions":
@@ -6075,7 +6163,7 @@ class Handler(BaseHTTPRequestHandler):
     def terminal_action(self, path: str, header) -> None:
         data = self.body(TERMINAL_IMAGE_LIMIT * 2 if path == "/terminal/paste-image" else 262_144)
         if not terminal_allowed(header):
-            return self.json(403, {"error": {"message": "Turn on Terminal in Settings, under Integrations."}})
+            return self.json(403, {"error": {"message": terminal_refusal(header)}})
         try:
             fields = json.loads(data or b"{}")
             if not isinstance(fields, dict):
@@ -6086,7 +6174,7 @@ class Handler(BaseHTTPRequestHandler):
                 delete_terminal_host(str(fields.get("id") or ""))
                 return self.json(200, {})
             if path == "/terminal/open":
-                return self.json(200, terminal_open(fields))
+                return self.json(200, terminal_open(fields, terminal_device(header)))
             terminal = terminals.get(str(fields.get("id") or ""))
             if terminal is None:
                 return self.json(404, {"error": {"message": "That session has closed."}})
@@ -6255,6 +6343,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.hermes_proxy()
         if path.startswith("/terminal/"):
             return self.terminal_action(path, header)
+        if path == "/access/terminal":
+            data = self.body(4096)
+            token = (header or "").removeprefix("Bearer ").strip()
+            asking = device_for(token) if token.startswith(DEVICE_PREFIX) and authorized(header) else None
+            if asking is None:
+                return self.json(401, {"error": {"message": "This needs a device's own key."}})
+            try:
+                fields = json.loads(data or b"{}")
+                set_terminal_device(asking, str(fields.get("id") or ""), fields.get("on") is True)
+            except PermissionError as error:
+                return self.json(403, {"error": {"message": str(error)}})
+            except (KeyError, ValueError, AttributeError):
+                return self.json(404, {"error": {"message": "That device isn't in the list."}})
+            return self.json(200, devices_view(header))
         if path in ("/access/enroll", "/access/revoke", "/access/settings"):
             data = self.body(4096)
             if not authorized(header):
