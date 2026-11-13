@@ -3506,13 +3506,21 @@ for line in sys.stdin:
 voice_worker = VoiceWorker()
 
 
+# A speech-to-text command that hears no words writes nothing, and Hermes reports that as a failure. On a
+# call that failure was a cough or a breath ending the turn in "Sorry, I missed that", in the device's own
+# voice, and in dictation it stopped the dictation. A command that's really broken fails another way.
+NOTHING_HEARD = re.compile(r"wrote no output file|produced no stdout|no speech|empty transcri", re.I)
+
+
 def hear_on_mac(audio: bytes, worker: VoiceWorker | None = None) -> str:
-    """Hermes's own speech-to-text, with whatever the owner set up for it."""
+    """Hermes's own speech-to-text, with whatever the owner set up for it. Empty when it ran and heard no words."""
     with tempfile.TemporaryDirectory(prefix="hermit-hear.") as folder:
         path = pathlib.Path(folder) / "heard.wav"
         path.write_bytes(audio)
         answer = (worker or voice_worker).ask({"op": "hear", "path": str(path)})
     if not answer.get("success"):
+        if NOTHING_HEARD.search(str(answer.get("error") or "")):
+            return ""
         print(f"local call: hearing failed: {clipped(str(answer.get('error') or ''), 160)}", flush=True)
         raise VoiceError("Your Mac couldn't make out that audio. Check Hermes's speech-to-text on your Mac.")
     return " ".join(str(answer.get("transcript") or "").split())
@@ -3607,7 +3615,9 @@ def dictate(audio: bytes, hear=None) -> dict:
         raise VoiceError(f"Hermes's speech-to-text on your {host_word()} didn't work. Check it's set up there.")
     finally:
         stop_voice_when_idle()
-    last_dictation["worked"] = True
+    # A stretch with no words in it says nothing either way about whether the hearing works.
+    if text:
+        last_dictation["worked"] = True
     return {"text": text, "seconds": round(time.time() - started, 2)}
 
 
@@ -5344,6 +5354,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = hide_silence_rows(raw)
             self.send_response(200)
             self.send_header("Content-Type", answer.getheader("Content-Type") or "application/json")
+            if answer.getheader("Cache-Control"):
+                self.send_header("Cache-Control", answer.getheader("Cache-Control"))
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             try:
