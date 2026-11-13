@@ -27,8 +27,12 @@ import shutil
 import socket
 import ssl
 import sqlite3
+import signal
 import subprocess
 import tempfile
+import termios
+import pwd
+import struct
 import sys
 import threading
 import time
@@ -122,7 +126,7 @@ INTEGRATIONS = STATE / "integrations.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
-KEPT_INTEGRATIONS = ("recaps", "macCalls", "macDictation")
+KEPT_INTEGRATIONS = ("recaps", "macCalls", "macDictation", "terminal")
 # Switches that are on until someone turns them off.
 ON_UNLESS_OFF = ("macCalls", "macDictation")
 # Works for anyone. Rules for your own workspaces go in links.json.
@@ -2463,7 +2467,9 @@ def fts_query(text: str) -> str | None:
 
 
 def search_messages(text: str) -> list[dict]:
-    """Your Bot Chats with every bot, newest first, using Hermes' own full-text index."""
+    """Your chats with every bot, newest first, using Hermes' own full-text index: the Bot Chat and every
+    other session except routine runs. Each hit says which session it's in, and `newer` counts the messages
+    after it there, so the app can fetch the page around an old message instead of searching for it."""
     query = fts_query(text)
     if not query:
         return []
@@ -2474,21 +2480,313 @@ def search_messages(text: str) -> list[dict]:
             continue
         try:
             with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
+                columns = {row[1] for row in connection.execute("pragma table_info(messages)")}
+                # Hidden turns, notifications and the like never show in a chat, so they can't be opened.
+                plain = " and m.display_kind is null" if "display_kind" in columns else ""
+                # The app pages through older history with compacted rows included, and rewound rows left out.
+                if {"active", "compacted"} <= columns:
+                    shown = " and (coalesce(n.active, 1) = 1 or coalesce(n.compacted, 0) = 1)"
+                elif "active" in columns:
+                    shown = " and coalesce(n.active, 1) = 1"
+                else:
+                    shown = ""
                 rows = connection.execute(
                     f"""select m.id, m.session_id, m.role, m.timestamp,
-                               snippet(messages_fts, 0, '{HIT_OPEN}', '{HIT_CLOSE}', '…', 14)
+                               snippet(messages_fts, 0, '{HIT_OPEN}', '{HIT_CLOSE}', '…', 14),
+                               s.title, s.source,
+                               (select count(*) from messages n where n.session_id = m.session_id and n.id > m.id{shown})
                         from messages_fts join messages m on m.id = messages_fts.rowid
                         join sessions s on s.id = m.session_id
-                        where messages_fts match ? and s.title = 'Bot Chat' and m.role in ('user', 'assistant')
-                          and m.tool_calls is null and m.content not like '[Cronjob%'
+                        where messages_fts match ? and coalesce(s.source, '') != 'cron'
+                          and m.role in ('user', 'assistant')
+                          and m.tool_calls is null and m.content not like '[Cronjob%'{plain}
                         order by m.timestamp desc limit ?""", (query, SEARCH_LIMIT)).fetchall()
         except sqlite3.Error:
             continue
         hits += [{"profile": profile, "session": session, "id": str(row_id), "role": role, "at": stamp,
-                  "snippet": tidy_snippet(snippet)}
-                 for row_id, session, role, stamp, snippet in rows]
+                  "snippet": tidy_snippet(snippet), "title": title, "source": source,
+                  "bot_chat": title == "Bot Chat", "newer": newer}
+                 for row_id, session, role, stamp, snippet, title, source, newer in rows]
     hits.sort(key=lambda hit: -hit["at"])
     return hits[:SEARCH_LIMIT]
+
+
+# Terminal: shells and ssh or mosh connections run here, on the Mac, so keys stay in ~/.ssh and a session
+# keeps running while the phone is away. The phone reads a session's output from an offset, so it picks up
+# exactly where it left off. Only a device key opens these, and only while the Terminal switch is on.
+TERMINAL_HOSTS = STATE / "terminal-hosts.json"
+TERMINAL_BUFFER = 1_000_000
+TERMINAL_LIMIT = 8
+TERMINAL_KEPT_SECONDS = 3600
+TERMINAL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+TERMINAL_HOST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+TERMINAL_USER = re.compile(r"[A-Za-z0-9._-]{0,64}")
+TERMINAL_SESSION = re.compile(r"[A-Za-z0-9_-]{0,40}")
+TERMINAL_KINDS = ("local", "ssh", "mosh")
+# Multiplexers a connection can attach to. herdr shows images from its panes, which the app draws.
+TERMINAL_MUXES = ("", "tmux", "herdr")
+terminal_lock = threading.Lock()
+terminals: dict[str, "Terminal"] = {}
+
+
+def terminal_allowed(header: str | None) -> bool:
+    token = (header or "").removeprefix("Bearer ").strip()
+    return token.startswith(DEVICE_PREFIX) and authorized(header) and integration_on("terminal")
+
+
+def terminal_hosts() -> list[dict]:
+    hosts = read_json(TERMINAL_HOSTS).get("hosts") if TERMINAL_HOSTS.exists() else None
+    return hosts if isinstance(hosts, list) else []
+
+
+def clean_terminal_host(fields: dict) -> dict:
+    """A connection as saved: names and numbers only, never a password or key."""
+    kind = fields.get("kind") if fields.get("kind") in TERMINAL_KINDS else "ssh"
+    name = " ".join(str(fields.get("name") or "").split())[:60]
+    host, user = str(fields.get("host") or "").strip(), str(fields.get("user") or "").strip()
+    mux = str(fields.get("mux") or "")
+    session = str(fields.get("session") or "").strip()
+    try:
+        port = int(fields.get("port") or 22)
+    except (TypeError, ValueError):
+        port = 0
+    if kind != "local" and not TERMINAL_HOST_NAME.fullmatch(host):
+        raise ValueError("That address doesn't look right.")
+    if not TERMINAL_USER.fullmatch(user) or not 0 < port < 65536:
+        raise ValueError("Check the user and port.")
+    if mux not in TERMINAL_MUXES:
+        raise ValueError("Choose tmux, herdr or neither.")
+    if not TERMINAL_SESSION.fullmatch(session):
+        raise ValueError("A session name can use letters, numbers, - and _.")
+    if mux == "tmux" and not session:
+        session = "main"
+    ident = str(fields.get("id") or "")
+    return {"id": ident if re.fullmatch(r"[0-9a-f]{12}", ident) else secrets.token_hex(6),
+            "name": name or (host if kind != "local" else "This Mac"), "kind": kind,
+            "host": host if kind != "local" else "", "user": user if kind != "local" else "",
+            "port": port, "mux": mux, "session": session if mux else ""}
+
+
+def save_terminal_host(fields: dict) -> dict:
+    host = clean_terminal_host(fields)
+    with terminal_lock:
+        hosts = [item for item in terminal_hosts() if item.get("id") != host["id"]]
+        hosts.append(host)
+        STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(TERMINAL_HOSTS, {"hosts": hosts})
+    return host
+
+
+def delete_terminal_host(ident: str) -> None:
+    with terminal_lock:
+        write_json(TERMINAL_HOSTS, {"hosts": [item for item in terminal_hosts() if item.get("id") != ident]})
+
+
+def terminal_program(name: str) -> str:
+    found = shutil.which(name, path=TERMINAL_PATH)
+    if not found:
+        raise ValueError(f"{name} isn't installed on the Mac. Install it with: brew install {name}")
+    return found
+
+
+def terminal_attach(host: dict) -> list[str]:
+    """The multiplexer to attach to, or start: tmux by name, herdr by session, or its default one."""
+    mux, session = host.get("mux") or "", host.get("session") or ""
+    if mux == "tmux":
+        return ["tmux", "new", "-A", "-s", session or "main"]
+    if mux == "herdr":
+        return ["herdr"] + (["--session", session] if session else [])
+    return []
+
+
+def terminal_command(host: dict) -> list[str]:
+    attach = terminal_attach(host)
+    if host["kind"] == "local":
+        if attach:
+            return [terminal_program(attach[0])] + attach[1:]
+        return [pwd.getpwuid(os.getuid()).pw_shell or "/bin/zsh", "-l"]
+    target = f"{host['user']}@{host['host']}" if host.get("user") else host["host"]
+    if host["kind"] == "mosh":
+        return [terminal_program("mosh"), f"--ssh=ssh -p {int(host['port'])}", target] + (["--"] + attach if attach else [])
+    return [terminal_program("ssh"), "-t", "-p", str(int(host["port"])), "-o", "ServerAliveInterval=30", target] \
+        + ([" ".join(attach)] if attach else [])
+
+
+def terminal_env() -> dict:
+    """Only what a shell needs. The bridge's own environment holds keys that don't belong in it."""
+    account = pwd.getpwuid(os.getuid())
+    env = {"HOME": account.pw_dir, "USER": account.pw_name, "LOGNAME": account.pw_name, "SHELL": account.pw_shell,
+           "PATH": TERMINAL_PATH, "TERM": "xterm-256color", "COLORTERM": "truecolor", "LANG": "en_US.UTF-8",
+           "LC_CTYPE": "en_US.UTF-8"}
+    if agent := os.getenv("SSH_AUTH_SOCK"):
+        env["SSH_AUTH_SOCK"] = agent
+    return env
+
+
+def take_terminal() -> None:
+    """In the child, after it's a session of its own: the terminal becomes its controlling one."""
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+class Terminal:
+    def __init__(self, host: dict, cols: int, rows: int):
+        self.id = secrets.token_hex(6)
+        self.host = host
+        self.created = time.time()
+        self.ended: float | None = None
+        self.code: int | None = None
+        self.buffer = bytearray()
+        self.start = 0
+        self.changed = threading.Condition()
+        command = terminal_command(host)
+        master, child = os.openpty()
+        self.master = master
+        self.resize(cols, rows)
+        try:
+            self.process = subprocess.Popen(command, stdin=child, stdout=child, stderr=child, env=terminal_env(),
+                                            cwd=str(pathlib.Path.home()), start_new_session=True,
+                                            preexec_fn=take_terminal, close_fds=True)
+        except OSError:
+            os.close(master)
+            raise
+        finally:
+            os.close(child)
+        threading.Thread(target=self.pump, daemon=True).start()
+
+    @property
+    def end(self) -> int:
+        return self.start + len(self.buffer)
+
+    def pump(self) -> None:
+        while True:
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            with self.changed:
+                self.buffer += chunk
+                if len(self.buffer) > TERMINAL_BUFFER:
+                    cut = len(self.buffer) - TERMINAL_BUFFER
+                    del self.buffer[:cut]
+                    self.start += cut
+                self.changed.notify_all()
+        code = self.process.wait()
+        with self.changed:
+            self.code, self.ended = code, time.time()
+            self.changed.notify_all()
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+    def since(self, offset: int) -> tuple[int, bytes]:
+        with self.changed:
+            offset = min(max(offset, self.start), self.end)
+            return offset, bytes(self.buffer[offset - self.start:])
+
+    def write(self, data: bytes) -> None:
+        if self.ended is None:
+            os.write(self.master, data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        cols, rows = max(10, min(int(cols), 500)), max(4, min(int(rows), 300))
+        if self.ended is None:
+            fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def close(self) -> None:
+        if self.ended is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGHUP)
+            except OSError:
+                pass
+
+    def view(self) -> dict:
+        return {"id": self.id, "host": self.host, "created": self.created, "ended": self.ended, "code": self.code,
+                "end": self.end}
+
+
+def herdr_agents(host: dict) -> dict | None:
+    """How a herdr session's agents stand, counted by state, for a connection to herdr on this Mac."""
+    if host.get("kind") != "local" or host.get("mux") != "herdr":
+        return None
+    command = [terminal_program("herdr")] + (["--session", host["session"]] if host.get("session") else []) + ["api", "snapshot"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5, env=terminal_env())
+        agents = json.loads(result.stdout)["result"]["snapshot"]["agents"]
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        return None
+    counts: dict[str, int] = {}
+    for agent in agents if isinstance(agents, list) else []:
+        state = str(agent.get("agent_status") or "")
+        if state:
+            counts[state] = counts.get(state, 0) + 1
+    return {"agents": len(agents) if isinstance(agents, list) else 0, "counts": counts}
+
+
+TERMINAL_IMAGE_LIMIT = 12_000_000
+
+
+def terminal_paste_image(terminal: "Terminal", image: bytes) -> None:
+    """Puts a PNG from the phone on the Mac's clipboard and presses Ctrl+V in the session, as pasting at the Mac
+    would. Claude Code reads an image from the clipboard on Ctrl+V, and herdr does too, carrying it to a remote
+    machine for `herdr --remote`. It replaces what was on the clipboard."""
+    if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Send the picture as a PNG.")
+    if sys.platform != "darwin":
+        raise ValueError("Pasting a picture needs the Mac's clipboard.")
+    handle, staged = tempfile.mkstemp(prefix="hermit-paste-", suffix=".png")
+    try:
+        with os.fdopen(handle, "wb") as file:
+            file.write(image)
+        script = f'set the clipboard to (read (POSIX file "{staged}") as «class PNGf»)'
+        result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            raise ValueError("The Mac's clipboard didn't take the picture.")
+    finally:
+        pathlib.Path(staged).unlink(missing_ok=True)
+    terminal.write(b"\x16")
+
+
+def terminal_list() -> list[dict]:
+    with terminal_lock:
+        for ident, terminal in list(terminals.items()):
+            if terminal.ended and time.time() - terminal.ended > TERMINAL_KEPT_SECONDS:
+                terminals.pop(ident)
+        return [terminal.view() for terminal in sorted(terminals.values(), key=lambda item: item.created)]
+
+
+def terminal_open(fields: dict) -> dict:
+    host = next((item for item in terminal_hosts() if item.get("id") == fields.get("host")), None)
+    if host is None:
+        raise ValueError("That connection isn't saved on the Mac.")
+    terminal_list()
+    with terminal_lock:
+        if sum(1 for item in terminals.values() if item.ended is None) >= TERMINAL_LIMIT:
+            raise ValueError(f"{TERMINAL_LIMIT} sessions are open. Close one first.")
+        terminal = Terminal(host, int(fields.get("cols") or 80), int(fields.get("rows") or 24))
+        terminals[terminal.id] = terminal
+    print(f"terminal: opened {host['kind']} {host['name']}", flush=True)
+    return terminal.view()
+
+
+def archived_sessions(profile: str) -> list[dict]:
+    """A profile's archived sessions, newest first, except routine runs. Hermes's own API sets the flag but
+    never lists them, so the app reads them here to offer Unarchive."""
+    database = homes()[profile] / "state.db"
+    if not database.exists():
+        return []
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
+            rows = connection.execute(
+                """select id, title, source, coalesce(last_activity_at, started_at), message_count
+                   from sessions where archived = 1 and coalesce(source, '') != 'cron'
+                   order by coalesce(last_activity_at, started_at) desc limit 100""").fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"id": row_id, "title": title, "source": source, "last_active": active, "message_count": count}
+            for row_id, title, source, active, count in rows]
 
 
 JOB_HOURS = 24
@@ -5473,6 +5771,32 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, {"hits": search_messages((query.get("q") or [""])[0])})
+        if url.path.startswith("/terminal/"):
+            if not terminal_allowed(header):
+                return self.json(403, {"error": {"message": "Turn on Terminal in Settings, under Integrations."}})
+            if url.path == "/terminal/hosts":
+                return self.json(200, {"hosts": terminal_hosts()})
+            if url.path == "/terminal/sessions":
+                return self.json(200, {"sessions": terminal_list()})
+            if url.path == "/terminal/herdr":
+                terminal = terminals.get((query.get("id") or [""])[0])
+                status = herdr_agents(terminal.host) if terminal else None
+                return self.json(200, status or {"agents": 0, "counts": {}})
+            if url.path == "/terminal/stream":
+                terminal = terminals.get((query.get("id") or [""])[0])
+                if terminal is None:
+                    return self.json(404, {"error": {"message": "That session has closed."}})
+                try:
+                    offset = int((query.get("from") or ["0"])[0])
+                except ValueError:
+                    offset = 0
+                return self.terminal_stream(terminal, offset)
+            return self.json(404, {"error": "not found"})
+        if url.path == "/sessions/archived":
+            profile = (query.get("profile") or [""])[0]
+            if profile not in homes() or not authorized(header, profile):
+                return self.json(401, {"error": "unauthorized"})
+            return self.json(200, {"sessions": archived_sessions(profile)})
         if url.path in ("/connectors", "/connectors/poll", "/connectors/catalog"):
             profile = (query.get("profile") or [""])[0]
             if profile not in homes() or not authorized(header, profile):
@@ -5652,6 +5976,36 @@ class Handler(BaseHTTPRequestHandler):
             return self.stream(session_id)
         self.json(404, {"error": "not found"})
 
+    def terminal_stream(self, terminal: "Terminal", offset: int) -> None:
+        """Output from `offset` on, as it comes. Each event says where its bytes start, so a phone that
+        reconnects asks for exactly what it missed."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self.wfile.write(b": open\n\n")
+            self.wfile.flush()
+            while True:
+                at, data = terminal.since(offset)
+                if data:
+                    event = {"at": at, "data": base64.b64encode(data).decode()}
+                    self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
+                    offset = at + len(data)
+                elif terminal.ended is not None:
+                    self.wfile.write(b"data: " + json.dumps({"ended": True, "code": terminal.code}).encode() + b"\n\n")
+                    self.wfile.flush()
+                    return
+                else:
+                    with terminal.changed:
+                        if terminal.end == offset and terminal.ended is None and not terminal.changed.wait(timeout=15):
+                            self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def stream(self, session_id: str) -> None:
         listener: queue.Queue = queue.Queue()
         with lock:
@@ -5712,6 +6066,43 @@ class Handler(BaseHTTPRequestHandler):
             self.json(200, {})
         except ValueError:
             self.json(400, {"error": {"message": "That request couldn't be read"}})
+
+    def terminal_action(self, path: str, header) -> None:
+        data = self.body(TERMINAL_IMAGE_LIMIT * 2 if path == "/terminal/paste-image" else 262_144)
+        if not terminal_allowed(header):
+            return self.json(403, {"error": {"message": "Turn on Terminal in Settings, under Integrations."}})
+        try:
+            fields = json.loads(data or b"{}")
+            if not isinstance(fields, dict):
+                raise ValueError("That request couldn't be read.")
+            if path == "/terminal/hosts":
+                return self.json(200, save_terminal_host(fields))
+            if path == "/terminal/hosts/delete":
+                delete_terminal_host(str(fields.get("id") or ""))
+                return self.json(200, {})
+            if path == "/terminal/open":
+                return self.json(200, terminal_open(fields))
+            terminal = terminals.get(str(fields.get("id") or ""))
+            if terminal is None:
+                return self.json(404, {"error": {"message": "That session has closed."}})
+            if path == "/terminal/input":
+                terminal.write(base64.b64decode(str(fields.get("data") or "")))
+            elif path == "/terminal/resize":
+                terminal.resize(int(fields.get("cols") or 80), int(fields.get("rows") or 24))
+            elif path == "/terminal/close":
+                terminal.close()
+            elif path == "/terminal/paste-image":
+                image = base64.b64decode(str(fields.get("data") or ""))
+                if len(image) > TERMINAL_IMAGE_LIMIT:
+                    raise ValueError("That picture is too large to paste.")
+                terminal_paste_image(terminal, image)
+            else:
+                return self.json(404, {"error": "not found"})
+            return self.json(200, {})
+        except (ValueError, TypeError) as error:
+            self.json(400, {"error": {"message": str(error) or "That request couldn't be read."}})
+        except OSError:
+            self.json(409, {"error": {"message": "That session has closed."}})
 
     def connector_action(self, path: str, header) -> None:
         fields = json.loads(self.body() or b"{}")
@@ -5857,6 +6248,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, claimed)
         if urlparse(self.path).path.startswith("/hermes/"):
             return self.hermes_proxy()
+        if path.startswith("/terminal/"):
+            return self.terminal_action(path, header)
         if path in ("/access/enroll", "/access/revoke", "/access/settings"):
             data = self.body(4096)
             if not authorized(header):
