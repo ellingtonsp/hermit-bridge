@@ -144,6 +144,26 @@ FACE_KINDS = {"round": 0.11, "organic": 0.35, "boxy": 0.54, "capsule": 0.65, "nu
               "cloud": 0.825, "droplet": 0.8875, "hexagon": 0.9325, "sun": 0.965, "triangle": 0.99}
 SILENT_REPLIES = {"[SILENT]", "NO_REPLY", "NO_REPLY.", "[NO_REPLY]"}
 
+
+def hide_silence_rows(body: bytes) -> bytes:
+    """The gateway keeps a bare silence token in the stored chat on purpose (turn alternation) and only
+    suppresses delivery. Mark those rows hidden, the same way the dashboard marks scaffold rows, so the
+    app's chat list skips them. Only assistant rows that are exactly a token; anything unparsable passes through."""
+    try:
+        page = json.loads(body)
+        rows = page.get("data") if isinstance(page, dict) else None
+        if not isinstance(rows, list):
+            return body
+        changed = False
+        for row in rows:
+            if (isinstance(row, dict) and row.get("role") == "assistant" and isinstance(row.get("content"), str)
+                    and row["content"].strip() in SILENT_REPLIES and not row.get("tool_calls")):
+                row["display_kind"] = "hidden"
+                changed = True
+        return json.dumps(page).encode() if changed else body
+    except (ValueError, TypeError, AttributeError):
+        return body
+
 subscribers: dict[str, list[queue.Queue]] = {}
 watchers: dict[str, "Watcher"] = {}
 lock = threading.Lock()
@@ -5311,6 +5331,25 @@ class Handler(BaseHTTPRequestHandler):
             connection.close()
             print(f"hermes proxy: {type(error).__name__}", flush=True)
             self.json(502, {"error": {"message": "Hermes isn't answering."}})
+            return True
+        if (self.command == "GET" and answer.status == 200
+                and re.fullmatch(r"/api/sessions/[^/]+/messages", rest)):
+            try:
+                raw = answer.read()
+            except (OSError, http.client.HTTPException):
+                connection.close()
+                self.json(502, {"error": {"message": "Hermes isn't answering."}})
+                return True
+            connection.close()
+            raw = hide_silence_rows(raw)
+            self.send_response(200)
+            self.send_header("Content-Type", answer.getheader("Content-Type") or "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self.close_connection = True
             return True
         try:
             self.send_response(answer.status)

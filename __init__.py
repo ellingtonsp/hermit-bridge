@@ -7,6 +7,7 @@ back to the agent as an ordinary user turn, and only then does the agent act.
 import json
 from pathlib import Path
 import re
+import sqlite3
 from datetime import datetime
 import socket
 
@@ -42,7 +43,10 @@ PHONE_GUIDE = (
     "and no actions. The user edits it and sends it themselves from their iPhone, and you'll get a message "
     "saying it went out. Never send a text yourself when you've shown one this way. When you read texts for "
     "the user, show the relevant part with app 'Messages' and a thread object, up to the last 12 messages "
-    "with handles for replying, instead of pasting them into your reply."
+    "with handles for replying, instead of pasting them into your reply. Messages on the Mac gives you phone "
+    "numbers and emails, not names: look them up with hermit_contacts before you show or describe a "
+    "conversation, put the person's name in thread.with, and use it to find someone's number before you draft "
+    "a text to them by name."
 )
 
 # A call adds a second marker. The live voice agent speaks for the bot, so it needs one short line.
@@ -244,7 +248,7 @@ def _thread(raw):
             except ValueError:
                 pass  # a time is a nicety, so a bad one is dropped rather than refusing the card
             lines.append(clean)
-    who = _text(raw.get("with"))
+    who = _named(_text(raw.get("with")))
     if not who or not lines:
         raise ValueError("a thread needs with and at least one message")
     thread = {"with": who, "messages": lines}
@@ -334,6 +338,156 @@ def build_card(args):
     if actions:
         card["actions"] = actions
     return card
+
+
+# ---- Names for the people in Messages. imsg looks them up through macOS's Contacts permission, which a
+# background service such as Hermes's gateway can't be given, so every one-to-one chat reached a bot as a bare
+# number (15 of 16, measured). The Contacts database itself is readable wherever Messages is, so it's read here,
+# read-only, and only for what's asked: the handles a bot passes in, or one name. Never the whole book, and
+# never more than a name and its numbers and emails. It answers only while Read messages is on in the app.
+
+CONTACTS_TOOL = "hermit_contacts"
+ADDRESS_BOOK = Path.home() / "Library" / "Application Support" / "AddressBook"
+MAX_LOOKUPS = 30
+MAX_MATCHES = 5
+RAW_HANDLE = re.compile(r"\+?[\d\s().-]{7,}|[^@\s,]+@[^@\s,]+")
+
+CONTACTS_SCHEMA = {
+    "name": CONTACTS_TOOL,
+    "description": (
+        "Look people up in the user's Contacts on their Mac, for reading and writing texts. Give `handles`, the "
+        "phone numbers or emails from Messages, to learn whose they are. Give `name` to find someone's numbers "
+        "and emails before you draft a text to them. Use it whenever Messages gives you a number instead of a "
+        "name, and say the name, not the number, to the user. It only answers what you ask: it can't list "
+        "everyone. If a name matches several people, ask the user which one."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "handles": {"type": "array", "items": {"type": "string"},
+                        "description": f"Phone numbers or emails to name, at most {MAX_LOOKUPS}."},
+            "name": {"type": "string", "description": "A person to find, such as 'Lauren' or 'Sam Lee'."},
+        },
+    },
+}
+
+
+def _phone_key(handle):
+    """A number as it's compared: its last ten digits, so +1 (555) 010-0123 and 5550100123 are the same."""
+    digits = re.sub(r"\D", "", str(handle))
+    return digits[-10:] if len(digits) >= 7 else ""
+
+
+def _people(root=None):
+    """Everyone in Contacts, as {name, phones, emails}, from every account's database. Empty where there's no
+    Contacts database, such as on Linux, or where it can't be read."""
+    root = Path(root) if root else ADDRESS_BOOK
+    try:
+        books = [root / "AddressBook-v22.abcddb", *sorted(root.glob("Sources/*/AddressBook-v22.abcddb"))]
+    except OSError:
+        return []
+    people = {}
+    for book in books:
+        try:
+            if not book.is_file():
+                continue
+            with sqlite3.connect(f"{book.as_uri()}?mode=ro", uri=True, timeout=2) as database:
+                names = {}
+                for key, first, last, company, nickname in database.execute(
+                        "select Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZNICKNAME from ZABCDRECORD"):
+                    name = " ".join(part.strip() for part in (first, last) if part and part.strip())
+                    if (name := name or (nickname or "").strip() or (company or "").strip()):
+                        names[key] = name
+                phones = list(database.execute("select ZOWNER, ZFULLNUMBER from ZABCDPHONENUMBER"))
+                emails = list(database.execute("select ZOWNER, ZADDRESS from ZABCDEMAILADDRESS"))
+        except (sqlite3.Error, OSError):
+            continue
+        for owner, number in phones:
+            if owner in names and number and _phone_key(number):
+                people.setdefault(names[owner], {"phones": [], "emails": []})["phones"].append(str(number).strip())
+        for owner, address in emails:
+            if owner in names and address and "@" in address:
+                people.setdefault(names[owner], {"phones": [], "emails": []})["emails"].append(str(address).strip().lower())
+        for name in names.values():
+            people.setdefault(name, {"phones": [], "emails": []})
+    return [{"name": name, "phones": list(dict.fromkeys(found["phones"])), "emails": list(dict.fromkeys(found["emails"]))}
+            for name, found in people.items()]
+
+
+def contact_names(handles, people):
+    """{handle: name} for the handles that belong to someone in Contacts."""
+    by_phone, by_email = {}, {}
+    for person in people:
+        for number in person["phones"]:
+            by_phone.setdefault(_phone_key(number), person["name"])
+        for address in person["emails"]:
+            by_email.setdefault(address, person["name"])
+    found = {}
+    for handle in handles:
+        text = str(handle).strip()
+        name = by_email.get(text.lower()) if "@" in text else by_phone.get(_phone_key(text) or None)
+        if name:
+            found[text] = name
+    return found
+
+
+def find_contacts(query, people):
+    """The few people whose name has every word asked for, as the start of one of its words."""
+    wanted = [word for word in re.split(r"\s+", str(query).strip().lower()) if word]
+    if not wanted:
+        return []
+    matches = []
+    for person in people:
+        words = person["name"].lower().split()
+        if all(any(word.startswith(part) for word in words) for part in wanted) and (person["phones"] or person["emails"]):
+            matches.append(person)
+    # Someone whose whole name was asked for comes before someone who only shares a first name.
+    matches.sort(key=lambda person: (person["name"].lower() != " ".join(wanted), len(person["name"])))
+    return matches
+
+
+def _messages_on():
+    return _integrations().get("messagesRead") is True
+
+
+def _named(who):
+    """A thread's `with` with any bare number or email in it swapped for the person's name, when Messages is on."""
+    if not who or not RAW_HANDLE.search(who) or not _messages_on():
+        return who
+    parts = [part.strip() for part in re.split(r",|\band\b|&", who) if part.strip()]
+    raw = [part for part in parts if RAW_HANDLE.fullmatch(part)]
+    if not raw:
+        return who
+    names = contact_names(raw, _people())
+    return ", ".join(names.get(part, part) for part in parts) if names else who
+
+
+def handle_contacts(args, **_kwargs):
+    args = args if isinstance(args, dict) else {}
+    if not _messages_on():
+        return json.dumps({"error": "The user has turned off bot access to Messages in the Hermit app (Settings → "
+                                    "Integrations), and Contacts goes with it. Don't try another way. Tell them "
+                                    "it's off, and that they can turn it on there."})
+    handles = [str(h).strip() for h in (args.get("handles") or []) if str(h).strip()][:MAX_LOOKUPS]
+    query = _text(args.get("name"))
+    if not handles and not query:
+        return json.dumps({"error": "Give handles to name, or a name to find."})
+    people = _people()
+    if not people:
+        return json.dumps({"error": "Contacts can't be read on this computer, so use the numbers as they are."})
+    answer = {}
+    if handles:
+        names = contact_names(handles, people)
+        answer["names"] = names
+        if (unknown := [h for h in handles if h not in names]):
+            answer["not_in_contacts"] = unknown
+    if query:
+        matches = find_contacts(query, people)
+        answer["matches"] = matches[:MAX_MATCHES]
+        if len(matches) > MAX_MATCHES:
+            answer["note"] = f"{len(matches)} people match. These are the first {MAX_MATCHES}: ask the user for a fuller name."
+        elif not matches:
+            answer["note"] = "Nobody in Contacts matches that name. Ask the user for the number."
+    return json.dumps(answer)
 
 
 def handle(args, **_kwargs):
@@ -818,6 +972,8 @@ def register(ctx):
     # In the same toolset as cards, so a bot that has cards has these without another switch.
     ctx.register_tool(name=STATUS_TOOL, toolset=TOOLSET, schema=STATUS_SCHEMA, handler=handle_status,
                       description=STATUS_SCHEMA["description"], emoji="📌")
+    ctx.register_tool(name=CONTACTS_TOOL, toolset=TOOLSET, schema=CONTACTS_SCHEMA, handler=handle_contacts,
+                      description=CONTACTS_SCHEMA["description"], emoji="👤")
     # Older Hermes has no plugin skills. The tools still say enough to build a simple page.
     try:
         ctx.register_skill("mini-apps", Path(__file__).parent / "skills" / "mini-apps" / "SKILL.md",
