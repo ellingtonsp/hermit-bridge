@@ -166,13 +166,19 @@ SCHEMA = {
                 "description": (
                     "Native building blocks under the title, at most 24, for things fields and body can't show well. "
                     "Each has a `type`: text {text, style: body|caption|headline}; fields {items: [{label, value}]}; "
-                    "chips {items: [{text, tint}]}; metrics {items: [{label, value, delta, trend: up|down|flat}]}; "
+                    "chips {items: [{text, tint}]}; metrics {items: [{label, value, delta, trend: up|down|flat, tint}]} (tint colors the delta when up isn't good, such as spend); "
                     "progress {label, value 0 to 1, detail}; list {items: [{title, detail, trailing, symbol, done}]}; "
                     "table {columns: [..], rows: [[..]]}; sparkline {label, values: [numbers]}; image {url https, alt}; "
-                    "divider {}. Tints: green, red, orange, yellow, blue, purple, gray. symbol is an SF Symbol name."),
+                    "divider {}; input {id, kind: text|toggle|choice|date|number, label, placeholder, options, value} for the "
+                    "user to fill in, which a button reads as {{input.<id>}} in its message or with. "
+                    "Tints: green, red, orange, yellow, blue, purple, gray. symbol is an SF Symbol name."),
                 "items": {"type": "object"},
             },
             "kind": {"type": "string", "description": "A saved card kind to fill in, made with hermit_card_kind. Send `data` with it."},
+            "id": {"type": "string", "description": (
+                "For a card you'll update later, such as a deploy, a delivery or a long job: a short id like "
+                "deploy-142. Sending another card with the same id in this chat replaces the earlier one in place, "
+                "so give it the full new state, not only what changed.")},
             "data": {"type": "object", "description": "The values a kind's {{bindings}} read."},
             "actions": {
                 "type": "array",
@@ -193,6 +199,7 @@ SCHEMA = {
                             "Ask the user before running call. On by default; set false only for harmless, read-only "
                             "tools.")},
                         "done": {"type": "string", "description": "Short status the card shows once call has run, such as 'Marked done'."},
+                        "show": {"type": "boolean", "description": "Show what call returned in the chat, for a read the user wants to see."},
                     },
                     "required": ["label"],
                 },
@@ -313,6 +320,10 @@ def build_card(args):
     if not app or not title:
         raise ValueError("app and title are required")
     card = {"app": app, "title": title}
+    if (ident := _text(args.get("id"))):
+        if not CARD_ID.fullmatch(ident):
+            raise ValueError("id has to be lowercase letters, digits, dashes and underscores, such as deploy-142")
+        card["id"] = ident
     for key in ("subtitle", "body", "status"):
         if (value := _text(args.get(key))):
             card[key] = value
@@ -370,6 +381,7 @@ def build_card(args):
 
 CALL_TOOL = re.compile(r"mcp__[A-Za-z0-9_-]{1,60}")
 MAX_CALL_ARGS = 4000
+MAX_SHOWN = 1500
 CARD_CALL = re.compile(r"^\[Card call: (\{.*\})\]$", re.MULTILINE)
 
 
@@ -383,6 +395,8 @@ def build_call(raw: dict) -> dict | None:
     if len(json.dumps(arguments)) > MAX_CALL_ARGS:
         raise ValueError("the arguments in with are too long for a card")
     call = {"call": tool, "with": arguments, "confirm": raw.get("confirm") is not False}
+    if raw.get("show") is True:
+        call["show"] = True
     if (done := _short(raw.get("done"), 40)):
         call["done"] = done
     return call
@@ -431,9 +445,10 @@ def run_card_call(user_message: str, history) -> str | None:
     if not match:
         return f"Nothing ran: \"{label}\" isn't a button on a card in this chat."
     card, action = match
+    arguments = fill(action.get("with") or {}, {"input": take_inputs(asked.get("inputs"))}, tapped=True)
     try:
         from tools.registry import registry
-        result = registry.dispatch(action["call"], action.get("with") or {})
+        result = registry.dispatch(action["call"], arguments)
     except Exception as exc:  # Hermes itself couldn't be reached from here.
         return f"\"{label}\" didn't run: {type(exc).__name__}."
     text = result if isinstance(result, str) else json.dumps(result)
@@ -445,13 +460,18 @@ def run_card_call(user_message: str, history) -> str | None:
     if problem:
         return f"\"{label}\" didn't work: {str(problem)[:300]}"
     app = card.get("app") or "it"
-    return f"{action.get('done') or 'Done'}. \"{label}\" ran in {app} from the card \"{title}\"."
+    summary = f"{action.get('done') or 'Done'}. \"{label}\" ran in {app} from the card \"{title}\"."
+    if action.get("show"):
+        # A read the user asked to see: its answer, cut to a readable length.
+        summary += "\n\n" + (text[:MAX_SHOWN] + ("…" if len(text) > MAX_SHOWN else ""))
+    return summary
 
 
 # ---- Blocks: a small vocabulary the app draws natively. Unknown types are refused here with a message the model
 # can act on, so a card never arrives with something the phone would silently skip.
 
 MAX_BLOCKS = 24
+CARD_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,60}")
 MAX_ITEMS = 12
 MAX_COLUMNS = 6
 MAX_SPARK = 60
@@ -516,7 +536,7 @@ def build_block(raw) -> dict | None:
     if kind == "metrics":
         items = _items(raw.get("items")[:4] if isinstance(raw.get("items"), list) else None,
                        {"label": lambda v: _short(v, 30), "value": lambda v: _short(v, 20), "delta": lambda v: _short(v, 20),
-                        "trend": lambda v: _text(v) if _text(v) in ("up", "down", "flat") else None}, "value")
+                        "trend": lambda v: _text(v) if _text(v) in ("up", "down", "flat") else None, "tint": _tint}, "value")
         return {"type": kind, "items": items} if items else None
     if kind == "progress":
         value = _number(raw.get("value"))
@@ -548,8 +568,54 @@ def build_block(raw) -> dict | None:
         return {"type": kind, "url": url, **_clean(raw, {"alt": _short})}
     if kind == "divider":
         return {"type": kind}
+    if kind == "input":
+        return build_input(raw)
     raise ValueError(f"unknown block type {kind!r}: use text, fields, chips, metrics, progress, list, table, "
-                     "sparkline, image or divider")
+                     "sparkline, image, divider or input")
+
+
+INPUT_ID = re.compile(r"[a-z][a-z0-9_]{0,30}")
+INPUT_KINDS = ("text", "toggle", "choice", "date", "number")
+
+
+def build_input(raw: dict) -> dict:
+    """A field the user fills in on the card. A button reads it as {{input.<id>}} in its message or arguments."""
+    ident = (_text(raw.get("id")) or "").lower()
+    if not INPUT_ID.fullmatch(ident):
+        raise ValueError("an input block needs an id of lowercase letters, digits and underscores, such as note")
+    kind = (_text(raw.get("kind")) or "text").lower()
+    if kind not in INPUT_KINDS:
+        raise ValueError(f"an input's kind is one of {', '.join(INPUT_KINDS)}")
+    block = {"type": "input", "id": ident, "kind": kind, **_clean(raw, {"label": _short, "placeholder": _short})}
+    if kind == "choice":
+        options = [o for o in (_short(o, 40) for o in (raw.get("options") or [])[:MAX_ITEMS]) if o]
+        if len(options) < 2:
+            raise ValueError("a choice input needs at least two options")
+        block["options"] = options
+    value = raw.get("value")
+    if kind == "toggle" and isinstance(value, bool):
+        block["value"] = value
+    elif kind == "number" and _number(value) is not None:
+        block["value"] = _number(value)
+    elif kind in ("text", "date", "choice") and _short(value):
+        block["value"] = _short(value)
+    return block
+
+
+MAX_INPUT = 2000
+
+
+def take_inputs(raw) -> dict:
+    """What the user entered, kept to plain values of a sensible size."""
+    inputs = {}
+    for key, value in (raw.items() if isinstance(raw, dict) else []):
+        if not INPUT_ID.fullmatch(str(key)):
+            continue
+        if isinstance(value, bool) or (isinstance(value, (int, float)) and value == value):
+            inputs[key] = value
+        elif isinstance(value, str):
+            inputs[key] = value[:MAX_INPUT]
+    return inputs
 
 
 def build_blocks(raw) -> list:
@@ -571,7 +637,7 @@ BINDING = re.compile(r"\{\{\s*([A-Za-z0-9_.]+)\s*\}\}")
 
 
 def _kind_folders() -> list:
-    return [_bot_home() / "hermit" / "cards", Path.home() / ".hermes" / "hermit" / "cards"]
+    return [_bot_home() / "hermit" / "cards", Path.home() / ".hermes" / "hermit" / "shared-cards"]
 
 
 def find_kind(name: str) -> dict | None:
@@ -598,32 +664,59 @@ def _lookup(data, path: str):
     return value
 
 
-def fill(template, data):
+def fill(template, data, tapped=False):
     """{{path}} in strings reads data. A string that is only a binding keeps the value's own type, so lists and
     numbers survive. An object with `each` repeats its `item` for every entry of that list."""
     if isinstance(template, str):
         whole = BINDING.fullmatch(template.strip())
-        if whole:
+        # {{input.x}} is filled when the button is tapped, from what the user entered on the card.
+        later = lambda path: path.startswith("input.") and not tapped
+        if whole and not later(whole.group(1)):
             return _lookup(data, whole.group(1))
-        return BINDING.sub(lambda m: "" if (v := _lookup(data, m.group(1))) is None else str(v), template)
+        return BINDING.sub(lambda m: m.group(0) if later(m.group(1))
+                           else "" if (v := _lookup(data, m.group(1))) is None else str(v), template)
     if isinstance(template, list):
         out = []
         for entry in template:
             if isinstance(entry, dict) and "each" in entry and "item" in entry:
                 for row in (_lookup(data, str(entry["each"])) or [])[:MAX_ITEMS]:
-                    out.append(fill(entry["item"], {**data, **row} if isinstance(row, dict) else {**data, "it": row}))
+                    out.append(fill(entry["item"], {**data, **row} if isinstance(row, dict) else {**data, "it": row}, tapped))
             else:
-                out.append(fill(entry, data))
+                out.append(fill(entry, data, tapped))
         return out
     if isinstance(template, dict):
-        return {key: fill(value, data) for key, value in template.items()}
+        return {key: fill(value, data, tapped) for key, value in template.items()}
     return template
+
+
+def kinds_guide() -> str:
+    """The card designs this bot can use, so it reaches for them instead of laying out a new card each time."""
+    seen, lines = set(), []
+    for folder in _kind_folders():
+        for path in sorted(folder.glob("*.json")) if folder.exists() else []:
+            if path.stem in seen or not KIND_NAME.fullmatch(path.stem):
+                continue
+            seen.add(path.stem)
+            try:
+                kind = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(kind, dict) and not kind.get("off"):
+                keys = sorted(kind.get("sample") or {}) if isinstance(kind.get("sample"), dict) else []
+                lines.append(f"- {path.stem}: {kind.get('description') or ''} Data keys: {', '.join(keys) or 'see its sample'}.")
+    if not lines:
+        return ""
+    return ("\n\nSaved card designs. When you show something one of these covers, send hermes_card(kind: name, data: "
+            "{...}) with data shaped like the design's sample, instead of laying out a card yourself:\n" + "\n".join(lines[:20]))
 
 
 def expand_kind(name: str, data) -> dict:
     kind = find_kind(name)
     if kind is None:
         raise ValueError(f"there's no card kind called {name!r}. Make it with {KIND_TOOL}, or send the card without kind")
+    if kind.get("off"):
+        raise ValueError(f"the user turned off the card design {name!r} in the Hermit app. Send the card without "
+                         "kind, as a plain card")
     data = data if isinstance(data, dict) else {}
     template = {key: kind[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions")
                 if key in kind}
@@ -841,6 +934,12 @@ def handle_kind(args, **_kwargs):
                 if key in template}
         kind["description"] = _short(args.get("description")) or ""
         kind["sample"] = sample
+        # What Settings → Card designs shows, and whether the owner has turned it off there.
+        kind["preview"] = preview
+        try:
+            kind["off"] = json.loads(path.read_text()).get("off") is True if path.exists() else False
+        except ValueError:
+            kind["off"] = False
         _write_json(path, kind)
         return json.dumps({"card": preview, "shown": True, "saved": str(path),
                            "note": f"Saved. This is a preview with the sample data. Show one with hermes_card(kind: "
@@ -1275,7 +1374,7 @@ def on_pre_llm_call(user_message=None, session_id=None, conversation_history=Non
         # Tells the bridge to watch this turn, so an approval can reach the phone even if the app closes.
         _emit(type="app_turn", session=session_id)
         on_call = user_message.rstrip(" \n").endswith(APP_MARKER * 2)
-        return {"context": PHONE_GUIDE + (VOICE_GUIDE if on_call else "")}
+        return {"context": PHONE_GUIDE + kinds_guide() + (VOICE_GUIDE if on_call else "")}
     return None
 
 

@@ -2334,6 +2334,53 @@ def proxy_allows(email: str, trust: dict) -> bool:
     return False
 
 
+# Card designs ("kinds") a bot saved with hermit_card_kind: its own under hermit/cards, and shared ones every bot
+# can use. Settings lists them with their previews, and the owner can turn one off or delete it.
+SHARED_CARDS = HOME / "hermit" / "shared-cards"
+CARD_KIND_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,40}")
+
+
+def card_kind_folders() -> dict[str, pathlib.Path]:
+    folders = {profile: home / "hermit" / "cards" for profile, home in homes().items()}
+    folders["shared"] = SHARED_CARDS
+    return folders
+
+
+def card_kinds() -> list[dict]:
+    kinds = []
+    for owner, folder in card_kind_folders().items():
+        for path in sorted(folder.glob("*.json")) if folder.exists() else []:
+            try:
+                kind = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(kind, dict) or not CARD_KIND_NAME.fullmatch(path.stem):
+                continue
+            kinds.append({"owner": owner, "name": path.stem, "description": str(kind.get("description") or ""),
+                          "off": kind.get("off") is True, "app": kind.get("app") if isinstance(kind.get("app"), str) else None,
+                          "preview": kind.get("preview") if isinstance(kind.get("preview"), dict) else None,
+                          "updated": path.stat().st_mtime})
+    return kinds
+
+
+def change_card_kind(fields: dict) -> None:
+    owner, name = str(fields.get("owner") or ""), str(fields.get("name") or "")
+    folder = card_kind_folders().get(owner)
+    if folder is None or not CARD_KIND_NAME.fullmatch(name):
+        raise KeyError(name)
+    path = folder / f"{name}.json"
+    if not path.exists():
+        raise KeyError(name)
+    if fields.get("remove") is True:
+        path.unlink()
+        print(f"cards: {owner} design {name!r} deleted", flush=True)
+        return
+    kind = json.loads(path.read_text())
+    kind["off"] = fields.get("off") is True
+    write_json(path, kind)
+    print(f"cards: {owner} design {name!r} turned {'off' if kind['off'] else 'on'}", flush=True)
+
+
 def plugin_ready(home: pathlib.Path) -> bool:
     """Whether Hermit's plugin is in this bot's folder. Without it the bot can chat, but sends no cards
     or live progress, and setup has to run again."""
@@ -6078,6 +6125,10 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, integrations_view())
+        if url.path == "/cards/kinds":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            return self.json(200, {"kinds": card_kinds()})
         if url.path == "/groups":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -6552,6 +6603,15 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     presence.pop(session_id, None)
             return self.json(200, {})
+        if path == "/cards/kinds":
+            data = self.body(4096)
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            try:
+                change_card_kind(json.loads(data or b"{}"))
+            except (KeyError, ValueError, AttributeError, OSError):
+                return self.json(404, {"error": {"message": "That card design isn't there any more."}})
+            return self.json(200, {"kinds": card_kinds()})
         if path == "/integrations":
             data = self.body()
             if not authorized(header):
