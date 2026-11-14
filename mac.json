@@ -1,9 +1,9 @@
 {
- "version": "1.0",
- "build": 23,
- "file": "Hermit-1.0-23.dmg",
- "sha256": "e6e7bb7f21d752f9f54fe9c25e2d976aad384d981185b68963585db8dc783288",
- "notes": "Terminal with SSH, Mosh and herdr; session pills; search every session; Tidings tips; What's New",
- "size": 25666297,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-23/Hermit-1.0-23.dmg"
+ "version": "1.1",
+ "build": 24,
+ "file": "Hermit-1.1-24.dmg",
+ "sha256": "45c54377b40030dd77c4c6eccfa45ec9899db14df9f467e26f79f1cecdf87b97",
+ "notes": "Sign in through your own proxy, pair by signing in, a guide for new users, Report a Problem, and a hideable inbox on iPad and Mac.",
+ "size": 26071831,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-24/Hermit-1.1-24.dmg"
 }
