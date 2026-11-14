@@ -1,9 +1,9 @@
 {
  "version": "1.1",
- "build": 24,
- "file": "Hermit-1.1-24.dmg",
- "sha256": "45c54377b40030dd77c4c6eccfa45ec9899db14df9f467e26f79f1cecdf87b97",
- "notes": "Sign in through your own proxy, pair by signing in, a guide for new users, Report a Problem, and a hideable inbox on iPad and Mac.",
- "size": 26071831,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-24/Hermit-1.1-24.dmg"
+ "build": 25,
+ "file": "Hermit-1.1-25.dmg",
+ "sha256": "b3cc464f46e1bbe2e90afdd0683f47c7263fb8ff147dc80c10b5f18b2bac0d7b",
+ "notes": "Richer cards you can design, buttons that act, inputs, and cards that update in place.",
+ "size": 26313568,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-25/Hermit-1.1-25.dmg"
 }
