@@ -721,7 +721,7 @@ def expand_kind(name: str, data) -> dict:
         raise ValueError(f"the user turned off the card design {name!r} in the Hermit app. Send the card without "
                          "kind, as a plain card")
     data = data if isinstance(data, dict) else {}
-    template = {key: kind[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions")
+    template = {key: kind[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions", "id")
                 if key in kind}
     return fill(template, data)
 
@@ -900,7 +900,8 @@ KIND_SCHEMA = {
         "an entry {\"each\": \"tasks\", \"item\": {...}} repeats item for every entry of data.tasks, with that "
         "entry's keys readable directly. Give `sample`, realistic data: the result is a preview card filled with it, "
         "which the user sees in the chat. Afterwards show one with hermes_card(kind: name, data: {...}). "
-        "Kinds are this bot's own unless `shared` makes them available to every bot."),
+        "Kinds are this bot's own unless `shared` makes them available to every bot. Before designing or "
+        "changing one, read this plugin's card-designs skill with skill_view; to change one, read it first with read."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -910,6 +911,7 @@ KIND_SCHEMA = {
             "sample": {"type": "object", "description": "Realistic data for the preview."},
             "shared": {"type": "boolean", "description": "Save it for every bot, not only this one."},
             "remove": {"type": "boolean", "description": "Delete this kind."},
+            "read": {"type": "boolean", "description": "Return this kind's saved template, description and sample, to change it."},
         },
         "required": ["name"],
     },
@@ -927,13 +929,22 @@ def handle_kind(args, **_kwargs):
         if args.get("remove"):
             path.unlink(missing_ok=True)
             return json.dumps({"removed": name})
+        if args.get("read"):
+            kind = find_kind(name)
+            if kind is None:
+                raise ValueError(f"there's no card kind called {name!r}")
+            template = {key: kind[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions", "id")
+                        if key in kind}
+            return json.dumps({"name": name, "description": kind.get("description") or "", "template": template,
+                               "sample": kind.get("sample") or {}, "off": kind.get("off") is True,
+                               "note": "Edit the template and save it again with the same name."})
         template = args.get("template")
         if not isinstance(template, dict):
             raise ValueError("template must be an object with the card's keys, such as app, title and blocks")
         sample = args.get("sample") if isinstance(args.get("sample"), dict) else {}
         # The preview goes through exactly what a real card will, so a kind that saves is a kind that shows.
         preview = build_card(fill(template, sample))
-        kind = {key: template[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions")
+        kind = {key: template[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions", "id")
                 if key in template}
         kind["description"] = _short(args.get("description")) or ""
         kind["sample"] = sample
@@ -1449,6 +1460,9 @@ def register(ctx):
         ctx.register_skill("mini-apps", Path(__file__).parent / "skills" / "mini-apps" / "SKILL.md",
                            "Build a mini app for the Hermit app: a page in the chat, with an optional server for live "
                            "data, credentials and actions, and values on the status bar.")
+        ctx.register_skill("card-designs", Path(__file__).parent / "skills" / "card-designs" / "SKILL.md",
+                           "Design a card for the Hermit app: a saved layout with native blocks, inputs, buttons that call "
+                           "connectors, and cards that update in place.")
     except Exception:
         pass
     ctx.register_tool(name=BAR_TOOL, toolset=TOOLSET, schema=BAR_SCHEMA, handler=handle_bar,
