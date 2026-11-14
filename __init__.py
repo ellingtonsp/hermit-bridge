@@ -415,7 +415,8 @@ def find_card_call(history, title: str, label: str) -> tuple[dict, dict] | None:
 
 def run_card_call(user_message: str, history) -> str | None:
     """What a tapped calling button did, as the turn's whole reply, or None when this isn't one."""
-    found = CARD_CALL.search(user_message or "")
+    # The app ends every message with its marker, which would otherwise sit past the call line's closing bracket.
+    found = CARD_CALL.search((user_message or "").replace(APP_MARKER, ""))
     if not found:
         return None
     try:
