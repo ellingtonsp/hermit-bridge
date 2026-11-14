@@ -117,6 +117,9 @@ INBOX = STATE / "inbox.json"
 VOICE_PREFS = STATE / "voice-prefs.json"
 FILE_HISTORY = STATE / "file-history"
 PAIR_CODE = STATE / "pair-code.json"
+# Off unless setup wrote it: who a sign-in proxy in front may pair, and how to tell it really was the proxy.
+PROXY_TRUST = STATE / "proxy-trust.json"
+PROXY_SECRET_HEADER = "X-Hermit-Proxy-Secret"
 PAIR_CODE_SECONDS = 600
 PAIR_CODE_TRIES = 5
 MAX_FILE = 512_000
@@ -2277,6 +2280,58 @@ def claim_pair_code(code: str) -> dict | None:
         bots = [{"profile": name, "key": key} for name, home in homes().items() if (key := api_key(home))]
         PAIR_CODE.unlink(missing_ok=True)
     return {"url": state["url"], "bots": bots}
+
+
+# Pairing by a sign-in proxy's word. The proxy has already signed the person in, so asking them for a code as
+# well is one step too many. The bridge takes the proxy's word only in a form nobody can fake by reaching the
+# bridge some other way: a token the proxy or its provider signed, checked against their published keys, or
+# a plain header that comes with a secret only the proxy was given.
+jwks_clients: dict[str, object] = {}
+
+
+def proxy_trust() -> dict:
+    try:
+        trust = read_json(PROXY_TRUST)
+    except (OSError, ValueError):
+        return {}
+    return trust if isinstance(trust, dict) and trust.get("allow") else {}
+
+
+def proxy_identity(headers, trust: dict) -> str | None:
+    """The email the proxy vouches for, or None when it didn't vouch in a way this bridge can check."""
+    signed = trust.get("jwt") if isinstance(trust.get("jwt"), dict) else None
+    if signed and (token := headers.get(signed.get("header") or "Authorization")):
+        token = token.removeprefix("Bearer ").strip()
+        try:
+            import jwt  # PyJWT ships with Hermes.
+            jwks = str(signed["jwks"])
+            client = jwks_clients.get(jwks) or jwks_clients.setdefault(jwks, jwt.PyJWKClient(jwks, cache_keys=True, lifespan=3600))
+            key = client.get_signing_key_from_jwt(token).key
+            claims = jwt.decode(token, key, algorithms=["RS256", "ES256", "PS256", "EdDSA"],
+                                audience=signed.get("audience") or None, issuer=signed.get("issuer") or None,
+                                options={"require": ["exp"], "verify_aud": bool(signed.get("audience"))})
+            email = claims.get(signed.get("claim") or "email")
+            return str(email).strip().lower() if email else None
+        except Exception as error:
+            print(f"access: a sign-in proxy's token didn't check out ({type(error).__name__})", flush=True)
+            return None
+    plain = trust.get("header") if isinstance(trust.get("header"), dict) else None
+    if plain and plain.get("secret"):
+        given = headers.get(PROXY_SECRET_HEADER) or ""
+        if given and hmac.compare_digest(given, str(plain["secret"])):
+            email = headers.get(plain.get("name") or "X-Forwarded-Email")
+            return str(email).strip().lower() if email else None
+    return None
+
+
+def proxy_allows(email: str, trust: dict) -> bool:
+    """Exact addresses, or a whole domain written as *@example.com."""
+    email = email.lower()
+    for allowed in trust.get("allow") or []:
+        allowed = str(allowed).strip().lower()
+        if allowed == email or (allowed.startswith("*@") and email.endswith(allowed[1:])):
+            return True
+    return False
 
 
 def plugin_ready(home: pathlib.Path) -> bool:
@@ -6328,6 +6383,23 @@ class Handler(BaseHTTPRequestHandler):
                 # Its own key already opens them, so it's told they exist and handed nothing more.
                 found["bots"] = [{"profile": bot["profile"]} for bot in found["bots"]]
             return self.json(200, found)
+        if path == "/pair/proxy":
+            trust = proxy_trust()
+            if not trust:
+                return self.json(404, {"error": {"message": "This server pairs with a code from setup."}})
+            email = proxy_identity(self.headers, trust)
+            if not email:
+                return self.json(401, {"error": {"message": "Your sign-in proxy didn't say who you are in a way this server trusts. Use a code from setup."}})
+            if not proxy_allows(email, trust):
+                print(f"access: {email} signed in at the proxy but isn't allowed to pair", flush=True)
+                return self.json(403, {"error": {"message": f"{email} isn't allowed to pair with this server."}})
+            fields = json.loads(self.body(4096) or b"{}")
+            name = str((fields.get("device") or {}).get("name") or "") if isinstance(fields.get("device"), dict) else ""
+            device, token = new_device(name)
+            print(f"access: paired through the sign-in proxy as {email}", flush=True)
+            bots = [{"profile": profile} for profile, home in homes().items() if api_key(home)]
+            url = str(trust.get("url") or "").rstrip("/") or f"https://{self.headers.get('Host') or 'localhost'}"
+            return self.json(200, {"url": url, "device": device, "token": token, "bots": bots})
         if path == "/pair/claim":
             fields = json.loads(self.body(4096) or b"{}")
             claimed = claim_pair_code(str(fields.get("code") or ""))

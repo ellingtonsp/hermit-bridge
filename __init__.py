@@ -932,6 +932,21 @@ def _setup_arguments(parser):
     parser.add_argument("--yes", action="store_true", help="don't ask before each change")
     parser.add_argument("--url", help="your own https:// address, instead of Tailscale")
     parser.add_argument("--no-restart", action="store_true", help="leave restarting the gateway to you")
+    parser.add_argument("--proxy-allow", action="append", metavar="EMAIL", help="who may pair once your sign-in proxy signs them in")
+    parser.add_argument("--proxy-jwks", metavar="URL", help="where your proxy publishes its token signing keys")
+    parser.add_argument("--proxy-jwt-header", metavar="NAME", help="the header carrying the signed token")
+    parser.add_argument("--proxy-issuer", metavar="URL", help="the token's issuer")
+    parser.add_argument("--proxy-audience", metavar="ID", help="the token's audience")
+    parser.add_argument("--proxy-email-header", metavar="NAME", help="a plain header with the email, guarded by a secret")
+    parser.add_argument("--proxy-off", action="store_true", help="stop pairing through the proxy")
+
+
+def _proxy_flags(args) -> list:
+    flags = [flag for email in (getattr(args, "proxy_allow", None) or []) for flag in ("--proxy-allow", email)]
+    for name in ("proxy_jwks", "proxy_jwt_header", "proxy_issuer", "proxy_audience", "proxy_email_header"):
+        if value := getattr(args, name, None):
+            flags += ["--" + name.replace("_", "-"), value]
+    return flags + (["--proxy-off"] if getattr(args, "proxy_off", False) else [])
 
 
 def _run_setup(args):
@@ -943,7 +958,7 @@ def _run_setup(args):
     script = folder / ("hermes_app_bridge.py" if args.action == "bridge" else "hermit_setup.py")
     flags = [] if args.action == "bridge" else [
         flag for flag, on in (("--check", args.check), ("--yes", args.yes), ("--no-restart", args.no_restart)) if on
-    ] + (["--url", args.url] if args.url else [])
+    ] + (["--url", args.url] if args.url else []) + _proxy_flags(args)
     python = pathlib.Path.home() / ".hermes/hermes-agent/venv/bin/python3"
     if python.exists():
         if args.action == "bridge":

@@ -328,12 +328,43 @@ def install_bridge(python: str, tailscale: str | None, api_port: str, hermes: st
     run(tailscale, "serve", "--bg", f"--https={HTTPS_PORT}", "--set-path=/app", f"http://127.0.0.1:{BRIDGE_PORT}")
 
 
+def proxy_trust(options, url: str, bridge) -> dict | None:
+    """What the bridge will take as the proxy's word. One of a signed token or a plain header with a secret."""
+    allow = [email.strip().lower() for email in options.proxy_allow if email.strip()]
+    trust: dict = {"allow": allow, "url": url}
+    if options.proxy_jwks:
+        trust["jwt"] = {"jwks": options.proxy_jwks, "header": options.proxy_jwt_header,
+                        "issuer": options.proxy_issuer or "", "audience": options.proxy_audience or ""}
+    elif options.proxy_email_header:
+        try:
+            kept = bridge.read_json(bridge.PROXY_TRUST).get("header", {}).get("secret")
+        except (OSError, ValueError, AttributeError):
+            kept = None
+        # Running setup again keeps the secret, so the proxy's configuration doesn't have to change.
+        trust["header"] = {"name": options.proxy_email_header, "secret": kept or secrets.token_urlsafe(32)}
+    else:
+        print("\n  MISSING  Sign-in proxy: give --proxy-jwks (a signed token) or --proxy-email-header (a plain header).")
+        return None
+    return trust
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=f"Connect Hermit to the Hermes on this {HERE}.")
     parser.add_argument("--check", action="store_true", help="report what's ready and change nothing")
     parser.add_argument("--yes", action="store_true", help="don't ask before each change")
     parser.add_argument("--url", help="your own https:// address, instead of Tailscale")
     parser.add_argument("--no-restart", action="store_true", help="leave restarting the Hermes gateway to you")
+    proxy = parser.add_argument_group("pairing through a sign-in proxy, with no code")
+    proxy.add_argument("--proxy-allow", action="append", metavar="EMAIL",
+                       help="who may pair once your proxy signs them in; repeat it, or use *@your.domain")
+    proxy.add_argument("--proxy-jwks", metavar="URL", help="where your proxy or provider publishes the keys its tokens are signed with")
+    proxy.add_argument("--proxy-jwt-header", metavar="NAME", default="Authorization",
+                       help="the header carrying that signed token, such as Cf-Access-Jwt-Assertion")
+    proxy.add_argument("--proxy-issuer", metavar="URL", help="the token's issuer, checked when given")
+    proxy.add_argument("--proxy-audience", metavar="ID", help="the token's audience, checked when given")
+    proxy.add_argument("--proxy-email-header", metavar="NAME",
+                       help="a plain header with the email, such as X-Forwarded-Email; setup makes a secret your proxy adds as well")
+    proxy.add_argument("--proxy-off", action="store_true", help="stop pairing through the proxy; codes still work")
     options = parser.parse_args()
     public_url = options.url.rstrip("/") if options.url else None
     if public_url and not public_url.startswith("https://"):
@@ -385,6 +416,20 @@ def main() -> int:
         print("/p/<profile> to any standalone profile. Your API keys are the only protection on a public address.")
     import hermes_app_bridge as bridge
     url = public_url or f"https://{host}:{HTTPS_PORT}"
+    if options.proxy_off:
+        bridge.PROXY_TRUST.unlink(missing_ok=True)
+        print("\nPairing through the sign-in proxy is off. Codes still work.")
+    elif options.proxy_allow:
+        trust = proxy_trust(options, url, bridge)
+        if trust and confirm(f"Let {', '.join(trust['allow'])} pair once your proxy signs them in, with no code?", options.yes):
+            bridge.STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+            bridge.write_json(bridge.PROXY_TRUST, trust)
+            bridge.PROXY_TRUST.chmod(0o600)
+            if "header" in trust:
+                # Kept out of this output, which a bot running setup would read back into a chat.
+                print(f"\nHave your proxy add the header {bridge.PROXY_SECRET_HEADER} to every request it passes on, with the")
+                print(f"secret saved in {bridge.PROXY_TRUST} as header.secret, and remove any copy a request arrives with.")
+            print("\nIn Hermit, open Other ways to connect, then Behind a sign-in proxy?, and sign in. No code needed.")
     code = bridge.new_pair_code(url)
     print(f"\nIn Hermit, enter\n  Address: {url}\n  Code: {code}\nThe code works once and expires in 10 minutes.")
     stamp = HOME / "app-bridge/setup.json"
