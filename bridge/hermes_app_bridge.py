@@ -129,7 +129,7 @@ INTEGRATIONS = STATE / "integrations.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
-KEPT_INTEGRATIONS = ("recaps", "macCalls", "macDictation", "terminal")
+KEPT_INTEGRATIONS = ("recaps", "macCalls", "macDictation", "terminal", "cardActions")
 # Switches that are on until someone turns them off.
 ON_UNLESS_OFF = ("macCalls", "macDictation")
 # Works for anyone. Rules for your own workspaces go in links.json.

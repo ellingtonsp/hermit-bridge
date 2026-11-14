@@ -161,6 +161,19 @@ SCHEMA = {
                 "required": ["with", "messages"],
             },
             "reminder_list": {"type": "string", "description": "A Reminders list name, only if the user asked for one."},
+            "blocks": {
+                "type": "array",
+                "description": (
+                    "Native building blocks under the title, at most 24, for things fields and body can't show well. "
+                    "Each has a `type`: text {text, style: body|caption|headline}; fields {items: [{label, value}]}; "
+                    "chips {items: [{text, tint}]}; metrics {items: [{label, value, delta, trend: up|down|flat}]}; "
+                    "progress {label, value 0 to 1, detail}; list {items: [{title, detail, trailing, symbol, done}]}; "
+                    "table {columns: [..], rows: [[..]]}; sparkline {label, values: [numbers]}; image {url https, alt}; "
+                    "divider {}. Tints: green, red, orange, yellow, blue, purple, gray. symbol is an SF Symbol name."),
+                "items": {"type": "object"},
+            },
+            "kind": {"type": "string", "description": "A saved card kind to fill in, made with hermit_card_kind. Send `data` with it."},
+            "data": {"type": "object", "description": "The values a kind's {{bindings}} read."},
             "actions": {
                 "type": "array",
                 "description": "Up to 8 buttons with labels of one or two words. The last primary action is the filled button. Style 'option' shows a lettered choice. Use options or buttons on a card, not both.",
@@ -171,12 +184,20 @@ SCHEMA = {
                         "style": {"type": "string", "enum": ["primary", "secondary", "option"]},
                         "message": {"type": "string", "description": "Sent to you as the user's reply when tapped."},
                         "url": {"type": "string", "description": "https link to open instead of replying."},
+                        "call": {"type": "string", "description": (
+                            "Instead of a message, run one of your connector tools directly when tapped, with no turn of "
+                            "yours in between: its exact tool name, such as mcp__notion__notion_update_page. Only "
+                            "connector tools (mcp__...) can be called this way.")},
+                        "with": {"type": "object", "description": "The arguments for call, exactly as the tool takes them."},
+                        "confirm": {"type": "boolean", "description": (
+                            "Ask the user before running call. On by default; set false only for harmless, read-only "
+                            "tools.")},
+                        "done": {"type": "string", "description": "Short status the card shows once call has run, such as 'Marked done'."},
                     },
                     "required": ["label"],
                 },
             },
         },
-        "required": ["app", "title"],
     },
 }
 
@@ -325,19 +346,287 @@ def build_card(args):
         if len(_text(raw["label"])) > MAX_ACTION_LABEL:
             raise ValueError(f"action label {raw['label']!r} is too long: use one or two words")
         action = {"label": _text(raw["label"]), "style": raw.get("style") if raw.get("style") in ("primary", "option") else "secondary"}
-        message, link = _text(raw.get("message")), _https(raw.get("url"))
-        if not message and not link:
-            raise ValueError(f"action {action['label']!r} needs a message or an https url")
+        message, link, call = _text(raw.get("message")), _https(raw.get("url")), build_call(raw)
+        if not message and not link and not call:
+            raise ValueError(f"action {action['label']!r} needs a message, an https url, or a connector tool to call")
         if message:
             action["message"] = message
         if link:
             action["url"] = link
+        if call:
+            action.update(call)
         actions.append(action)
     if len({a["style"] == "option" for a in actions}) > 1:
         raise ValueError("use option actions or buttons on a card, not both")
     if actions:
         card["actions"] = actions
+    if (blocks := build_blocks(args.get("blocks"))):
+        card["blocks"] = blocks
     return card
+
+
+# ---- Card actions that run a connector tool. The phone only ever says "this button on that card"; what runs is
+# what the bot put on the card, read back from this conversation's own history, so nothing else can be named.
+
+CALL_TOOL = re.compile(r"mcp__[A-Za-z0-9_-]{1,60}")
+MAX_CALL_ARGS = 4000
+CARD_CALL = re.compile(r"^\[Card call: (\{.*\})\]$", re.MULTILINE)
+
+
+def build_call(raw: dict) -> dict | None:
+    tool = _text(raw.get("call"))
+    if not tool:
+        return None
+    if not CALL_TOOL.fullmatch(tool):
+        raise ValueError(f"call {tool!r} isn't a connector tool: give the exact mcp__ tool name you'd use yourself")
+    arguments = raw.get("with") if isinstance(raw.get("with"), dict) else {}
+    if len(json.dumps(arguments)) > MAX_CALL_ARGS:
+        raise ValueError("the arguments in with are too long for a card")
+    call = {"call": tool, "with": arguments, "confirm": raw.get("confirm") is not False}
+    if (done := _short(raw.get("done"), 40)):
+        call["done"] = done
+    return call
+
+
+def _card_from(message) -> dict | None:
+    if not isinstance(message, dict) or message.get("role") != "tool":
+        return None
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    try:
+        card = json.loads(content).get("card") if isinstance(content, str) else None
+    except (ValueError, AttributeError):
+        return None
+    return card if isinstance(card, dict) else None
+
+
+def find_card_call(history, title: str, label: str) -> tuple[dict, dict] | None:
+    """The newest card in this conversation with that title and a calling button with that label."""
+    for message in reversed(history or []):
+        card = _card_from(message)
+        if not card or card.get("title") != title:
+            continue
+        for action in card.get("actions") or []:
+            if isinstance(action, dict) and action.get("label") == label and action.get("call"):
+                return card, action
+    return None
+
+
+def run_card_call(user_message: str, history) -> str | None:
+    """What a tapped calling button did, as the turn's whole reply, or None when this isn't one."""
+    found = CARD_CALL.search(user_message or "")
+    if not found:
+        return None
+    try:
+        asked = json.loads(found.group(1))
+    except ValueError:
+        return "That button couldn't be read, so nothing ran."
+    title, label = _text(asked.get("title")) or "", _text(asked.get("label")) or ""
+    if _integrations().get("cardActions") is not True:
+        return ("Nothing ran: card actions are off. They can be turned on in the Hermit app, in Settings → "
+                "Integrations → Card actions.")
+    match = find_card_call(history, title, label)
+    if not match:
+        return f"Nothing ran: \"{label}\" isn't a button on a card in this chat."
+    card, action = match
+    try:
+        from tools.registry import registry
+        result = registry.dispatch(action["call"], action.get("with") or {})
+    except Exception as exc:  # Hermes itself couldn't be reached from here.
+        return f"\"{label}\" didn't run: {type(exc).__name__}."
+    text = result if isinstance(result, str) else json.dumps(result)
+    try:
+        problem = json.loads(text).get("error") if text.strip().startswith("{") else None
+    except ValueError:
+        problem = None
+    _emit(type="card_call", tool=action["call"], ok=not problem)
+    if problem:
+        return f"\"{label}\" didn't work: {str(problem)[:300]}"
+    app = card.get("app") or "it"
+    return f"{action.get('done') or 'Done'}. \"{label}\" ran in {app} from the card \"{title}\"."
+
+
+# ---- Blocks: a small vocabulary the app draws natively. Unknown types are refused here with a message the model
+# can act on, so a card never arrives with something the phone would silently skip.
+
+MAX_BLOCKS = 24
+MAX_ITEMS = 12
+MAX_COLUMNS = 6
+MAX_SPARK = 60
+TINTS = {"green", "red", "orange", "yellow", "blue", "purple", "gray"}
+SYMBOL = re.compile(r"[a-z0-9]+(\.[a-z0-9]+)*")
+
+
+def _short(value, limit=200):
+    text = _text(value)
+    return text[:limit] if text else None
+
+
+def _clean(item: dict, keys: dict) -> dict:
+    """Keeps the listed keys, each through its cleaner, and drops what comes back empty."""
+    out = {}
+    for key, clean in keys.items():
+        value = clean(item.get(key))
+        if value not in (None, "", [], {}):
+            out[key] = value
+    return out
+
+
+def _tint(value):
+    text = (_text(value) or "").lower()
+    return text if text in TINTS else None
+
+
+def _symbol(value):
+    text = (_text(value) or "").lower()
+    return text if SYMBOL.fullmatch(text) and len(text) <= 60 else None
+
+
+def _number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) < 1e15 else None
+
+
+def _items(raw, keys, required):
+    rows = []
+    for item in (raw if isinstance(raw, list) else [])[:MAX_ITEMS]:
+        if isinstance(item, dict) and (row := _clean(item, keys)) and required in row:
+            rows.append(row)
+    return rows
+
+
+def build_block(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = (_text(raw.get("type")) or "").lower()
+    if kind == "text":
+        block = _clean(raw, {"text": _text, "style": lambda v: _text(v) if _text(v) in ("body", "caption", "headline") else None})
+        return {"type": kind, **block} if "text" in block else None
+    if kind == "fields":
+        items = _items(raw.get("items"), {"label": _short, "value": _short}, "value")
+        return {"type": kind, "items": items} if items else None
+    if kind == "chips":
+        items = _items(raw.get("items"), {"text": lambda v: _short(v, 40), "tint": _tint}, "text")
+        return {"type": kind, "items": items} if items else None
+    if kind == "metrics":
+        items = _items(raw.get("items")[:4] if isinstance(raw.get("items"), list) else None,
+                       {"label": lambda v: _short(v, 30), "value": lambda v: _short(v, 20), "delta": lambda v: _short(v, 20),
+                        "trend": lambda v: _text(v) if _text(v) in ("up", "down", "flat") else None}, "value")
+        return {"type": kind, "items": items} if items else None
+    if kind == "progress":
+        value = _number(raw.get("value"))
+        if value is None:
+            raise ValueError("a progress block needs a value from 0 to 1")
+        block = _clean(raw, {"label": _short, "detail": _short, "tint": _tint})
+        return {"type": kind, "value": max(0.0, min(1.0, value)), **block}
+    if kind == "list":
+        items = _items(raw.get("items"), {"title": _short, "detail": _short, "trailing": lambda v: _short(v, 30),
+                                          "symbol": _symbol, "tint": _tint,
+                                          "done": lambda v: v if isinstance(v, bool) else None}, "title")
+        return {"type": kind, "items": items} if items else None
+    if kind == "table":
+        columns = [c for c in (_short(c, 40) for c in (raw.get("columns") or [])[:MAX_COLUMNS]) if c]
+        rows = [[_short(cell, 60) or "" for cell in row[:len(columns)]] for row in (raw.get("rows") or [])[:MAX_ITEMS]
+                if isinstance(row, list)]
+        if not columns or not rows:
+            return None
+        return {"type": kind, "columns": columns, "rows": rows}
+    if kind == "sparkline":
+        values = [v for v in (_number(v) for v in (raw.get("values") or [])[-MAX_SPARK:]) if v is not None]
+        if len(values) < 2:
+            raise ValueError("a sparkline block needs at least two numbers in values")
+        return {"type": kind, "values": values, **_clean(raw, {"label": _short, "tint": _tint})}
+    if kind == "image":
+        url = _https(raw.get("url"))
+        if not url:
+            raise ValueError("an image block needs an https url")
+        return {"type": kind, "url": url, **_clean(raw, {"alt": _short})}
+    if kind == "divider":
+        return {"type": kind}
+    raise ValueError(f"unknown block type {kind!r}: use text, fields, chips, metrics, progress, list, table, "
+                     "sparkline, image or divider")
+
+
+def build_blocks(raw) -> list:
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("blocks must be a list")
+    if len(raw) > MAX_BLOCKS:
+        raise ValueError(f"at most {MAX_BLOCKS} blocks")
+    return [block for block in (build_block(b) for b in raw) if block]
+
+
+# ---- Card kinds: a template kept as a file, filled in here, so the transcript holds the finished card and an older
+# app shows it like any other. A bot's own kinds come first, then the shared ones every bot can use.
+
+KIND_TOOL = "hermit_card_kind"
+KIND_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,40}")
+BINDING = re.compile(r"\{\{\s*([A-Za-z0-9_.]+)\s*\}\}")
+
+
+def _kind_folders() -> list:
+    return [_bot_home() / "hermit" / "cards", Path.home() / ".hermes" / "hermit" / "cards"]
+
+
+def find_kind(name: str) -> dict | None:
+    for folder in _kind_folders():
+        path = folder / f"{name}.json"
+        if path.exists():
+            try:
+                kind = json.loads(path.read_text())
+            except ValueError:
+                raise ValueError(f"card kind {name!r} can't be read: save it again with {KIND_TOOL}")
+            return kind if isinstance(kind, dict) else None
+    return None
+
+
+def _lookup(data, path: str):
+    value = data
+    for part in path.split("."):
+        if isinstance(value, dict):
+            value = value.get(part)
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            return None
+    return value
+
+
+def fill(template, data):
+    """{{path}} in strings reads data. A string that is only a binding keeps the value's own type, so lists and
+    numbers survive. An object with `each` repeats its `item` for every entry of that list."""
+    if isinstance(template, str):
+        whole = BINDING.fullmatch(template.strip())
+        if whole:
+            return _lookup(data, whole.group(1))
+        return BINDING.sub(lambda m: "" if (v := _lookup(data, m.group(1))) is None else str(v), template)
+    if isinstance(template, list):
+        out = []
+        for entry in template:
+            if isinstance(entry, dict) and "each" in entry and "item" in entry:
+                for row in (_lookup(data, str(entry["each"])) or [])[:MAX_ITEMS]:
+                    out.append(fill(entry["item"], {**data, **row} if isinstance(row, dict) else {**data, "it": row}))
+            else:
+                out.append(fill(entry, data))
+        return out
+    if isinstance(template, dict):
+        return {key: fill(value, data) for key, value in template.items()}
+    return template
+
+
+def expand_kind(name: str, data) -> dict:
+    kind = find_kind(name)
+    if kind is None:
+        raise ValueError(f"there's no card kind called {name!r}. Make it with {KIND_TOOL}, or send the card without kind")
+    data = data if isinstance(data, dict) else {}
+    template = {key: kind[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions")
+                if key in kind}
+    return fill(template, data)
 
 
 # ---- Names for the people in Messages. imsg looks them up through macOS's Contacts permission, which a
@@ -492,10 +781,70 @@ def handle_contacts(args, **_kwargs):
 
 def handle(args, **_kwargs):
     try:
+        if isinstance(args, dict) and _text(args.get("kind")):
+            # What the bot sends beside the kind, such as a different title, wins over the template.
+            filled = expand_kind(_text(args["kind"]).lower(), args.get("data"))
+            args = {**filled, **{k: v for k, v in args.items() if k not in ("kind", "data")}}
         return json.dumps({"card": build_card(args), "shown": True,
                            "note": "The user can see this card. Don't repeat what's on it. Reply in one short "
                                    "sentence at most, or only with what isn't on the card."})
     except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+KIND_SCHEMA = {
+    "name": KIND_TOOL,
+    "description": (
+        "Save a card kind: a reusable card layout for the Hermit app, so cards of one sort always look the same "
+        "and you only send their data. Use it when the user asks for a card for something, or when you send the "
+        "same sort of card again and again. A kind has the card's own keys (app, title, subtitle, body, status, "
+        "url, fields, blocks, actions) where any string can read data with {{name}} or {{a.b}}. A string that is "
+        "only a binding, such as \"{{values}}\", keeps a list or number as it is. In a list of items or table rows, "
+        "an entry {\"each\": \"tasks\", \"item\": {...}} repeats item for every entry of data.tasks, with that "
+        "entry's keys readable directly. Give `sample`, realistic data: the result is a preview card filled with it, "
+        "which the user sees in the chat. Afterwards show one with hermes_card(kind: name, data: {...}). "
+        "Kinds are this bot's own unless `shared` makes them available to every bot."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Lowercase letters, digits and dashes, such as meeting-brief."},
+            "description": {"type": "string", "description": "What the kind is for, in one sentence."},
+            "template": {"type": "object", "description": "The card, with {{bindings}}: app, title, blocks, actions and so on."},
+            "sample": {"type": "object", "description": "Realistic data for the preview."},
+            "shared": {"type": "boolean", "description": "Save it for every bot, not only this one."},
+            "remove": {"type": "boolean", "description": "Delete this kind."},
+        },
+        "required": ["name"],
+    },
+}
+
+
+def handle_kind(args, **_kwargs):
+    try:
+        args = args if isinstance(args, dict) else {}
+        name = (_text(args.get("name")) or "").lower()
+        if not KIND_NAME.fullmatch(name):
+            raise ValueError("name has to be lowercase letters, digits and dashes, such as meeting-brief")
+        folder = _kind_folders()[1 if args.get("shared") else 0]
+        path = folder / f"{name}.json"
+        if args.get("remove"):
+            path.unlink(missing_ok=True)
+            return json.dumps({"removed": name})
+        template = args.get("template")
+        if not isinstance(template, dict):
+            raise ValueError("template must be an object with the card's keys, such as app, title and blocks")
+        sample = args.get("sample") if isinstance(args.get("sample"), dict) else {}
+        # The preview goes through exactly what a real card will, so a kind that saves is a kind that shows.
+        preview = build_card(fill(template, sample))
+        kind = {key: template[key] for key in ("app", "title", "subtitle", "body", "status", "url", "fields", "blocks", "actions")
+                if key in template}
+        kind["description"] = _short(args.get("description")) or ""
+        kind["sample"] = sample
+        _write_json(path, kind)
+        return json.dumps({"card": preview, "shown": True, "saved": str(path),
+                           "note": f"Saved. This is a preview with the sample data. Show one with hermes_card(kind: "
+                                   f"\"{name}\", data: {{...}}). Tell the user in a few words what it's for."})
+    except (ValueError, OSError) as exc:
         return json.dumps({"error": str(exc)})
 
 
@@ -890,7 +1239,7 @@ def blocked(args):
 
 
 def on_pre_tool_call(tool_name=None, args=None, session_id=None, **_kwargs):
-    if tool_name == TOOL_NAME:
+    if tool_name in (TOOL_NAME, KIND_TOOL):
         return None
     if (reason := blocked(args)):
         return {"action": "block", "message": reason}
@@ -917,7 +1266,10 @@ def on_post_llm_call(session_id=None, user_message=None, assistant_response=None
     _emit(**event)
 
 
-def on_pre_llm_call(user_message=None, session_id=None, **_kwargs):
+def on_pre_llm_call(user_message=None, session_id=None, conversation_history=None, **_kwargs):
+    # A tapped card button that runs a connector tool: done here, in this bot's own turn, with no model call.
+    if isinstance(user_message, str) and (outcome := run_card_call(user_message, conversation_history)) is not None:
+        return {"action": "block", "message": outcome}
     if isinstance(user_message, str) and user_message.rstrip(" \n").endswith(APP_MARKER):
         # Tells the bridge to watch this turn, so an approval can reach the phone even if the app closes.
         _emit(type="app_turn", session=session_id)
@@ -1000,3 +1352,5 @@ def register(ctx):
                       description=BAR_SCHEMA["description"], emoji="🎛️")
     ctx.register_tool(name=APP_TOOL, toolset=TOOLSET, schema=APP_SCHEMA, handler=handle_mini_app,
                       description=APP_SCHEMA["description"], emoji="🧩")
+    ctx.register_tool(name=KIND_TOOL, toolset=TOOLSET, schema=KIND_SCHEMA, handler=handle_kind,
+                      description=KIND_SCHEMA["description"], emoji="🧱")
