@@ -15,7 +15,10 @@ import socket
 # invisible character and the hook below adds the phone guidance for those turns only.
 APP_MARKER = "\u2063"
 PHONE_GUIDE = (
-    "This message came from the Hermes iPhone app. Before longer work, say in one short sentence "
+    "This message came from the Hermes iPhone app. hermes_card also takes blocks (metrics, lists, tables, "
+    "progress, sparklines, inputs and more), kind and data for a saved design, an id so a later card with the "
+    "same id updates it in place, and buttons that call a connector tool directly; if what you know of "
+    "hermes_card lacks these, look its parameters up again before using it. Before longer work, say in one short sentence "
     "what you're doing, in plain language. Never mention tools, commands or internal steps. Lead the "
     "result with the answer, then at most a few short bullets. Link each person, email, document or "
     "ticket you mention with a markdown link to where it lives, using its real URL, and never invent "
