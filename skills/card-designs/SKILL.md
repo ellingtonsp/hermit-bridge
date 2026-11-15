@@ -54,19 +54,21 @@ Up to 24 per card. Use the fewest that tell the story, usually two to four.
 | `metrics` | Two to four headline numbers | `items: [{label, value, delta, trend: up/down/flat, tint}]` |
 | `sparkline` | A trend | `label`, `values` (numbers), `tint` |
 | `progress` | How far along | `label`, `value` from 0 to 1, `detail`, `tint` |
-| `list` | Items with a status | `items: [{title, detail, trailing, symbol, tint, done}]` |
+| `list` | Items with a status | `items: [{title, detail, trailing, symbol, tint, bot, done}]` |
 | `table` | Rows and columns | `columns`, `rows` (at most 6 columns, 12 rows) |
 | `chips` | Tags and flags | `items: [{text, tint}]` |
 | `fields` | Label and value pairs | `items: [{label, value}]` |
 | `text` | A sentence or a heading | `text`, `style`: body, caption or headline |
-| `image` | A picture | `url` (https), `alt` |
+| `image` | A picture | `url` (https) or `bot`, `alt` |
 | `input` | Something the user fills in | `id`, `kind`: text, toggle, choice, date or number, `label`, `options`, `value` |
 | `divider` | A break | none |
 
 Tints are green, red, orange, yellow, blue, purple and gray. A metric's arrow is green going up and red
 going down, unless you set its `tint`: give spend, burn, errors and overdue counts a red or green tint
 that says whether the change is good. `symbol` is an SF Symbol name, such as `calendar` or
-`exclamationmark.circle`.
+`exclamationmark.circle`. `bot` is a bot's profile name, such as `chief-of-staff`, and shows that bot's face
+in place of the symbol; the symbol shows if the face can't. In a design, `"bot": "{{profile}}"` works inside
+an `each` repeat.
 
 ## Buttons
 

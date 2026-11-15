@@ -170,11 +170,12 @@ SCHEMA = {
                     "Native building blocks under the title, at most 24, for things fields and body can't show well. "
                     "Each has a `type`: text {text, style: body|caption|headline}; fields {items: [{label, value}]}; "
                     "chips {items: [{text, tint}]}; metrics {items: [{label, value, delta, trend: up|down|flat, tint}]} (tint colors the delta when up isn't good, such as spend); "
-                    "progress {label, value 0 to 1, detail}; list {items: [{title, detail, trailing, symbol, done}]}; "
-                    "table {columns: [..], rows: [[..]]}; sparkline {label, values: [numbers]}; image {url https, alt}; "
+                    "progress {label, value 0 to 1, detail}; list {items: [{title, detail, trailing, symbol, tint, bot, done}]}; "
+                    "table {columns: [..], rows: [[..]]}; sparkline {label, values: [numbers]}; image {url https or bot, alt}; "
                     "divider {}; input {id, kind: text|toggle|choice|date|number, label, placeholder, options, value} for the "
                     "user to fill in, which a button reads as {{input.<id>}} in its message or with. "
-                    "Tints: green, red, orange, yellow, blue, purple, gray. symbol is an SF Symbol name."),
+                    "Tints: green, red, orange, yellow, blue, purple, gray. symbol is an SF Symbol name. bot is a bot's "
+                    "profile name, such as chief-of-staff, and shows its face."),
                 "items": {"type": "object"},
             },
             "kind": {"type": "string", "description": "A saved card kind to fill in, made with hermit_card_kind. Send `data` with it."},
@@ -480,6 +481,8 @@ MAX_COLUMNS = 6
 MAX_SPARK = 60
 TINTS = {"green", "red", "orange", "yellow", "blue", "purple", "gray"}
 SYMBOL = re.compile(r"[a-z0-9]+(\.[a-z0-9]+)*")
+# A bot's profile name, which the app turns into that bot's face from its own signed-in copy.
+BOT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
 def _short(value, limit=200):
@@ -505,6 +508,11 @@ def _tint(value):
 def _symbol(value):
     text = (_text(value) or "").lower()
     return text if SYMBOL.fullmatch(text) and len(text) <= 60 else None
+
+
+def _bot(value):
+    text = (_text(value) or "").lower()
+    return text if BOT_NAME.fullmatch(text) else None
 
 
 def _number(value):
@@ -549,7 +557,7 @@ def build_block(raw) -> dict | None:
         return {"type": kind, "value": max(0.0, min(1.0, value)), **block}
     if kind == "list":
         items = _items(raw.get("items"), {"title": _short, "detail": _short, "trailing": lambda v: _short(v, 30),
-                                          "symbol": _symbol, "tint": _tint,
+                                          "symbol": _symbol, "tint": _tint, "bot": _bot,
                                           "done": lambda v: v if isinstance(v, bool) else None}, "title")
         return {"type": kind, "items": items} if items else None
     if kind == "table":
@@ -565,10 +573,10 @@ def build_block(raw) -> dict | None:
             raise ValueError("a sparkline block needs at least two numbers in values")
         return {"type": kind, "values": values, **_clean(raw, {"label": _short, "tint": _tint})}
     if kind == "image":
-        url = _https(raw.get("url"))
-        if not url:
-            raise ValueError("an image block needs an https url")
-        return {"type": kind, "url": url, **_clean(raw, {"alt": _short})}
+        url, bot = _https(raw.get("url")), _bot(raw.get("bot"))
+        if not url and not bot:
+            raise ValueError("an image block needs an https url, or bot with a bot's profile name")
+        return {"type": kind, **({"url": url} if url else {"bot": bot}), **_clean(raw, {"alt": _short})}
     if kind == "divider":
         return {"type": kind}
     if kind == "input":
