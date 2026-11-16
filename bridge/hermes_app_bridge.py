@@ -4385,7 +4385,7 @@ TIDINGS_RUN_SECONDS = 300
 TIDINGS_RETRY_SECONDS = 10
 # Raise this whenever TIDINGS_ASK or TIDINGS_SOUL changes, so a rating can be traced to the words that
 # produced its card.
-TIDINGS_PROMPT = 6
+TIDINGS_PROMPT = 7
 # Ratings and what each run read, kept on this Mac to judge and improve the prompt. Never sent anywhere.
 TIDINGS_EVALS = STATE / "tidings-evals.jsonl"
 TIDINGS_RUNS = STATE / "tidings-runs"
@@ -4458,33 +4458,44 @@ The owner's own words on what they want from this feed, which outrank the advice
 
 
 TIDINGS_LEARNED = """
-What the owner made of earlier cards. Write more like the ones they liked, and steer away from what they
-didn't, taking their words as the reason:
+What the owner made of earlier cards. Write more like the ones they liked or acted on, and steer away from
+what they didn't like, taking their words as the reason. A card they put away without a thumb isn't a
+complaint: it may have been handled already or not needed yet, so it teaches nothing either way.
 {lessons}
 """
 
 
 def tidings_lessons(now: float | None = None) -> str:
-    """The owner's latest thumb on each recent card, as lines for the bot to learn from. Thumbs down come
-    with what was written about them, which is the most useful part."""
+    """The owner's latest thumb on each recent card, and the cards whose button they used, as lines for the
+    bot to learn from. Thumbs down come with what was written about them, which is the most useful part. A
+    thumb says more than a tap, so a card with both is only taught by its thumb. A card put away without its
+    button teaches nothing."""
     if not TIDINGS_EVALS.exists():
         return ""
     since = (now or time.time()) - TIDINGS_LESSON_DAYS * 86400
-    latest = {}
+    latest, acted = {}, {}
     for line in TIDINGS_EVALS.read_text().splitlines()[-4000:]:
         try:
             entry = json.loads(line)
         except ValueError:
             continue
-        if isinstance(entry, dict) and entry.get("type") == "rating" and entry.get("card") and float(entry.get("at") or 0) > since:
+        if not isinstance(entry, dict) or not entry.get("card") or float(entry.get("at") or 0) <= since:
+            continue
+        if entry.get("type") == "rating":
             latest[entry["card"]] = entry  # a later thumb, or taking one back, replaces the earlier
-    lines = {"up": [], "down": []}
+        elif entry.get("type") == "outcome" and entry.get("how") == "done":
+            acted[entry["card"]] = entry
+    lines = {"up": [], "down": [], "acted": []}
     for entry in sorted(latest.values(), key=lambda entry: entry["at"], reverse=True):
         rating = entry.get("rating")
-        if rating in lines and len(lines[rating]) < TIDINGS_LESSONS:
+        if rating in ("up", "down") and len(lines[rating]) < TIDINGS_LESSONS:
             words = f": {entry['note']}" if rating == "down" and entry.get("note") else ""
             lines[rating].append(f"- {'Liked' if rating == 'up' else 'Not useful'}: \"{entry.get('title')}\" ({entry.get('kind')}){words}")
-    return "\n".join(lines["down"] + lines["up"])
+    for entry in sorted(acted.values(), key=lambda entry: entry["at"], reverse=True):
+        if (latest.get(entry["card"]) or {}).get("rating") in ("up", "down") or len(lines["acted"]) >= TIDINGS_LESSONS:
+            continue
+        lines["acted"].append(f"- Acted on: \"{entry.get('title')}\" ({entry.get('kind')})")
+    return "\n".join(lines["down"] + lines["up"] + lines["acted"])
 
 
 def tidings_number(value, name: str) -> int:
