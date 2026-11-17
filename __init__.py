@@ -204,6 +204,15 @@ SCHEMA = {
                             "tools.")},
                         "done": {"type": "string", "description": "Short status the card shows once call has run, such as 'Marked done'."},
                         "show": {"type": "boolean", "description": "Show what call returned in the chat, for a read the user wants to see."},
+                        "solo": {"type": "boolean", "description": (
+                            "Run this button's message on its own when tapped: a short session of yours just for it, "
+                            "apart from this chat, so several taps run at once and its result shows on the card. Only "
+                            "for a message that is a whole instruction by itself, naming who and what (such as 'Draft "
+                            "a reply to Ayush saying Thursday works'), never one that leans on the chat ('yes', 'the "
+                            "second one'). It may draft, update records and look things up, but never send.")},
+                        "about": {"type": "string", "description": (
+                            "With solo: who or what the button is about, such as an email address or a thread, so "
+                            "taps about the same thing take turns.")},
                     },
                     "required": ["label"],
                 },
@@ -370,6 +379,12 @@ def build_card(args):
             action["url"] = link
         if call:
             action.update(call)
+        if raw.get("solo") is True:
+            if not message or call:
+                raise ValueError(f"action {action['label']!r} can run on its own only with a message, and no call")
+            action["solo"] = True
+            if (about := _short(raw.get("about"), 120)):
+                action["about"] = about
         actions.append(action)
     if len({a["style"] == "option" for a in actions}) > 1:
         raise ValueError("use option actions or buttons on a card, not both")
@@ -1388,10 +1403,29 @@ def on_post_llm_call(session_id=None, user_message=None, assistant_response=None
     _emit(**event)
 
 
+SOLO_RESULTS = re.compile(r"^\[Card results: (\{.*\})\]$", re.DOTALL)
+
+
+def solo_results(user_message: str) -> str | None:
+    """The bridge's note of what solo card taps did, as this turn's whole reply, or None when this isn't one.
+    It reaches the bot's history as an ordinary turn, so the bot knows later what was done."""
+    found = SOLO_RESULTS.match((user_message or "").replace(APP_MARKER, "").strip())
+    if not found:
+        return None
+    try:
+        summary = json.loads(found.group(1)).get("summary")
+    except (ValueError, AttributeError):
+        return None
+    return _text(summary) or None
+
+
 def on_pre_llm_call(user_message=None, session_id=None, conversation_history=None, **_kwargs):
     # A tapped card button that runs a connector tool: done here, in this bot's own turn, with no model call.
     if isinstance(user_message, str) and (outcome := run_card_call(user_message, conversation_history)) is not None:
         return {"action": "block", "message": outcome}
+    # The bridge's note of what tapped solo buttons did: kept in the chat as it is, with no model call.
+    if isinstance(user_message, str) and (summary := solo_results(user_message)) is not None:
+        return {"action": "block", "message": summary}
     if isinstance(user_message, str) and user_message.rstrip(" \n").endswith(APP_MARKER):
         # Tells the bridge to watch this turn, so an approval can reach the phone even if the app closes.
         _emit(type="app_turn", session=session_id)

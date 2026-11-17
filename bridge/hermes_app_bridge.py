@@ -2983,6 +2983,252 @@ def archived_sessions(profile: str) -> list[dict]:
             for row_id, title, source, active, count in rows]
 
 
+# ---- Card buttons that run on their own. A button marked "solo" carries a whole instruction, so it doesn't need
+# the chat around it. Tapping one starts a short session of that bot just for it, apart from its main chat, so
+# several taps run side by side instead of waiting their turn. The phone only says "this button on that card";
+# what runs is the message the bot put on the card, read back from the bot's own history. Each result settles on
+# its card. A minute after the last one settles, one line goes into the main chat saying what was done, so the
+# bot knows. The short session is archived when it ends.
+SOLO_LOG = STATE / "card-solo.jsonl"
+SOLO_PARALLEL = 4
+SOLO_RUN_SECONDS = 240
+SOLO_SUMMARY_QUIET = 45
+SOLO_KEPT_SECONDS = 6 * 3600
+SOLO_RESULTS_PREFIX = "[Card results:"
+solo_lock = threading.Lock()
+solo_jobs: dict[str, dict] = {}
+solo_slots = threading.BoundedSemaphore(SOLO_PARALLEL)
+solo_about_locks: dict[str, threading.Lock] = {}
+solo_summary_timers: dict[str, threading.Timer] = {}
+
+SOLO_ASK = """You're doing one task the user started by tapping a button on one of your cards in the Hermit app. It
+runs on its own, apart from your main chat, so other taps can run at the same time. Do it now, then stop.
+
+The card: "{title}"
+What it showed:
+{shown}
+
+The button "{label}" asks you to:
+{message}
+
+Rules for a task started this way:
+- Do only what the button asks. Don't start anything else, and don't make cards.
+- You may do what the user could quietly undo: save an email draft (never send it), update a note or a record,
+  set a follow-up, label or file something, look something up.
+- Never send anything to a person (email, text, chat, post), never accept, decline or change an invitation, and
+  never spend, sign, delete, archive or unsubscribe. If the task needs one of those, do the safe part (such as
+  saving the draft) and say what is left for the user.
+- If it's unclear what the user meant, or you find more than one match, don't guess: change nothing and say
+  what you need.
+
+End your answer with one line of JSON and nothing after it:
+{{"result": "what happened, under 70 characters, such as Reply drafted to Ayush", "link": "an https link to what you made or changed, or empty", "needs_you": "what is left for the user, or empty"}}"""
+
+
+def solo_card_action(profile: str, session_id: str, card_id: str, label: str) -> tuple[dict, dict] | None:
+    """The card and its solo button, from the bot's own history, or None when that isn't a solo button there."""
+    database = homes()[profile] / "state.db"
+    if not str(card_id).isdigit() or not database.exists():
+        return None
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
+            row = connection.execute("select content from messages where id=? and session_id=? and tool_name='hermes_card'",
+                                     (int(card_id), session_id)).fetchone()
+        card = json.loads(row[0]).get("card") if row else None
+    except (sqlite3.Error, ValueError, AttributeError, TypeError):
+        return None
+    for action in (card or {}).get("actions") or []:
+        if isinstance(action, dict) and action.get("label") == label and action.get("solo") is True and action.get("message"):
+            return card, action
+    return None
+
+
+def solo_shown(card: dict) -> str:
+    shown = {key: value for key, value in card.items() if key not in ("actions", "id", "kind", "data")}
+    return clipped(json.dumps(shown, ensure_ascii=False), 3000)
+
+
+def solo_outcome(output: str) -> dict:
+    """What a run did, from its stream of events: the line of JSON it ends with, or failing that its first words."""
+    result = {}
+    for line in (output or "").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event
+    text = str(result.get("text") or "").strip()
+    found = {}
+    for line in reversed(text.splitlines()):
+        try:
+            found = json.loads(line.strip())
+        except ValueError:
+            continue
+        if isinstance(found, dict):
+            break
+        found = {}
+    side = str(result.get("session_id") or "")
+    if not result or str(result.get("exit_code")) not in ("0", "None") or (not text and result.get("error")):
+        return {"ok": False, "side": side, "problem": clipped(str(result.get("error") or "It stopped before finishing."), 160)}
+    words = str(found.get("result") or "").strip() or clipped(text.splitlines()[0] if text else "Done", 70)
+    link = str(found.get("link") or "").strip()
+    return {"ok": True, "side": side, "result": clipped(words, 90), "link": link if link.startswith("https://") else "",
+            "needs_you": clipped(str(found.get("needs_you") or "").strip(), 160)}
+
+
+def solo_view(job: dict) -> dict:
+    return {key: job.get(key) for key in ("id", "card", "label", "status", "result", "link", "needs_you", "problem",
+                                          "tapped", "settled")}
+
+
+def solo_note(**entry) -> None:
+    try:
+        with SOLO_LOG.open("a") as file:
+            file.write(json.dumps({"at": time.time(), **entry}) + "\n")
+    except OSError:
+        pass
+
+
+def profile_api(profile: str, method: str, path: str, body: dict | None = None, timeout: float = 30) -> int:
+    """Calls a bot's own Hermes API with its key, the way the app's requests are passed on. The status, or 0."""
+    port, prefix = api_address(profile)
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request(method, prefix + path, body=json.dumps(body).encode() if body is not None else None,
+                           headers={"Authorization": f"Bearer {api_key(homes()[profile])}", "Content-Type": "application/json"})
+        answer = connection.getresponse()
+        answer.read()
+        return answer.status
+    except (OSError, http.client.HTTPException):
+        return 0
+    finally:
+        connection.close()
+
+
+def solo_message(message: str, inputs) -> str:
+    """{{input.x}} in the bot's message becomes what was typed on the card, as it does when the app sends it."""
+    def value(found):
+        given = inputs.get(found.group(1)) if isinstance(inputs, dict) else None
+        return clipped(str(given), 500) if isinstance(given, (str, int, float)) else ""
+    return re.sub(r"\{\{\s*input\.([A-Za-z0-9_-]{1,40})\s*\}\}", value, message)
+
+
+def start_solo(profile: str, session_id: str, card_id: str, label: str, run=subprocess.run, inputs=None) -> dict:
+    """Starts a tapped solo button, or returns the run already going for it. Raises KeyError if it isn't one."""
+    found = solo_card_action(profile, session_id, card_id, label)
+    if not found:
+        raise KeyError(label)
+    card, action = found
+    with solo_lock:
+        now = time.time()
+        for old in [key for key, job in solo_jobs.items() if now - job["tapped"] > SOLO_KEPT_SECONDS]:
+            solo_jobs.pop(old, None)
+        for job in solo_jobs.values():
+            if (job["session"], job["card"], job["label"]) == (session_id, str(card_id), label) \
+                    and job["status"] in ("queued", "working"):
+                return solo_view(job)
+        job = {"id": uuid.uuid4().hex[:12], "profile": profile, "session": session_id, "card": str(card_id),
+               "label": label, "title": card.get("title") or "", "about": clipped(str(action.get("about") or ""), 120),
+               "status": "queued", "tapped": now, "message": solo_message(action["message"], inputs)}
+        solo_jobs[job["id"]] = job
+        timer = solo_summary_timers.pop(session_id, None)
+    if timer:
+        timer.cancel()
+    threading.Thread(target=run_solo, args=(job, card, action, run), daemon=True).start()
+    return solo_view(job)
+
+
+def run_solo(job: dict, card: dict, action: dict, run=subprocess.run) -> None:
+    key = f"{job['profile']}:{(job['about'] or job['card']).lower()}"
+    with solo_lock:
+        about = solo_about_locks.setdefault(key, threading.Lock())
+    outcome = {"ok": False, "problem": "It couldn't start."}
+    with about, solo_slots:  # taps about the same thing take turns; everything else runs side by side
+        with solo_lock:
+            job.update(status="working", started=time.time())
+        handle, name = tempfile.mkstemp(prefix="card-solo.", suffix=".txt")
+        query = pathlib.Path(name)
+        try:
+            with os.fdopen(handle, "w") as file:
+                file.write(SOLO_ASK.format(title=job["title"], shown=solo_shown(card), label=job["label"],
+                                           message=job["message"]))
+            done = run([hermes_binary(), "-p", job["profile"], "chat", "-Q", "--oneshot", "--query-file", str(query),
+                        "--source", "tool", "--format", "stream-json", "--max-turns", "25"],
+                       capture_output=True, text=True, timeout=SOLO_RUN_SECONDS + 60, stdin=subprocess.DEVNULL)
+            outcome = solo_outcome(done.stdout)
+        except subprocess.TimeoutExpired:
+            outcome = {"ok": False, "problem": "It took too long, so it was stopped."}
+        except OSError as error:
+            outcome = {"ok": False, "problem": f"It couldn't start: {type(error).__name__}."}
+        finally:
+            query.unlink(missing_ok=True)
+    with solo_lock:
+        job.update(status="done" if outcome.get("ok") else "failed", settled=time.time(),
+                   **{k: v for k, v in outcome.items() if k in ("result", "link", "needs_you", "problem", "side")})
+    solo_note(type="run", profile=job["profile"], card=job["card"], label=job["label"], ok=bool(outcome.get("ok")),
+              tapped=job["tapped"], started=job.get("started"), settled=job["settled"],
+              seconds=round(job["settled"] - job["tapped"], 1), waited=round((job.get("started") or job["tapped"]) - job["tapped"], 1))
+    if job.get("side"):  # the short session's work is done; keep it, out of sight
+        profile_api(job["profile"], "PATCH", f"/api/sessions/{job['side']}", {"archived": True})
+    schedule_solo_summary(job["profile"], job["session"])
+
+
+def schedule_solo_summary(profile: str, session_id: str, quiet: float = SOLO_SUMMARY_QUIET) -> None:
+    with solo_lock:
+        old = solo_summary_timers.pop(session_id, None)
+        timer = threading.Timer(quiet, send_solo_summary, (profile, session_id))
+        timer.daemon = True
+        solo_summary_timers[session_id] = timer
+    if old:
+        old.cancel()
+    timer.start()
+
+
+def solo_summary(jobs: list[dict]) -> str:
+    done = [job for job in jobs if job["status"] == "done" and not job.get("needs_you")]
+    needs = [job for job in jobs if job["status"] == "done" and job.get("needs_you")]
+    failed = [job for job in jobs if job["status"] == "failed"]
+    counts = [f"{len(done)} done"] + ([f"{len(needs)} need you"] if needs else []) + ([f"{len(failed)} didn't work"] if failed else [])
+    lines = [f"From your cards: {', '.join(counts)}."]
+    for job in done + needs:
+        words = f"[{job['result']}]({job['link']})" if job.get("link") else job["result"]
+        lines.append(f"- {words}" + (f" (needs you: {job['needs_you']})" if job.get("needs_you") else ""))
+    for job in failed:
+        lines.append(f"- \"{job['label']}\" on \"{job['title']}\" didn't work: {job.get('problem')}")
+    return "\n".join(lines)
+
+
+def send_solo_summary(profile: str, session_id: str) -> None:
+    """One line in the main chat for every solo tap settled since the last, so the bot knows what was done. The
+    hermes-cards plugin answers it with no model turn."""
+    with solo_lock:
+        jobs = [job for job in solo_jobs.values() if job["session"] == session_id and not job.get("summarized")]
+        if not jobs or any(job["status"] in ("queued", "working") for job in jobs):
+            return  # the last one to settle schedules it again
+        for job in jobs:
+            job["summarized"] = True
+    items = [{key: job.get(key) for key in ("title", "label", "result", "link", "needs_you", "problem", "status")} for job in jobs]
+    marker = SOLO_RESULTS_PREFIX + " " + json.dumps({"summary": solo_summary(jobs), "items": items}, ensure_ascii=False) + "]"
+    status = profile_api(profile, "POST", "/v1/runs", {"input": marker, "session_id": session_id})
+    solo_note(type="summary", profile=profile, count=len(jobs), status=status)
+
+
+def solo_state(session_id: str) -> list[dict]:
+    with solo_lock:
+        return [solo_view(job) for job in solo_jobs.values() if job["session"] == session_id]
+
+
+def solo_ack(job_id: str, how: str) -> None:
+    """Got it, or Talk about this: kept as a sign of which results were wanted as they were."""
+    with solo_lock:
+        job = solo_jobs.get(job_id)
+    if job:
+        solo_note(type="ack", how="talk" if how == "talk" else "ok", profile=job["profile"], card=job["card"],
+                  label=job["label"], result=job.get("result"))
+
+
+
 JOB_HOURS = 24
 LOG_LINE = re.compile(r"^(\d\d:\d\d:\d\d) (\w+)\s*\| ?(.*)$")
 
@@ -6140,6 +6386,11 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, {"kinds": card_kinds()})
+        if url.path == "/cards/solo":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            session_id = (parse_qs(url.query).get("session") or [""])[0]
+            return self.json(200, {"jobs": solo_state(session_id)})
         if url.path == "/groups":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -6623,6 +6874,23 @@ class Handler(BaseHTTPRequestHandler):
             except (KeyError, ValueError, AttributeError, OSError):
                 return self.json(404, {"error": {"message": "That card design isn't there any more."}})
             return self.json(200, {"kinds": card_kinds()})
+        if path in ("/cards/solo", "/cards/solo/ack"):
+            data = self.body(8192)
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            try:
+                fields = json.loads(data or b"{}")
+                if path == "/cards/solo/ack":
+                    solo_ack(str(fields.get("job") or ""), str(fields.get("how") or ""))
+                    return self.json(200, {})
+                profile = str(fields.get("bot") or "")
+                if profile not in homes():
+                    raise KeyError(profile)
+                job = start_solo(profile, str(fields.get("session") or ""), str(fields.get("card") or ""),
+                                 str(fields.get("label") or ""), inputs=fields.get("inputs"))
+            except (KeyError, ValueError, AttributeError, TypeError):
+                return self.json(404, {"error": {"message": "That button can't run on its own."}})
+            return self.json(200, {"job": job})
         if path == "/integrations":
             data = self.body()
             if not authorized(header):
