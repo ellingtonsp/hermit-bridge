@@ -3199,6 +3199,29 @@ def solo_summary(jobs: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def bot_chat_session(profile: str) -> str | None:
+    """The bot's own Bot Chat as it stands now: the session titled so, followed to its newest continuation.
+    A card from a routine lives in the routine's session, which takes no turns from outside."""
+    database = homes()[profile] / "state.db"
+    if not database.exists():
+        return None
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
+            row = connection.execute("select id from sessions where title='Bot Chat' order by started_at desc limit 1").fetchone()
+            if not row:
+                return None
+            tip = row[0]
+            for _ in range(50):
+                child = connection.execute("select id from sessions where parent_session_id=? order by started_at desc limit 1",
+                                           (tip,)).fetchone()
+                if not child:
+                    break
+                tip = child[0]
+            return tip
+    except sqlite3.Error:
+        return None
+
+
 def send_solo_summary(profile: str, session_id: str) -> None:
     """One line in the main chat for every solo tap settled since the last, so the bot knows what was done. The
     hermes-cards plugin answers it with no model turn."""
@@ -3210,8 +3233,12 @@ def send_solo_summary(profile: str, session_id: str) -> None:
             job["summarized"] = True
     items = [{key: job.get(key) for key in ("title", "label", "result", "link", "needs_you", "problem", "status")} for job in jobs]
     marker = SOLO_RESULTS_PREFIX + " " + json.dumps({"summary": solo_summary(jobs), "items": items}, ensure_ascii=False) + "]"
-    status = profile_api(profile, "POST", "/v1/runs", {"input": marker, "session_id": session_id})
-    solo_note(type="summary", profile=profile, count=len(jobs), status=status)
+    # Into the bot's main chat, where it will be asked about later, even when the cards came from a routine.
+    target = bot_chat_session(profile) or session_id
+    status = profile_api(profile, "POST", "/v1/runs", {"input": marker, "session_id": target})
+    if target != session_id and not 200 <= status < 300:
+        status = profile_api(profile, "POST", "/v1/runs", {"input": marker, "session_id": session_id})
+    solo_note(type="summary", profile=profile, count=len(jobs), status=status, chat=target)
 
 
 def solo_state(session_id: str) -> list[dict]:
