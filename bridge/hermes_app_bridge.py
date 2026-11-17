@@ -3447,22 +3447,48 @@ def session_counts(home: pathlib.Path, session_id: str, read_at: float,
                 "order by timestamp desc, id desc limit 400", (session_id, time.time() - NEEDS_DAYS * 86400)).fetchall()
     except sqlite3.Error:
         return 0, []
-    needs, said = [], set()
+    closed = closed or set()
+    cards, said = [], set()
     replies_since, now = 0, time.time()
     for row_id, role, tool, content, stamp in rows:  # newest first, so `said` holds what came after
         if role == "user":
             said.add(reply_text(content))
         elif role == "assistant" and not tool and str(content or "").strip():
             replies_since += 1
-        elif tool == "hermes_card" and str(row_id) not in (closed or set()) and (need := card_need(content)):
+        elif tool == "hermes_card" and (need := card_need(content)):
             answers = set(need.pop("answers")) | set(CARD_RESULTS)
-            if not answers & said:
-                need["card"] = str(row_id)
-                # From the turn that just ended: nothing said by you since, at most its own reply after it,
-                # and recent. An older card still waits in the inbox, but it isn't this reply's question.
-                need["fresh"] = not said and replies_since <= 1 and now - float(stamp or 0) <= FRESH_CARD_SECONDS
-                needs.append(need)
+            # From the turn that just ended: nothing said by you since, at most its own reply after it,
+            # and recent. An older card still waits in the inbox, but it isn't this reply's question.
+            fresh = not said and replies_since <= 1 and now - float(stamp or 0) <= FRESH_CARD_SECONDS
+            settled = str(row_id) in closed or bool(answers & said)
+            cards.append((str(row_id), card_identity(content), need, fresh, settled))
+    # When a chat is compacted, Hermes writes its history again: a card's copy gets a new time while your
+    # answer keeps its own, so the copy looks unanswered. A copy is as settled as the first one written.
+    first = {}
+    for row_id, (same, _), _need, _fresh, settled in reversed(cards):  # oldest first
+        first.setdefault(same, settled)
+    needs, shown = [], set()
+    for row_id, (same, card_id), need, fresh, settled in cards:  # newest first
+        # A card sent again with the same id updates the one on screen, so only the newest one can wait.
+        # Copies of one card wait once too.
+        if (card_id or same) in shown:
+            continue
+        shown.add(card_id or same)
+        if settled or first.get(same):
+            continue
+        need["card"] = row_id
+        need["fresh"] = fresh
+        needs.append(need)
     return unread, needs
+
+
+def card_identity(content: str | None) -> tuple[str, str]:
+    """The card exactly as sent, to recognize a copy, and its id, to recognize an update in place."""
+    try:
+        card = json.loads(content or "").get("card") or {}
+    except (ValueError, AttributeError):
+        return content or "", ""
+    return json.dumps(card, sort_keys=True), str(card.get("id") or "")
 
 
 def inbox_item(profile: str, session_id: str, state: dict) -> dict:
