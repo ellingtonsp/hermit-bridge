@@ -126,6 +126,9 @@ MAX_FILE = 512_000
 FILE_HISTORY_KEPT = 5
 LINKS = STATE / "links.json"
 INTEGRATIONS = STATE / "integrations.json"
+# What Hermit may watch on its own, without being asked: each source and each bot's connectors. All off
+# until the owner turns one on, and only a device's own key can turn one on. See WATCH_SOURCES.
+WATCHING = STATE / "watching.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
@@ -4816,7 +4819,8 @@ def tidings_state() -> dict:
     model = saved.get("model") if isinstance(saved.get("model"), dict) else None
     # On unless switched off. Before any bot or source is chosen a run reads nothing and asks nothing.
     return {"on": saved.get("on") is not False, "web": saved.get("web") is True,
-            "calendar": saved.get("calendar") is True, "reminders": saved.get("reminders") is True,
+            # Calendar and Reminders are Watching's switches now, shared with everything that watches.
+            "calendar": watching_on("calendar"), "reminders": watching_on("reminders"),
             "allowed": [name for name in saved.get("allowed") or [] if isinstance(name, str)],
             "model": model, "cards": [card for card in saved.get("cards") or [] if isinstance(card, dict)],
             "closed": saved.get("closed") if isinstance(saved.get("closed"), dict) else {},
@@ -4835,7 +4839,8 @@ def tidings_state() -> dict:
 
 def save_tidings(state: dict) -> None:
     TIDINGS_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    write_json(TIDINGS_STATE, state)
+    # Calendar and Reminders live in Watching. They're left out so a stale copy here can't come back.
+    write_json(TIDINGS_STATE, {key: value for key, value in state.items() if key not in TIDINGS_SOURCES})
 
 
 def default_model() -> dict | None:
@@ -4910,9 +4915,18 @@ def ensure_tidings(run=subprocess.run) -> None:
 def change_tidings(fields: dict) -> dict:
     with tidings_lock:
         state = tidings_state()
-        for name in ("on", "web", "calendar", "reminders", "asks", "thumbs", "learns"):
+        for name in ("on", "web", "asks", "thumbs", "learns"):
             if isinstance(fields.get(name), bool):
                 state[name] = fields[name]
+        # An app from before Watching still sets these here, so they go to Watching, where they're kept.
+        shared = {name: fields[name] for name in TIDINGS_SOURCES if isinstance(fields.get(name), bool)}
+        if shared:
+            with watching_lock:
+                watching = watching_state()
+                watching["sources"].update(shared)
+                WATCHING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                write_json(WATCHING, watching)
+            state.update(shared)
         if isinstance(fields.get("kinds"), list):
             state["kinds"] = [kind for kind in TIDINGS_KINDS if kind in fields["kinds"]]
         if isinstance(fields.get("guide"), str):
@@ -5422,6 +5436,145 @@ def take_integrations(fields: dict, sender: str) -> dict:
                 print("integrations: " + ", ".join(f"{key} {'on' if sent[key] else 'off'}" for key in changed), flush=True)
     return settings
 
+
+# Every source Hermit may watch without being asked, in the order Settings shows them. "where" is where it's
+# read: the phone sends what it sees, the Mac reads its own. "uses" names what reads it today, so Settings can
+# say so; a source nothing reads yet says that instead.
+WATCH_SOURCES = {
+    "calendar": {"title": "Calendar", "where": "phone", "uses": ["Tidings"],
+                 "detail": "Your events for the next two weeks"},
+    "reminders": {"title": "Reminders", "where": "phone", "uses": ["Tidings"],
+                  "detail": "Reminders you haven't ticked off"},
+    "location": {"title": "Places", "where": "phone", "uses": [],
+                 "detail": "When you arrive at or leave a place you've saved, never a trail of where you go"},
+    "focus": {"title": "Focus", "where": "phone", "uses": [],
+              "detail": "Which Focus is on"},
+    "mail": {"title": "Mail", "where": "mac", "uses": [],
+             "detail": "New mail: who it's from, the subject and the first lines"},
+    "messages": {"title": "Messages", "where": "mac", "uses": [],
+                 "detail": "New texts: who they're from and the first lines"},
+    "notes": {"title": "Notes", "where": "mac", "uses": [],
+              "detail": "Notes you add or change"},
+}
+WATCH_CONNECTOR_SECONDS = 8
+watching_lock = threading.Lock()
+
+
+def watching_state() -> dict:
+    """The saved switches. Before the first save, Calendar and Reminders carry over from Tidings, where they
+    used to live, so turning this on changes nothing the owner had chosen."""
+    try:
+        saved = read_json(WATCHING) if WATCHING.exists() else None
+    except (OSError, ValueError):
+        saved = {}
+    if saved is None:
+        try:
+            earlier = read_json(TIDINGS_STATE) if TIDINGS_STATE.exists() else {}
+        except (OSError, ValueError):
+            earlier = {}
+        saved = {"sources": {name: earlier.get(name) is True for name in ("calendar", "reminders")}}
+        # Kept at once: Tidings stops saving these, so the carried-over choice must not depend on it.
+        try:
+            WATCHING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json(WATCHING, saved)
+        except OSError:
+            pass
+    sources = saved.get("sources") if isinstance(saved.get("sources"), dict) else {}
+    connectors_on = saved.get("connectors") if isinstance(saved.get("connectors"), dict) else {}
+    return {"sources": {name: sources.get(name) is True for name in WATCH_SOURCES},
+            "connectors": {key: True for key, value in connectors_on.items() if isinstance(key, str) and value is True}}
+
+
+def watching_on(source: str) -> bool:
+    """Whether Hermit may watch this source. Anything unknown is off."""
+    return watching_state()["sources"].get(source, False)
+
+
+def connector_key(profile: str, name: str) -> str:
+    return f"{profile}/{name}"
+
+
+def connector_watched(profile: str, name: str) -> bool:
+    """Whether the bot that owns this connector may watch it. Its sign-in stays with that bot."""
+    return connector_key(profile, name) in watching_state()["connectors"]
+
+
+def watch_connectors(listing=None) -> list[dict]:
+    """Each bot's connectors, asked of all of them at once, so one slow gateway doesn't hold up the rest. A bot
+    whose gateway doesn't answer in time is listed without them, and says so."""
+    listing = listing or connectors
+    known = {name: home for name, home in homes().items() if name != TIDINGS}
+    results: dict[str, list | None] = {}
+
+    def ask(name: str) -> None:
+        try:
+            results[name] = listing(name)
+        except Exception as error:  # a gateway that's down or old: shown as unavailable, never fatal
+            print(f"watching: {name} connectors unavailable ({type(error).__name__})", flush=True)
+            results[name] = None
+
+    threads = [threading.Thread(target=ask, args=(name,), daemon=True) for name in known]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + WATCH_CONNECTOR_SECONDS
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    watched = watching_state()["connectors"]
+    bots = []
+    for name, home in sorted(known.items()):
+        found = results.get(name)
+        if found == []:
+            continue
+        rows = [{"name": row["name"], "ready": row.get("status") not in ("failed", "error") and not row.get("needs_auth"),
+                 "on": connector_key(name, row["name"]) in watched}
+                for row in found or [] if isinstance(row, dict) and isinstance(row.get("name"), str) and row.get("enabled", True)]
+        if found is not None and not rows:
+            continue
+        bots.append({"bot": name, "title": bot_info(name, home)["title"] or name, "available": found is not None,
+                     "connectors": rows})
+    return bots
+
+
+def watching_view(listing=None) -> dict:
+    state = watching_state()
+    return {"sources": [{"id": name, **info, "on": state["sources"][name]} for name, info in WATCH_SOURCES.items()],
+            "bots": watch_connectors(listing)}
+
+
+def change_watching(fields: dict, device: str | None) -> dict:
+    """Turns sources and connectors on or off. Off works with any key; on needs a device's own key, since a bot
+    holds its profile's key and mustn't be able to widen what Hermit reads."""
+    sources = fields.get("sources") if isinstance(fields.get("sources"), dict) else {}
+    connectors_sent = fields.get("connectors") if isinstance(fields.get("connectors"), dict) else {}
+    wanted = {name: value for name, value in sources.items() if name in WATCH_SOURCES and isinstance(value, bool)}
+    known = homes()
+    wanted_connectors = {}
+    for key, value in connectors_sent.items():
+        profile, _, name = key.partition("/") if isinstance(key, str) else ("", "", "")
+        if profile in known and profile != TIDINGS and name and len(name) <= 128 and isinstance(value, bool):
+            wanted_connectors[key] = value
+    if device is None and (any(wanted.values()) or any(wanted_connectors.values())):
+        raise PermissionError("Turn watching on from the app, on a device paired with its own key.")
+    with watching_lock:
+        state = watching_state()
+        state["sources"].update(wanted)
+        for key, value in wanted_connectors.items():
+            if value:
+                state["connectors"][key] = True
+            else:
+                state["connectors"].pop(key, None)
+        WATCHING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(WATCHING, state)
+    changed = [f"{name} {'on' if value else 'off'}" for name, value in {**wanted, **wanted_connectors}.items()]
+    if changed:
+        print("watching: " + ", ".join(changed), flush=True)
+    # Tidings forgets what a device had sent for a source that's now off.
+    if any(name in TIDINGS_SOURCES and value is False for name, value in wanted.items()):
+        with tidings_lock:
+            kept = {name: value for name, value in tidings_context().items() if state["sources"].get(name)}
+            if kept != tidings_context():
+                write_json(TIDINGS_CONTEXT, kept)
+    return state
 
 def recap_chat(home: pathlib.Path, session_id: str) -> tuple[str, str, int]:
     """The end of one chat as lines to read, the id of its newest message, and how many messages that is."""
@@ -6435,6 +6588,10 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, integrations_view())
+        if url.path == "/watching":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            return self.guarded(watching_view)
         if url.path == "/cards/kinds":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -6957,6 +7114,23 @@ class Handler(BaseHTTPRequestHandler):
             sender = hashlib.sha256("\n".join(self.headers.get(name) or "" for name in
                                               ("Authorization", "User-Agent", "X-Forwarded-For")).encode()).hexdigest()
             return self.json(200, take_integrations(fields, sender))
+        if path == "/watching":
+            data = self.body()
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            try:
+                fields = json.loads(data or b"{}")
+            except ValueError:
+                fields = None
+            if not isinstance(fields, dict):
+                return self.json(400, {"error": {"message": "That request couldn't be read"}})
+            token = (header or "").removeprefix("Bearer ").strip()
+            device = device_for(token) if token.startswith(DEVICE_PREFIX) else None
+            try:
+                change_watching(fields, device)
+            except PermissionError as error:
+                return self.json(403, {"error": {"message": str(error)}})
+            return self.guarded(watching_view)
         if path == "/live/register":
             return self.live_register(header)
         if path == "/inbox/state" or path == "/inbox/read" or path == "/inbox/close":
