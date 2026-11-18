@@ -6859,6 +6859,75 @@ def push(profile: str, reply: str, data: dict | None = None, category: str | Non
     settle_devices(gone, relay_tokens, refused, reached)
 
 
+# A bot can ring at most this often, so a loop or a chatty routine can't keep the phone ringing.
+RING_GAP_SECONDS = 300
+last_rings: dict[str, float] = {}
+rings_lock = threading.Lock()
+
+
+def may_ring(device: dict, profile: str, routine: str | None, asked: bool) -> bool:
+    """A routine the owner set to call them, or a bot that asked to, on a device that allows calls from bots.
+    A muted bot or routine never rings."""
+    if not device.get("voip_token") or is_muted(device, profile, routine):
+        return False
+    if routine and f"{profile}/{routine}" in device.get("ringing_routines", []):
+        return True
+    return asked and bool(device.get("rings"))
+
+
+def ring(profile: str, session_id: str | None, reason: str, routine: str | None = None, asked: bool = False,
+         only: str | None = None) -> int:
+    """Rings the phones that allow it with a VoIP push, which the app turns into an incoming call. `only`
+    rings one device's token, for the test in Settings. Returns how many Apple accepted."""
+    if not only:
+        with rings_lock:
+            if time.time() - last_rings.get(profile, 0) < RING_GAP_SECONDS:
+                print(f"ring {profile}: too soon", flush=True)
+                return 0
+            last_rings[profile] = time.time()
+    if use_relay():
+        # Hermit's relay carries notifications, not calls. The notification still goes out.
+        print(f"ring {profile}: the relay can't carry calls", flush=True)
+        return 0
+    config = json.loads(APNS_CONFIG.read_text())
+    home = homes().get(profile)
+    title = (bot_info(profile, home)["title"] if home else None) or profile.replace("-", " ").title()
+    body = json.dumps({"profile": profile, "session": session_id or "", "name": title,
+                       "reason": (reason or routine or "")[:120], "id": str(uuid.uuid4())})
+    authorization = apns_token(config)
+    reached = 0
+    for device in load_devices():
+        if only:
+            if device.get("voip_token") != only:
+                continue
+        elif not may_ring(device, profile, routine, asked):
+            continue
+        host = "api.sandbox.push.apple.com" if device.get("sandbox") else "api.push.apple.com"
+        topic = push_topic(device.get("topic"), config["topic"]) + ".voip"
+        result = subprocess.run(
+            ["curl", "-s", "--http2", "-m", "10", "-w", "\n%{http_code}", "-K", "-",
+             "-d", body, f"https://{host}/3/device/{device['voip_token']}"],
+            input=f'header = "authorization: bearer {authorization}"\n'
+                  f'header = "apns-topic: {topic}"\nheader = "apns-push-type: voip"\n'
+                  f'header = "apns-priority: 10"\nheader = "apns-expiration: 0"\n',
+            capture_output=True, text=True)
+        status, why = apns_outcome(result.stdout)
+        reached += status == "200"
+        print(f"ring {profile}: {status}{' ' + why if why else ''}", flush=True)
+    return reached
+
+
+def ring_after_turn(session_id: str, event: dict) -> None:
+    """After a finished turn: a call the bot asked for, or a routine set to call. Not while the chat is open."""
+    owner = session_owner(session_id)
+    if not owner or on_screen(session_id):
+        return
+    profile = owner[0]
+    chat = session_id if owner[1] == "Bot Chat" else bot_chat_session(profile)
+    asked = event.get("ring") is not None
+    ring(profile, chat, str(event.get("ring") or ""), event.get("routine"), asked)
+
+
 def publish(session_id: str, event: dict) -> bool:
     with lock:
         listeners = list(subscribers.get(session_id, []))
@@ -6900,6 +6969,9 @@ def udp_loop() -> None:
                 if reply and reply not in SILENT_REPLIES and owner and owner[1] == "Bot Chat":
                     threading.Thread(target=reply_push, args=(owner[0], session_id, reply, event.get("routine")),
                                      daemon=True).start()
+            if event.get("type") == "turn" and (event.get("ring") is not None or event.get("routine")) \
+                    and (event.get("reply") or "").strip() not in SILENT_REPLIES:
+                threading.Thread(target=ring_after_turn, args=(session_id, event), daemon=True).start()
         except Exception as error:  # one bad datagram must never stop the loop
             print(f"event error: {type(error).__name__}", flush=True)
 
@@ -7645,6 +7717,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, devices_view(header))
         if path == "/devices":
             return self.register_device(header)
+        if path == "/calls/test":
+            # Settings' "Try a call": rings only the device that asked, through the same path a bot uses.
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            fields = json.loads(self.body() or b"{}")
+            token, profile = str(fields.get("voip_token") or ""), str(fields.get("profile") or "")
+            if not re.fullmatch(r"[0-9a-f]{32,200}", token) or profile not in homes():
+                return self.json(400, {"error": {"message": "This device hasn't registered for calls yet."}})
+            reached = ring(profile, bot_chat_session(profile), "Testing calls from Hermit", only=token)
+            return self.json(200 if reached else 502, {"rang": reached})
         if path == "/updates/bridge":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -8136,9 +8218,14 @@ class Handler(BaseHTTPRequestHandler):
         muted_until = {str(name)[:64]: float(end) for name, end in list(until.items())[:64]
                        if isinstance(end, (int, float)) and end > time.time()}
         push_key = str(body.get("push_key") or "")
+        # Calls: the token PushKit gave this install, whether bots may ring it, and routines that always do.
+        voip_token = str(body.get("voip_token") or "")
+        ringing = [str(name)[:200] for name in (body.get("ringing_routines") or [])][:200]
         entry = {"token": token, "sandbox": bool(body.get("sandbox")), "muted": muted,
                  "topic": push_topic(body.get("topic"), ""),
                  "muted_routines": muted_routines, "muted_until": muted_until,
+                 "rings": bool(body.get("rings")), "ringing_routines": ringing,
+                 **({"voip_token": voip_token} if re.fullmatch(r"[0-9a-f]{32,200}", voip_token) else {}),
                  **({"push_key": push_key} if re.fullmatch(r"[A-Za-z0-9+/]{43}=", push_key) else {})}
         with devices_lock:
             save_devices([d for d in load_devices() if not same_install(d, entry)] + [entry])
