@@ -1,9 +1,9 @@
 {
  "version": "1.2",
- "build": 29,
- "file": "Hermit-1.2-29.dmg",
- "sha256": "fdbee1ae128c0318fa0797f8b069107f07d62dfdddd9d5953014db410dd065c5",
- "notes": "Morning brief: your day each morning, with a call to talk it through.",
- "size": 26800869,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-29/Hermit-1.2-29.dmg"
+ "build": 30,
+ "file": "Hermit-1.2-30.dmg",
+ "sha256": "3e05ba65114c29389cb3a09eb918a8f66e55d1f2c13bc63cfb2495d2c80a28b3",
+ "notes": "Notice as it happens: new mail and calendar changes, weighed against your watch guide.",
+ "size": 26806947,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-30/Hermit-1.2-30.dmg"
 }
