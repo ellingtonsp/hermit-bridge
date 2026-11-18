@@ -1,9 +1,9 @@
 {
  "version": "1.2",
- "build": 31,
- "file": "Hermit-1.2-31.dmg",
- "sha256": "2c3cc852b8e3ef1aa4a631c71ac944b5638567a9695d984c87f88c1f30fb1fd9",
- "notes": "Morning brief lands in its bot's chat and notifies with Call.",
- "size": 26811926,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-31/Hermit-1.2-31.dmg"
+ "build": 32,
+ "file": "Hermit-1.2-32.dmg",
+ "sha256": "e7f94d290dccfbb8aeaf457e72fc6af731c74a2f9047c7647519a739db1fdb60",
+ "notes": "The morning brief arrives as written, even on a quiet day",
+ "size": 26812922,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-32/Hermit-1.2-32.dmg"
 }
