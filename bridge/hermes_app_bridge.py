@@ -6786,7 +6786,11 @@ def apns_outcome(output: str) -> tuple[str, str]:
 def plain_text(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[*_`#>]", "", text)
-    return " ".join(text.split())[:180]
+    text = " ".join(text.split())
+    if len(text) <= 180:
+        return text
+    # The face rides in the same 4 KB push, so the text stays short. It ends on a whole word.
+    return text[:179].rsplit(" ", 1)[0].rstrip(",;:—-") + "…"
 
 
 def small_avatar(home: pathlib.Path) -> str | None:
