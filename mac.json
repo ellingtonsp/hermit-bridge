@@ -1,9 +1,9 @@
 {
  "version": "1.2",
- "build": 27,
- "file": "Hermit-1.2-27.dmg",
- "sha256": "d9ffc2fa335cd8a10ab57d80f3000dd41fafd5cb8d238ad5af1fb9cc21025e98",
- "notes": "Watching and a watch guide: choose what Hermit keeps an eye on, and tell it what to look out for.",
- "size": 26326672,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-27/Hermit-1.2-27.dmg"
+ "build": 28,
+ "file": "Hermit-1.2-28.dmg",
+ "sha256": "1b4dea03867affe662d14538e383919978c410bb1589c603ef48597ef618e6c5",
+ "notes": "Meeting prep: a card before a meeting with guests, with who it's with and recent mail.",
+ "size": 26731164,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-28/Hermit-1.2-28.dmg"
 }
