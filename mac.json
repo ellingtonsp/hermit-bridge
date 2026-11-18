@@ -1,9 +1,9 @@
 {
  "version": "1.2",
- "build": 28,
- "file": "Hermit-1.2-28.dmg",
- "sha256": "1b4dea03867affe662d14538e383919978c410bb1589c603ef48597ef618e6c5",
- "notes": "Meeting prep: a card before a meeting with guests, with who it's with and recent mail.",
- "size": 26731164,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-28/Hermit-1.2-28.dmg"
+ "build": 29,
+ "file": "Hermit-1.2-29.dmg",
+ "sha256": "fdbee1ae128c0318fa0797f8b069107f07d62dfdddd9d5953014db410dd065c5",
+ "notes": "Morning brief: your day each morning, with a call to talk it through.",
+ "size": 26800869,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-29/Hermit-1.2-29.dmg"
 }
