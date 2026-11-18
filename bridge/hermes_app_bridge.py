@@ -2997,6 +2997,108 @@ def archived_sessions(profile: str) -> list[dict]:
             for row_id, title, source, active, count in rows]
 
 
+# Routines whose runs archive themselves when they finish, chosen per routine in the app. A run is a session of
+# its own, titled "<routine> · <date>". Sessions it opened in other bots while it ran go too, such as a daily
+# report that asks every bot for theirs. Archived, not deleted, so they wait under Archived and in Desktop.
+# By name, like ringing routines, since that's what the run's title carries.
+TIDY_ROUTINES = STATE / "tidy-routines.json"
+TIDY_SECONDS = 300
+# Turning one on tidies its runs from this far back too.
+TIDY_DAYS = 30
+tidy_lock = threading.Lock()
+
+
+def tidy_routines() -> dict[str, list[str]]:
+    """Profile to the names of its routines that archive their runs."""
+    saved = read_json(TIDY_ROUTINES)
+    profiles = saved.get("profiles") if isinstance(saved, dict) else None
+    if not isinstance(profiles, dict):
+        return {}
+    return {profile: sorted({name for name in names if isinstance(name, str) and name})
+            for profile, names in profiles.items() if isinstance(profile, str) and isinstance(names, list)}
+
+
+def set_tidy_routine(profile: str, routine: str, on: bool) -> list[str]:
+    with tidy_lock:
+        profiles = tidy_routines()
+        names = set(profiles.get(profile, []))
+        if on:
+            names.add(routine)
+        else:
+            names.discard(routine)
+        if names:
+            profiles[profile] = sorted(names)
+        else:
+            profiles.pop(profile, None)
+        TIDY_ROUTINES.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(TIDY_ROUTINES, {"profiles": profiles})
+    return sorted(names)
+
+
+def finished_runs(database: pathlib.Path, routines: set[str], since: float) -> list[tuple[str, float, float]]:
+    """A profile's finished, unarchived runs of these routines: id, start and end."""
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
+            rows = connection.execute(
+                """select id, title, started_at, ended_at from sessions
+                   where source = 'cron' and archived = 0 and coalesce(pinned, 0) = 0
+                   and ended_at is not null and started_at > ?""", (since,)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [(row_id, start, end) for row_id, title, start, end in rows
+            if (title or "").rsplit(" · ", 1)[0] in routines]
+
+
+def sessions_opened_during(database: pathlib.Path, runs: list[tuple[str, float, float]]) -> list[str]:
+    """Finished sessions another bot opened in this one while one of the runs was going."""
+    if not runs:
+        return []
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
+            rows = connection.execute(
+                """select id, started_at from sessions
+                   where source = 'tool' and archived = 0 and coalesce(pinned, 0) = 0
+                   and ended_at is not null and started_at between ? and ?""",
+                (min(start for _, start, _ in runs), max(end for _, _, end in runs))).fetchall()
+    except sqlite3.Error:
+        return []
+    return [row_id for row_id, start in rows if any(begin <= start <= end for _, begin, end in runs)]
+
+
+def tidy_pass() -> int:
+    """Archives what the chosen routines left behind. How many sessions it archived."""
+    chosen = tidy_routines()
+    if not chosen:
+        return 0
+    places = homes()
+    since = time.time() - TIDY_DAYS * 86400
+    archived = 0
+    for profile, names in chosen.items():
+        if profile not in places:
+            continue
+        runs = finished_runs(places[profile] / "state.db", set(names), since)
+        if not runs:
+            continue
+        found = [(profile, run_id) for run_id, _, _ in runs]
+        for other, home in places.items():
+            if other != profile and (home / "state.db").exists():
+                found += [(other, session) for session in sessions_opened_during(home / "state.db", runs)]
+        for owner, session in found:
+            if profile_api(owner, "PATCH", f"/api/sessions/{session}", {"archived": True}) == 200:
+                archived += 1
+    return archived
+
+
+def tidy_loop() -> None:
+    while True:
+        try:
+            if (count := tidy_pass()):
+                print(f"tidy: archived {count} routine session(s)", flush=True)
+        except Exception as error:
+            print(f"tidy: {type(error).__name__}", flush=True)
+        time.sleep(TIDY_SECONDS)
+
+
 # ---- Card buttons that run on their own. A button marked "solo" carries a whole instruction, so it doesn't need
 # the chat around it. Tapping one starts a short session of that bot just for it, apart from its main chat, so
 # several taps run side by side instead of waiting their turn. The phone only says "this button on that card";
@@ -7185,6 +7287,11 @@ class Handler(BaseHTTPRequestHandler):
             if profile not in homes() or not authorized(header, profile):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, {"sessions": archived_sessions(profile)})
+        if url.path == "/routines/tidy":
+            profile = (query.get("profile") or [""])[0]
+            if profile not in homes() or not authorized(header, profile):
+                return self.json(401, {"error": "unauthorized"})
+            return self.json(200, {"routines": tidy_routines().get(profile, [])})
         if url.path in ("/connectors", "/connectors/poll", "/connectors/catalog"):
             profile = (query.get("profile") or [""])[0]
             if profile not in homes() or not authorized(header, profile):
@@ -7736,6 +7843,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(400, {"error": {"message": "This device hasn't registered for calls yet."}})
             reached = ring(profile, bot_chat_session(profile), "Testing calls from Hermit", only=token)
             return self.json(200 if reached else 502, {"rang": reached})
+        if path == "/routines/tidy":
+            # A routine's runs, and what they open in other bots, archive themselves once finished.
+            try:
+                fields = json.loads(self.body(4096) or b"{}")
+            except ValueError:
+                fields = None
+            if not isinstance(fields, dict):
+                return self.json(400, {"error": {"message": "That request couldn't be read"}})
+            profile, routine = str(fields.get("profile") or ""), str(fields.get("routine") or "").strip()
+            if profile not in homes() or not authorized(header, profile):
+                return self.json(401, {"error": "unauthorized"})
+            if not routine or len(routine) > 200:
+                return self.json(400, {"error": {"message": "That routine needs a name."}})
+            names = set_tidy_routine(profile, routine, bool(fields.get("on")))
+            # At once, so earlier runs leave the list now and not in five minutes.
+            threading.Thread(target=tidy_pass, daemon=True).start()
+            return self.json(200, {"routines": names})
         if path == "/updates/bridge":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -8291,4 +8415,5 @@ if __name__ == "__main__":
     threading.Thread(target=watch_loop, daemon=True).start()
     threading.Thread(target=prep_loop, daemon=True).start()
     threading.Thread(target=signals_loop, daemon=True).start()
+    threading.Thread(target=tidy_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
