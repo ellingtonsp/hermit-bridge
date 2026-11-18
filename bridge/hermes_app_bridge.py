@@ -134,6 +134,8 @@ WATCHING = STATE / "watching.json"
 WATCH_GUIDE = STATE / "watch-guide.json"
 # Meetings already prepared for, so each gets one card.
 PREP_STATE = STATE / "meeting-prep.json"
+# What signals has already seen: mail threads, the calendar as it last stood, and today's notifications.
+SIGNALS_STATE = STATE / "signals.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
@@ -4846,6 +4848,8 @@ def tidings_state() -> dict:
             "lead": "open" if saved.get("lead") == "open" else "ask",
             # Meeting prep: a card before a meeting with guests. Off until switched on.
             "prep": saved.get("prep") is True,
+            # Notice as it happens: new mail and calendar changes, checked every few minutes. Off until switched on.
+            "live": saved.get("live") is True,
             "prepMinutes": saved.get("prepMinutes") if saved.get("prepMinutes") in PREP_MINUTES else 15,
             **{name: tidings_number(saved.get(name), name) for name in TIDINGS_LIMITS}}
 
@@ -4876,7 +4880,7 @@ def tidings_view(state: dict | None = None) -> dict:
             "learns": state["learns"],
             "hours": state["hours"], "limit": state["limit"], "days": state["days"], "keep": state["keep"],
             "chat": state["chat"] if state["chat"] in known else None, "lead": state["lead"],
-            "prep": state["prep"], "prepMinutes": state["prepMinutes"],
+            "prep": state["prep"], "prepMinutes": state["prepMinutes"], "live": state["live"],
             "cards": [card for card in state["cards"] if card.get("id") not in state["closed"]] if state["on"] else []}
 
 
@@ -4929,7 +4933,7 @@ def ensure_tidings(run=subprocess.run) -> None:
 def change_tidings(fields: dict) -> dict:
     with tidings_lock:
         state = tidings_state()
-        for name in ("on", "web", "asks", "thumbs", "learns", "prep"):
+        for name in ("on", "web", "asks", "thumbs", "learns", "prep", "live"):
             if isinstance(fields.get(name), bool):
                 state[name] = fields[name]
         if fields.get("prepMinutes") in PREP_MINUTES:
@@ -5428,15 +5432,11 @@ def prep_material(meeting: dict, threads: list[str]) -> str:
     return "\n".join(parts)
 
 
-def prep_note(material: str, minutes: int, run=subprocess.run) -> str:
-    """A few sentences from the Tidings bot, which has no tools and contacts no one. Empty when it fails, and
-    the card goes out without them."""
+def tidings_oneshot(ask: str, label: str, run=subprocess.run) -> str:
+    """One question to the Tidings bot, which has no tools and contacts no one. Its answer, or empty on failure."""
     if not tidings_home().is_dir():
         return ""
-    guide = watch_guide_text()
-    ask = PREP_ASK.format(minutes=minutes, material=material,
-                          guide=TIDINGS_GUIDE.format(guide=guide) if guide else "")
-    handle, name = tempfile.mkstemp(prefix="prep.", suffix=".txt")
+    handle, name = tempfile.mkstemp(prefix=label + ".", suffix=".txt")
     query = pathlib.Path(name)
     try:
         with os.fdopen(handle, "w") as file:
@@ -5449,16 +5449,27 @@ def prep_note(material: str, minutes: int, run=subprocess.run) -> str:
             command += ["-m", model["model"], "--provider", model["provider"]]
         done = run(command, capture_output=True, text=True, timeout=180, env=hermes_env(), cwd=str(tidings_home()))
         if done.returncode != 0:
-            print(f"prep: note exit {done.returncode}", flush=True)
+            print(f"{label}: exit {done.returncode}", flush=True)
             return ""
-        start, end = done.stdout.find("{"), done.stdout.rfind("}")
-        answer = json.loads(done.stdout[start:end + 1]) if 0 <= start < end else {}
-        return clipped(" ".join(str(answer.get("body") or "").split()), 480) if isinstance(answer, dict) else ""
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"prep: note {type(error).__name__}", flush=True)
+        return done.stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"{label}: {type(error).__name__}", flush=True)
         return ""
     finally:
         query.unlink(missing_ok=True)
+
+
+def prep_note(material: str, minutes: int, run=subprocess.run) -> str:
+    """A few sentences from the Tidings bot. Empty when it fails, and the card goes out without them."""
+    guide = watch_guide_text()
+    said = tidings_oneshot(PREP_ASK.format(minutes=minutes, material=material,
+                                           guide=TIDINGS_GUIDE.format(guide=guide) if guide else ""), "prep", run)
+    start, end = said.find("{"), said.rfind("}")
+    try:
+        answer = json.loads(said[start:end + 1]) if 0 <= start < end else {}
+    except ValueError:
+        return ""
+    return clipped(" ".join(str(answer.get("body") or "").split()), 480) if isinstance(answer, dict) else ""
 
 
 def prep_card(meeting: dict, note: str) -> dict:
@@ -5548,6 +5559,197 @@ def prep_loop() -> None:
         except Exception as error:
             print(f"prep loop: {type(error).__name__}", flush=True)
         time.sleep(60)
+
+SIGNAL_SECONDS = 300
+SIGNAL_MAIL_MAX = 25
+SIGNAL_SEEN_DAYS = 14
+SIGNAL_NOTIFY_DAY = 6
+SIGNAL_QUIET = (22, 7)  # no notifications from 10 PM to 7 AM; cards still land
+SIGNAL_ASK = """Things just changed in the owner's mail and calendar. Decide which, if any, the owner should hear
+about now, using their watch guide and plain good sense. Most changes need nothing: newsletters, receipts,
+automated mail, routine invitations and anything already in the feed. Pick one only if it needs the owner's
+attention soon, or matches what the watch guide asks for.
+Answer with a JSON list only, empty if nothing matters: [{{"fact": the number in brackets, "title": under 60
+characters, "body": one or two short sentences saying why it matters, "notify": true only if it can't wait
+for the owner to open the app}}]
+{guide}
+Already in the feed: {open}
+
+Changes:
+{facts}
+"""
+signal_lock = threading.Lock()
+signal_running = threading.Event()
+
+
+def signals_state(now: float | None = None) -> dict:
+    try:
+        saved = read_json(SIGNALS_STATE) if SIGNALS_STATE.exists() else {}
+    except (OSError, ValueError):
+        saved = {}
+    cutoff = (now or time.time()) - SIGNAL_SEEN_DAYS * 86400
+    return {"mail": {key: at for key, at in (saved.get("mail") or {}).items() if isinstance(at, (int, float)) and at > cutoff},
+            "calendar": saved.get("calendar") if isinstance(saved.get("calendar"), dict) else None,
+            "mailReady": saved.get("mailReady") is True,
+            "notified": [at for at in saved.get("notified") or [] if isinstance(at, (int, float)) and at > (now or time.time()) - 86400]}
+
+
+def mail_changes(account: str, state: dict, now: float, gog=None) -> list[str]:
+    """New threads in the inbox since the last look, as "from: subject". The first look only notes what's
+    there, so switching this on doesn't bring up a day of old mail."""
+    gog = gog or run_gog
+    result = gog(["--readonly", "gmail", "search", "in:inbox newer_than:2d", "-a", account, "--max", str(SIGNAL_MAIL_MAX)])
+    if result.returncode != 0:
+        raise RuntimeError(f"gog gmail exit {result.returncode}")
+    found = json.loads(result.stdout or "{}")
+    facts = []
+    for thread in found.get("threads") or [] if isinstance(found, dict) else []:
+        key = f"{account}|{thread.get('id')}" if isinstance(thread, dict) else ""
+        if not key or key in state["mail"]:
+            continue
+        state["mail"][key] = now
+        subject = " ".join(str(thread.get("subject") or "").split())
+        sender = " ".join(str(thread.get("from") or "").split())
+        if state["mailReady"] and subject:
+            facts.append(clipped(f"New mail from {sender}: {subject}", 240))
+    return facts
+
+
+def calendar_changes(accounts: list[str], state: dict, now: float, gog=None) -> list[str]:
+    """Meetings with guests in the next two days that are new, moved or gone since the last look. The first
+    look only notes how things stand."""
+    gog = gog or run_gog
+    start = datetime.datetime.fromtimestamp(now).astimezone()
+    current = {}
+    for account in accounts:
+        result = gog(["--readonly", "calendar", "events", "-a", account, "--from", start.isoformat(timespec="seconds"),
+                      "--to", (start + datetime.timedelta(days=2)).isoformat(timespec="seconds")])
+        if result.returncode != 0:
+            raise RuntimeError(f"gog calendar exit {result.returncode}")
+        for event in json.loads(result.stdout or "{}").get("events") or []:
+            begins = prep_time(event.get("start") or {}) if isinstance(event, dict) else None
+            people = [person for person in event.get("attendees") or [] if isinstance(person, dict)] if begins else []
+            if not begins or event.get("status") == "cancelled" or not any(not person.get("self") for person in people):
+                continue
+            current[f"{account}|{event.get('id')}"] = {"title": clipped(" ".join(str(event.get("summary") or "Meeting").split()), 80),
+                                                     "start": begins}
+    before = state["calendar"]
+    state["calendar"] = current
+    if before is None:
+        return []
+    def when(at: float) -> str:
+        return datetime.datetime.fromtimestamp(at).astimezone().strftime("%a %-I:%M %p")
+    facts = []
+    for key, event in current.items():
+        old = before.get(key)
+        if old is None:
+            facts.append(f"New meeting: {event['title']}, {when(event['start'])}")
+        elif abs(float(old.get("start") or 0) - event["start"]) >= 60:
+            facts.append(f"Moved: {event['title']}, from {when(float(old['start']))} to {when(event['start'])}")
+    for key, old in before.items():
+        # Gone from the list while still well inside the window: cancelled, or the owner was taken off it.
+        if key not in current and now < float(old.get("start") or 0) < now + 40 * 3600:
+            facts.append(f"Cancelled or removed: {old.get('title')}, {when(float(old['start']))}")
+    return facts
+
+
+def triage_signals(facts: list[str], open_titles: list[str], run=subprocess.run) -> list[dict]:
+    guide = watch_guide_text()
+    said = tidings_oneshot(SIGNAL_ASK.format(guide=TIDINGS_GUIDE.format(guide=guide) if guide else "",
+                                             open=json.dumps(open_titles[:20]),
+                                             facts="\n".join(f"[{index + 1}] {fact}" for index, fact in enumerate(facts))),
+                           "signals", run)
+    start, end = said.find("["), said.rfind("]")
+    try:
+        picked = json.loads(said[start:end + 1]) if 0 <= start < end else []
+    except ValueError:
+        return []
+    chosen = []
+    for entry in picked if isinstance(picked, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("fact"), int) or not 1 <= entry["fact"] <= len(facts):
+            continue
+        title = clipped(" ".join(str(entry.get("title") or "").split()), 80)
+        if title:
+            chosen.append({"fact": facts[entry["fact"] - 1], "title": title,
+                           "body": clipped(" ".join(str(entry.get("body") or "").split()), 320),
+                           "notify": entry.get("notify") is True})
+    return chosen[:5]
+
+
+def quiet_hours(now: float) -> bool:
+    hour = datetime.datetime.fromtimestamp(now).hour
+    return hour >= SIGNAL_QUIET[0] or hour < SIGNAL_QUIET[1]
+
+
+def run_signals(now: float | None = None, gog=None, run=subprocess.run, alert=None) -> int:
+    """One look at what changed, for the sources switched on in Watching. What matters becomes a Tidings card,
+    and a notification only when it can't wait, at most six a day and never at night."""
+    now = now or time.time()
+    tidings = tidings_state()
+    if not (tidings["on"] and tidings["live"]):
+        return 0
+    mail_on, calendar_on = watching_on("mail"), watching_on("google-calendar")
+    if not (mail_on or calendar_on):
+        return 0
+    with signal_lock:
+        state = signals_state(now)
+    facts = []
+    try:
+        accounts = calendar_accounts()
+        if mail_on:
+            for account in accounts:
+                facts += mail_changes(account, state, now, gog)
+            state["mailReady"] = True
+        if calendar_on:
+            facts += calendar_changes(accounts, state, now, gog)
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+        print(f"signals: {type(error).__name__}", flush=True)
+    with signal_lock:
+        SIGNALS_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(SIGNALS_STATE, state)
+    if not facts:
+        return 0
+    chosen = triage_signals(facts, [card.get("title") or "" for card in tidings["cards"]], run)
+    made = 0
+    for item in chosen:
+        key = "signal-" + hashlib.sha256(item["fact"].encode()).hexdigest()[:12]
+        card = {"id": key, "key": key, "kind": "headsup", "title": item["title"], "body": item["body"],
+                "at": now, "from": ["Mail" if item["fact"].startswith("New mail") else "Google Calendar"], "signal": True}
+        with tidings_lock:
+            latest = tidings_state()
+            known = latest["cards"] + [entry | {"id": card_id} for card_id, entry in closed_tidings(latest, now).items()]
+            if any(old.get("id") == key for old in known) or same_subject(card, known):
+                continue
+            latest["cards"] = ([card] + latest["cards"])[:TIDINGS_KEPT]
+            save_tidings(latest)
+        made += 1
+        with signal_lock:
+            state = signals_state(now)
+            loud = item["notify"] and not quiet_hours(now) and len(state["notified"]) < SIGNAL_NOTIFY_DAY
+            if loud:
+                state["notified"].append(now)
+                write_json(SIGNALS_STATE, state)
+        if loud:
+            try:
+                (alert or prep_alert)(card)
+            except Exception as error:  # the card is in the feed; only the notification failed
+                print(f"signals: alert failed ({type(error).__name__})", flush=True)
+    print(f"signals: {len(facts)} changes, {made} cards", flush=True)
+    return made
+
+
+def signals_loop() -> None:
+    while True:
+        try:
+            if not signal_running.is_set():
+                signal_running.set()
+                try:
+                    run_signals()
+                finally:
+                    signal_running.clear()
+        except Exception as error:
+            print(f"signals loop: {type(error).__name__}", flush=True)
+        time.sleep(SIGNAL_SECONDS)
 
 def start_tidings(pressed: bool = False) -> bool:
     """Starts a run unless one is going. A run asked for by hand waits out a short gap since the last."""
@@ -5700,9 +5902,9 @@ WATCH_SOURCES = {
                  "detail": "When you arrive at or leave a place you've saved, never a trail of where you go"},
     "focus": {"title": "Focus", "where": "phone", "uses": [],
               "detail": "Which Focus is on"},
-    "google-calendar": {"title": "Google Calendar", "where": "mac", "uses": ["Meeting prep"],
+    "google-calendar": {"title": "Google Calendar", "where": "mac", "uses": ["Meeting prep", "Notice as it happens"],
                         "detail": "Meetings on the Google accounts signed in on your Mac: when, the title and who's invited"},
-    "mail": {"title": "Mail", "where": "mac", "uses": ["Meeting prep"],
+    "mail": {"title": "Mail", "where": "mac", "uses": ["Meeting prep", "Notice as it happens"],
              "detail": "Gmail on your Mac: who mail is from, the subject and the first lines"},
     "messages": {"title": "Messages", "where": "mac", "uses": [],
                  "detail": "New texts: who they're from and the first lines"},
@@ -7988,4 +8190,5 @@ if __name__ == "__main__":
     threading.Thread(target=tidings_loop, daemon=True).start()
     threading.Thread(target=watch_loop, daemon=True).start()
     threading.Thread(target=prep_loop, daemon=True).start()
+    threading.Thread(target=signals_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
