@@ -993,6 +993,10 @@ def closed_cards(profile: str, session_id: str) -> set[str]:
         return {key.rsplit(":", 1)[1] for key in load_inbox().get("closed", {}) if key.startswith(prefix)}
 
 
+# The routine the app's Morning brief screen makes. Its notification offers Call, to talk the brief through.
+BRIEF_ROUTINE = "Morning brief"
+
+
 def reply_push(profile: str, session_id: str, reply: str, routine: str | None = None) -> None:
     """A finished reply. If it ends on a question card, its choices become the notification's buttons.
 
@@ -1007,7 +1011,7 @@ def reply_push(profile: str, session_id: str, reply: str, routine: str | None = 
              {"session": session_id, "card": question["card"], "title": question["title"],
               "options": question["options"]}, "hermit.question")
     else:
-        push(profile, reply, {"session": session_id}, "hermit.reply", routine)
+        push(profile, reply, {"session": session_id}, "hermit.brief" if routine == BRIEF_ROUTINE else "hermit.reply", routine)
 
 
 groups_cache: dict = {"rooms": [], "at": 0.0, "worker": None}
