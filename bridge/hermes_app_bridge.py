@@ -129,6 +129,9 @@ INTEGRATIONS = STATE / "integrations.json"
 # What Hermit may watch on its own, without being asked: each source and each bot's connectors. All off
 # until the owner turns one on, and only a device's own key can turn one on. See WATCH_SOURCES.
 WATCHING = STATE / "watching.json"
+# "What to look out for": the owner's own words, and lines bots proposed that the owner accepted. Every proactive
+# run reads it. Bots propose through the plugin's hermit_watch tool; see watch_guide_state.
+WATCH_GUIDE = STATE / "watch-guide.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
@@ -4830,7 +4833,8 @@ def tidings_state() -> dict:
             else list(TIDINGS_KINDS),
             "asks": saved.get("asks") is not False, "thumbs": saved.get("thumbs") is not False,
             "learns": saved.get("learns") is not False,
-            "guide": saved.get("guide") if isinstance(saved.get("guide"), str) else "",
+            # The owner's words now live in the watch guide, with the lines bots added and the owner accepted.
+            "guide": watch_guide_state()["owner"],
             "hours": tidings_hours(saved.get("hours")) or list(TIDINGS_HOURS),
             "chat": saved.get("chat") if isinstance(saved.get("chat"), str) else None,
             "lead": "open" if saved.get("lead") == "open" else "ask",
@@ -4840,7 +4844,7 @@ def tidings_state() -> dict:
 def save_tidings(state: dict) -> None:
     TIDINGS_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Calendar and Reminders live in Watching. They're left out so a stale copy here can't come back.
-    write_json(TIDINGS_STATE, {key: value for key, value in state.items() if key not in TIDINGS_SOURCES})
+    write_json(TIDINGS_STATE, {key: value for key, value in state.items() if key not in TIDINGS_SOURCES and key != "guide"})
 
 
 def default_model() -> dict | None:
@@ -4930,7 +4934,12 @@ def change_tidings(fields: dict) -> dict:
         if isinstance(fields.get("kinds"), list):
             state["kinds"] = [kind for kind in TIDINGS_KINDS if kind in fields["kinds"]]
         if isinstance(fields.get("guide"), str):
-            state["guide"] = clipped(fields["guide"].strip(), TIDINGS_GUIDE_CHARS)
+            # An app from before the watch guide still sends it here.
+            with watch_guide_lock:
+                guide = watch_guide_state()
+                guide["owner"] = clipped(fields["guide"].strip(), WATCH_OWNER_CHARS)
+                save_watch_guide(guide)
+            state["guide"] = guide["owner"]
         for name in TIDINGS_LIMITS:
             if name in fields:
                 state[name] = tidings_number(fields[name], name)
@@ -5235,7 +5244,7 @@ def run_tidings(run=subprocess.run) -> None:
                   for entry in list(closed_tidings(state).values())[:TIDINGS_CLOSED_SHOWN]]
         # Everything the question is made from, kept with the run so a new wording can be tried on it later.
         asked = {"today": time.strftime("%A %B %d, %Y"), "web": state["web"], "bots": bots,
-                 "kinds": state["kinds"], "limit": state["limit"], "guide": state["guide"],
+                 "kinds": state["kinds"], "limit": state["limit"], "guide": watch_guide_text(),
                  "lessons": tidings_lessons() if state["learns"] and state["thumbs"] else "",
                  "open": [{"key": card.get("key"), "title": card.get("title")} for card in open_cards],
                  "closed": closed, "material": material}
@@ -5575,6 +5584,205 @@ def change_watching(fields: dict, device: str | None) -> dict:
             if kept != tidings_context():
                 write_json(TIDINGS_CONTEXT, kept)
     return state
+
+WATCH_OWNER_CHARS = 1500
+WATCH_LINE_CHARS = 200
+WATCH_ENTRIES = 40
+WATCH_PENDING_PER_BOT = 10
+WATCH_DECLINED_DAYS = 90
+# Where a bot's hermit_watch requests wait, one file each, in its own folder. The bridge is the only one that
+# writes the guide, so a request never races another.
+WATCH_REQUESTS = "hermit/watch-requests"
+watch_guide_lock = threading.Lock()
+
+
+def watch_text(value, limit: int = WATCH_LINE_CHARS) -> str:
+    return clipped(" ".join(value.split()), limit) if isinstance(value, str) else ""
+
+
+def watch_until(value) -> str | None:
+    """A last day as YYYY-MM-DD, or None for no end."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.date.fromisoformat(value.strip()[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def watch_same(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def watch_guide_state(today: datetime.date | None = None) -> dict:
+    """The saved guide. Entries past their last day are dropped as it's read. Before the first save, the owner's
+    words come from Tidings' instructions, where they used to be."""
+    today = today or datetime.date.today()
+    try:
+        saved = read_json(WATCH_GUIDE) if WATCH_GUIDE.exists() else None
+    except (OSError, ValueError):
+        saved = {}
+    if saved is None:
+        try:
+            earlier = read_json(TIDINGS_STATE) if TIDINGS_STATE.exists() else {}
+        except (OSError, ValueError):
+            earlier = {}
+        saved = {"owner": earlier.get("guide") if isinstance(earlier.get("guide"), str) else ""}
+        try:
+            WATCH_GUIDE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json(WATCH_GUIDE, saved)
+        except OSError:
+            pass
+    entries = []
+    for entry in saved.get("entries") or []:
+        if not isinstance(entry, dict) or not watch_text(entry.get("text")) or entry.get("status") not in ("pending", "active"):
+            continue
+        until = watch_until(entry.get("until"))
+        if until and datetime.date.fromisoformat(until) < today:
+            continue
+        entries.append({"id": str(entry.get("id") or ""), "text": watch_text(entry.get("text")),
+                        "reason": watch_text(entry.get("reason")), "by": str(entry.get("by") or "owner"),
+                        "status": entry["status"], "until": until,
+                        "scope": entry.get("scope") if entry.get("scope") in ("everywhere", "bot") else "everywhere",
+                        "made": float(entry.get("made") or 0)})
+    declined = {key: at for key, at in (saved.get("declined") or {}).items()
+                if isinstance(at, (int, float)) and time.time() - at < WATCH_DECLINED_DAYS * 86400}
+    return {"owner": clipped(saved.get("owner") or "", WATCH_OWNER_CHARS) if isinstance(saved.get("owner"), str) else "",
+            "entries": entries, "declined": declined}
+
+
+def save_watch_guide(state: dict) -> None:
+    WATCH_GUIDE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_json(WATCH_GUIDE, state)
+
+
+def watch_guide_text(state: dict | None = None, bot: str | None = None) -> str:
+    """The guide as a proactive run reads it: the owner's words first, which outrank the rest, then what bots
+    added and the owner accepted. With `bot`, only lines for everywhere or for that bot."""
+    state = state or watch_guide_state()
+    known = homes()
+    lines = []
+    for entry in state["entries"]:
+        if entry["status"] != "active" or (bot and entry["scope"] == "bot" and entry["by"] != bot):
+            continue
+        who = "" if entry["by"] == "owner" else f" (from {bot_info(entry['by'], known[entry['by']])['title'] or entry['by'] if entry['by'] in known else entry['by']})"
+        about = f" [only for {entry['by']}]" if entry["scope"] == "bot" and not bot else ""
+        until = f" Until {entry['until']}." if entry["until"] else ""
+        lines.append(f"- {entry['text']}{who}{about}{until}")
+    parts = [state["owner"]] if state["owner"] else []
+    if lines:
+        parts.append("Also watch for, added by the owner's bots with the owner's yes:\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def watch_guide_view(state: dict | None = None) -> dict:
+    state = state or watch_guide_state()
+    known = homes()
+    return {"owner": state["owner"], "limit": WATCH_OWNER_CHARS,
+            "entries": [{**{key: entry[key] for key in ("id", "text", "reason", "by", "status", "until", "scope")},
+                         "title": "You" if entry["by"] == "owner" else
+                         (bot_info(entry["by"], known[entry["by"]])["title"] or entry["by"]) if entry["by"] in known else entry["by"]}
+                        for entry in state["entries"]]}
+
+
+def change_watch_guide(fields: dict, device: str | None) -> dict:
+    """The owner's words, and accepting, editing or removing a line. Whatever widens what Hermit looks for needs a
+    device's own key: a bot holds its profile's key and mustn't be able to accept its own proposal."""
+    action = fields.get("action")
+    widening = "owner" in fields or action in ("accept", "add", "edit")
+    if device is None and widening:
+        raise PermissionError("Change the watch guide from the app, on a device paired with its own key.")
+    with watch_guide_lock:
+        state = watch_guide_state()
+        if isinstance(fields.get("owner"), str):
+            state["owner"] = clipped(fields["owner"].strip(), WATCH_OWNER_CHARS)
+        entry = next((item for item in state["entries"] if item["id"] == fields.get("id")), None)
+        if action == "add":
+            text = watch_text(fields.get("text"))
+            if not text:
+                raise VoiceError("Write what to look out for.")
+            if len(state["entries"]) >= WATCH_ENTRIES:
+                raise VoiceError("The guide is full. Remove a line first.")
+            state["entries"].append({"id": secrets.token_hex(4), "text": text, "reason": "", "by": "owner",
+                                     "status": "active", "until": watch_until(fields.get("until")), "scope": "everywhere",
+                                     "made": time.time()})
+        elif action in ("accept", "edit", "decline", "remove"):
+            if entry is None:
+                raise VoiceError("That line isn't in the guide any more.")
+            if action == "accept":
+                entry["status"] = "active"
+            if action in ("accept", "edit"):
+                if watch_text(fields.get("text")):
+                    entry["text"] = watch_text(fields["text"])
+                if "until" in fields:
+                    entry["until"] = watch_until(fields.get("until"))
+            if action == "decline":
+                state["declined"][watch_same(entry["text"])] = time.time()
+            if action in ("decline", "remove"):
+                state["entries"].remove(entry)
+        save_watch_guide(state)
+    if action:
+        print(f"watch guide: {action}", flush=True)
+    return watch_guide_view(state)
+
+
+def take_watch_requests(alert=None) -> int:
+    """Takes what bots asked of the guide through hermit_watch: new lines, which wait for the owner, and lines a
+    bot takes back. A line the owner already has, or turned down lately, is let go quietly. Returns how many
+    new ones there are, and tells the owner's devices about them."""
+    alert = alert or watch_alert
+    fresh = []
+    with watch_guide_lock:
+        state = watch_guide_state()
+        changed = False
+        for profile, home in homes().items():
+            folder = home / WATCH_REQUESTS
+            for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+                try:
+                    request = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    request = None
+                path.unlink(missing_ok=True)
+                changed = True
+                if not isinstance(request, dict):
+                    continue
+                if request.get("op") == "withdraw":
+                    state["entries"] = [entry for entry in state["entries"]
+                                        if not (entry["id"] == request.get("id") and entry["by"] == profile)]
+                    continue
+                text = watch_text(request.get("text"))
+                same = watch_same(text)
+                mine = [entry for entry in state["entries"] if entry["by"] == profile and entry["status"] == "pending"]
+                if (not text or same in state["declined"] or any(watch_same(entry["text"]) == same for entry in state["entries"])
+                        or len(mine) >= WATCH_PENDING_PER_BOT or len(state["entries"]) >= WATCH_ENTRIES):
+                    continue
+                entry = {"id": secrets.token_hex(4), "text": text, "reason": watch_text(request.get("reason")),
+                         "by": profile, "status": "pending", "until": watch_until(request.get("until")),
+                         "scope": "bot" if request.get("scope") == "bot" else "everywhere", "made": time.time()}
+                state["entries"].append(entry)
+                fresh.append(entry)
+        if changed:
+            save_watch_guide(state)
+    for entry in fresh:
+        print(f"watch guide: {entry['by']} proposed a line", flush=True)
+        try:
+            alert(entry)
+        except Exception as error:  # the line still waits in the guide; only the notification failed
+            print(f"watch guide: alert failed ({type(error).__name__})", flush=True)
+    return len(fresh)
+
+
+def watch_alert(entry: dict) -> None:
+    push(entry["by"], f"Suggests watching for: {entry['text']}", data={"screen": "watch-guide"})
+
+
+def watch_loop() -> None:
+    while True:
+        try:
+            take_watch_requests()
+        except Exception as error:
+            print(f"watch loop: {type(error).__name__}", flush=True)
+        time.sleep(30)
 
 def recap_chat(home: pathlib.Path, session_id: str) -> tuple[str, str, int]:
     """The end of one chat as lines to read, the id of its newest message, and how many messages that is."""
@@ -6592,6 +6800,11 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.guarded(watching_view)
+        if url.path == "/watch-guide":
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            take_watch_requests()
+            return self.guarded(watch_guide_view)
         if url.path == "/cards/kinds":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -7114,6 +7327,25 @@ class Handler(BaseHTTPRequestHandler):
             sender = hashlib.sha256("\n".join(self.headers.get(name) or "" for name in
                                               ("Authorization", "User-Agent", "X-Forwarded-For")).encode()).hexdigest()
             return self.json(200, take_integrations(fields, sender))
+        if path == "/watch-guide":
+            data = self.body()
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            try:
+                fields = json.loads(data or b"{}")
+            except ValueError:
+                fields = None
+            if not isinstance(fields, dict):
+                return self.json(400, {"error": {"message": "That request couldn't be read"}})
+            token = (header or "").removeprefix("Bearer ").strip()
+            device = device_for(token) if token.startswith(DEVICE_PREFIX) else None
+            try:
+                value = change_watch_guide(fields, device)
+            except PermissionError as error:
+                return self.json(403, {"error": {"message": str(error)}})
+            except VoiceError as error:  # written for people
+                return self.json(409, {"error": {"message": str(error)}})
+            return self.json(200, value)
         if path == "/watching":
             data = self.body()
             if not authorized(header):
@@ -7510,4 +7742,5 @@ if __name__ == "__main__":
     threading.Thread(target=feed_loop, daemon=True).start()
     threading.Thread(target=servers_loop, daemon=True).start()
     threading.Thread(target=tidings_loop, daemon=True).start()
+    threading.Thread(target=watch_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
