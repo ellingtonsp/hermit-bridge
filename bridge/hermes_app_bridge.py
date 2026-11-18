@@ -7717,6 +7717,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, devices_view(header))
         if path == "/devices":
             return self.register_device(header)
+        if path == "/calls/trace":
+            # How a call went, step by step with timings, so one that stalls on the phone shows where.
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            fields = json.loads(self.body() or b"{}")
+            profile = re.sub(r"[^a-z0-9_-]", "", str(fields.get("profile") or ""))[:64]
+            steps = [clipped(" ".join(str(step).split()), 120) for step in (fields.get("steps") or [])[:60]]
+            print(f"call {profile}: " + " · ".join(steps), flush=True)
+            return self.json(200, {"ok": True})
         if path == "/calls/test":
             # Settings' "Try a call": rings only the device that asked, through the same path a bot uses.
             if not authorized(header):
