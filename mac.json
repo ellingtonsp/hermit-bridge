@@ -1,9 +1,9 @@
 {
- "version": "1.1",
- "build": 25,
- "file": "Hermit-1.1-25.dmg",
- "sha256": "b3cc464f46e1bbe2e90afdd0683f47c7263fb8ff147dc80c10b5f18b2bac0d7b",
- "notes": "Richer cards you can design, buttons that act, inputs, and cards that update in place.",
- "size": 26313568,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-25/Hermit-1.1-25.dmg"
+ "version": "1.2",
+ "build": 27,
+ "file": "Hermit-1.2-27.dmg",
+ "sha256": "d9ffc2fa335cd8a10ab57d80f3000dd41fafd5cb8d238ad5af1fb9cc21025e98",
+ "notes": "Watching and a watch guide: choose what Hermit keeps an eye on, and tell it what to look out for.",
+ "size": 26326672,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-27/Hermit-1.2-27.dmg"
 }
