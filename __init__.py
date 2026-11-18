@@ -1395,6 +1395,18 @@ def routine_name(user_message):
     return None
 
 
+BRIEF_ROUTINE = "Morning brief"
+
+
+def brief_text(user_message) -> str | None:
+    """The brief Hermit's Morning brief routine wrote, or None for any other turn. Hermes hands a routine's
+    output to the bot to review, and a bot that reviews a brief comments on it instead of passing it on."""
+    if routine_name(user_message) != BRIEF_ROUTINE:
+        return None
+    _header, _, brief = user_message.partition("]")
+    return brief.strip() or None
+
+
 def on_post_llm_call(session_id=None, user_message=None, assistant_response=None, **_kwargs):
     # Routine results can notify too. The phone decides which routines may, per routine.
     event = {"type": "turn", "session": session_id, "reply": str(assistant_response or "")[:4000]}
@@ -1426,6 +1438,9 @@ def on_pre_llm_call(user_message=None, session_id=None, conversation_history=Non
     # The bridge's note of what tapped solo buttons did: kept in the chat as it is, with no model call.
     if isinstance(user_message, str) and (summary := solo_results(user_message)) is not None:
         return {"action": "block", "message": summary}
+    # The morning brief: posted as written, so the chat and its notification carry the brief itself.
+    if (brief := brief_text(user_message)) is not None:
+        return {"action": "block", "message": brief}
     if isinstance(user_message, str) and user_message.rstrip(" \n").endswith(APP_MARKER):
         # Tells the bridge to watch this turn, so an approval can reach the phone even if the app closes.
         _emit(type="app_turn", session=session_id)
