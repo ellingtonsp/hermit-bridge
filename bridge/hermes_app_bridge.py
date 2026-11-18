@@ -132,6 +132,8 @@ WATCHING = STATE / "watching.json"
 # "What to look out for": the owner's own words, and lines bots proposed that the owner accepted. Every proactive
 # run reads it. Bots propose through the plugin's hermit_watch tool; see watch_guide_state.
 WATCH_GUIDE = STATE / "watch-guide.json"
+# Meetings already prepared for, so each gets one card.
+PREP_STATE = STATE / "meeting-prep.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
@@ -4838,6 +4840,9 @@ def tidings_state() -> dict:
             "hours": tidings_hours(saved.get("hours")) or list(TIDINGS_HOURS),
             "chat": saved.get("chat") if isinstance(saved.get("chat"), str) else None,
             "lead": "open" if saved.get("lead") == "open" else "ask",
+            # Meeting prep: a card before a meeting with guests. Off until switched on.
+            "prep": saved.get("prep") is True,
+            "prepMinutes": saved.get("prepMinutes") if saved.get("prepMinutes") in PREP_MINUTES else 15,
             **{name: tidings_number(saved.get(name), name) for name in TIDINGS_LIMITS}}
 
 
@@ -4867,6 +4872,7 @@ def tidings_view(state: dict | None = None) -> dict:
             "learns": state["learns"],
             "hours": state["hours"], "limit": state["limit"], "days": state["days"], "keep": state["keep"],
             "chat": state["chat"] if state["chat"] in known else None, "lead": state["lead"],
+            "prep": state["prep"], "prepMinutes": state["prepMinutes"],
             "cards": [card for card in state["cards"] if card.get("id") not in state["closed"]] if state["on"] else []}
 
 
@@ -4919,9 +4925,11 @@ def ensure_tidings(run=subprocess.run) -> None:
 def change_tidings(fields: dict) -> dict:
     with tidings_lock:
         state = tidings_state()
-        for name in ("on", "web", "asks", "thumbs", "learns"):
+        for name in ("on", "web", "asks", "thumbs", "learns", "prep"):
             if isinstance(fields.get(name), bool):
                 state[name] = fields[name]
+        if fields.get("prepMinutes") in PREP_MINUTES:
+            state["prepMinutes"] = fields["prepMinutes"]
         # An app from before Watching still sets these here, so they go to Watching, where they're kept.
         shared = {name: fields[name] for name in TIDINGS_SOURCES if isinstance(fields.get(name), bool)}
         if shared:
@@ -5307,6 +5315,236 @@ def run_tidings(run=subprocess.run) -> None:
     print(f"tidings: {len(cards)} cards, {len(fresh)} new, {repeats} already raised", flush=True)
 
 
+PREP_MINUTES = (5, 10, 15, 30)
+PREP_LOOK_SECONDS = 300
+PREP_KEPT_DAYS = 7
+PREP_GUESTS = 6
+PREP_THREADS = 3
+PREP_ASK = """A meeting starts in about {minutes} minutes. Write a short prep note for the owner, from only what's
+below. Say who they're meeting and anything from the recent mail with those people that matters for this
+meeting: what was asked, promised or left open. If there's nothing useful, say only who it is with.
+Answer with JSON only: {{"body": "two or three short sentences, under 60 words, plain words, no greeting"}}
+{guide}
+Meeting:
+{material}
+"""
+prep_lock = threading.Lock()
+prep_running = threading.Event()
+# The next two hours of meetings, read every five minutes rather than every pass, since each read unlocks gog.
+prep_cache: dict = {"at": 0.0, "meetings": []}
+
+
+def prep_time(value: dict) -> float | None:
+    """An event's start or end as a timestamp. All-day events have only a date, and are left out."""
+    text = value.get("dateTime") if isinstance(value, dict) else None
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def upcoming_meetings(account: str, now: float, gog=None) -> list[dict]:
+    """Meetings on one Google account in the next two hours that have someone else invited, and that the owner
+    hasn't declined. Read-only."""
+    gog = gog or run_gog
+    start = datetime.datetime.fromtimestamp(now).astimezone()
+    result = gog(["--readonly", "calendar", "events", "-a", account, "--from", start.isoformat(timespec="seconds"),
+                  "--to", (start + datetime.timedelta(hours=2)).isoformat(timespec="seconds")])
+    if result.returncode != 0:
+        raise RuntimeError(f"gog calendar exit {result.returncode}")
+    meetings = []
+    for event in json.loads(result.stdout or "{}").get("events") or []:
+        if not isinstance(event, dict) or event.get("status") == "cancelled":
+            continue
+        begins = prep_time(event.get("start") or {})
+        attendees = [person for person in event.get("attendees") or [] if isinstance(person, dict)]
+        me = next((person for person in attendees if person.get("self")), None)
+        guests = [{"name": " ".join(str(person.get("displayName") or "").split())[:80], "email": str(person.get("email") or "")[:120]}
+                  for person in attendees if not person.get("self") and not person.get("resource")]
+        if begins is None or not guests or (me and me.get("responseStatus") == "declined"):
+            continue
+        link = event.get("hangoutLink") if isinstance(event.get("hangoutLink"), str) else ""
+        meetings.append({"id": hashlib.sha256(f"{account}|{event.get('id')}|{begins}".encode()).hexdigest()[:16],
+                         "account": account, "title": clipped(" ".join(str(event.get("summary") or "Meeting").split()), 80),
+                         "start": begins, "place": clipped(" ".join(str(event.get("location") or "").split()), 120),
+                         "link": link if link.startswith("https://") else "",
+                         "html": event.get("htmlLink") if str(event.get("htmlLink") or "").startswith("https://") else "",
+                         "about": clipped(" ".join(str(event.get("description") or "").split()), 800),
+                         "guests": guests[:PREP_GUESTS]})
+    return meetings
+
+
+def meetings_due(meetings: list[dict], now: float, minutes: int, prepped: dict) -> list[dict]:
+    """Meetings starting about `minutes` from now, with a little slack either side so a late pass still
+    catches one, and none prepared for already."""
+    lead = minutes * 60
+    return [meeting for meeting in meetings if meeting["id"] not in prepped
+            and lead - 180 <= meeting["start"] - now <= lead + 120]
+
+
+def prep_threads(account: str, guests: list[dict], gog=None) -> list[str]:
+    """The latest mail with these guests, as subject and first lines. Read-only, and only with Mail switched on
+    in Watching."""
+    gog = gog or run_gog
+    emails = [guest["email"] for guest in guests if "@" in guest["email"]]
+    if not emails:
+        return []
+    query = "(" + " OR ".join(f"from:{email} OR to:{email}" for email in emails) + ") newer_than:120d"
+    result = gog(["--readonly", "gmail", "search", query, "-a", account, "--max", str(PREP_THREADS)])
+    if result.returncode != 0:
+        return []
+    found = json.loads(result.stdout or "{}")
+    threads = found.get("threads") if isinstance(found, dict) else found
+    lines = []
+    for thread in threads if isinstance(threads, list) else []:
+        if not isinstance(thread, dict):
+            continue
+        # gog's search gives the subject, sender and date, not the body, which is plenty for a heads-up.
+        subject = " ".join(str(thread.get("subject") or "").split())
+        sender = " ".join(str(thread.get("from") or "").split())
+        day = str(thread.get("date") or "")[:16]
+        if subject:
+            lines.append(clipped(f"{day} {sender}: {subject}".strip(), 300))
+    return lines[:PREP_THREADS]
+
+
+def prep_material(meeting: dict, threads: list[str]) -> str:
+    when = datetime.datetime.fromtimestamp(meeting["start"]).astimezone().strftime("%-I:%M %p")
+    guests = ", ".join(guest["name"] + (f" <{guest['email']}>" if guest["email"] else "") if guest["name"] else guest["email"]
+                       for guest in meeting["guests"])
+    parts = [f"{meeting['title']}, at {when}", f"With: {guests}"]
+    if meeting["place"]:
+        parts.append(f"Where: {meeting['place']}")
+    if meeting["about"]:
+        parts.append(f"Its description: {meeting['about']}")
+    if threads:
+        parts.append("Recent mail with them, newest first:\n" + "\n".join(f"- {line}" for line in threads))
+    return "\n".join(parts)
+
+
+def prep_note(material: str, minutes: int, run=subprocess.run) -> str:
+    """A few sentences from the Tidings bot, which has no tools and contacts no one. Empty when it fails, and
+    the card goes out without them."""
+    if not tidings_home().is_dir():
+        return ""
+    guide = watch_guide_text()
+    ask = PREP_ASK.format(minutes=minutes, material=material,
+                          guide=TIDINGS_GUIDE.format(guide=guide) if guide else "")
+    handle, name = tempfile.mkstemp(prefix="prep.", suffix=".txt")
+    query = pathlib.Path(name)
+    try:
+        with os.fdopen(handle, "w") as file:
+            file.write(ask)
+        state = tidings_state()
+        command = [hermes_binary(), "-p", TIDINGS, "chat", "-Q", "--oneshot", "--query-file", str(query),
+                   "-t", "todo", "--max-turns", "2", "--run-budget", "120"]
+        model = state["model"] or default_model()
+        if model:
+            command += ["-m", model["model"], "--provider", model["provider"]]
+        done = run(command, capture_output=True, text=True, timeout=180, env=hermes_env(), cwd=str(tidings_home()))
+        if done.returncode != 0:
+            print(f"prep: note exit {done.returncode}", flush=True)
+            return ""
+        start, end = done.stdout.find("{"), done.stdout.rfind("}")
+        answer = json.loads(done.stdout[start:end + 1]) if 0 <= start < end else {}
+        return clipped(" ".join(str(answer.get("body") or "").split()), 480) if isinstance(answer, dict) else ""
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"prep: note {type(error).__name__}", flush=True)
+        return ""
+    finally:
+        query.unlink(missing_ok=True)
+
+
+def prep_card(meeting: dict, note: str) -> dict:
+    when = datetime.datetime.fromtimestamp(meeting["start"]).astimezone().strftime("%-I:%M")
+    names = [guest["name"] or guest["email"].split("@")[0] for guest in meeting["guests"]]
+    who = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+    card = {"id": "prep-" + meeting["id"], "key": "prep-" + meeting["id"], "kind": "headsup",
+            "title": clipped(f"{meeting['title']} at {when}", 80), "body": note or f"With {who}.",
+            "at": time.time(), "from": ["Google Calendar"], "prep": True}
+    if meeting["link"] or meeting["html"]:
+        card["link"] = meeting["link"] or meeting["html"]
+    if meeting["place"]:
+        card["place"] = meeting["place"]
+    return card
+
+
+def prepped_meetings(now: float | None = None) -> dict:
+    try:
+        saved = read_json(PREP_STATE) if PREP_STATE.exists() else {}
+    except (OSError, ValueError):
+        saved = {}
+    cutoff = (now or time.time()) - PREP_KEPT_DAYS * 86400
+    return {key: at for key, at in saved.items() if isinstance(at, (int, float)) and at > cutoff}
+
+
+def run_meeting_prep(now: float | None = None, gog=None, run=subprocess.run, alert=None) -> int:
+    """One pass: for each meeting with guests starting about the chosen time from now, one card in Tidings
+    and a notification. Needs Tidings and Meeting prep on, and Google Calendar on in Watching. Mail is read
+    for the note only when it's on in Watching too."""
+    now = now or time.time()
+    state = tidings_state()
+    if not (state["on"] and state["prep"] and watching_on("google-calendar")):
+        return 0
+    with prep_lock:
+        prepped = prepped_meetings(now)
+    if now - prep_cache["at"] >= PREP_LOOK_SECONDS or gog is not None:
+        meetings = []
+        try:
+            for account in calendar_accounts():
+                meetings += upcoming_meetings(account, now, gog)
+            prep_cache.update(at=now, meetings=meetings)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            print(f"prep: calendar {type(error).__name__}", flush=True)
+    due = meetings_due(prep_cache["meetings"], now, state["prepMinutes"], prepped)
+    made = 0
+    for meeting in due:
+        threads = prep_threads(meeting["account"], meeting["guests"], gog) if watching_on("mail") else []
+        card = prep_card(meeting, prep_note(prep_material(meeting, threads), state["prepMinutes"], run))
+        with prep_lock:
+            prepped = prepped_meetings(now)
+            if meeting["id"] in prepped:
+                continue
+            prepped[meeting["id"]] = now
+            PREP_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json(PREP_STATE, prepped)
+        with tidings_lock:
+            latest = tidings_state()
+            latest["cards"] = [card] + [old for old in latest["cards"] if old.get("id") != card["id"]][:TIDINGS_KEPT - 1]
+            save_tidings(latest)
+        made += 1
+        print(f"prep: card for a meeting in {round((meeting['start'] - now) / 60)} min, mail {'read' if threads else 'not read'}", flush=True)
+        try:
+            (alert or prep_alert)(card)
+        except Exception as error:  # the card is in the feed; only the notification failed
+            print(f"prep: alert failed ({type(error).__name__})", flush=True)
+    return made
+
+
+def prep_alert(card: dict) -> None:
+    # From the bot Tidings' cards ask, or the main one, so the notification has a face.
+    known = homes()
+    chosen = tidings_state()["chat"]
+    profile = chosen if chosen in known else "default" if "default" in known else next(iter(known), None)
+    if profile:
+        push(profile, card["body"], data={"screen": "tidings"}, title=card["title"])
+
+
+def prep_loop() -> None:
+    while True:
+        try:
+            if not prep_running.is_set():
+                prep_running.set()
+                try:
+                    run_meeting_prep()
+                finally:
+                    prep_running.clear()
+        except Exception as error:
+            print(f"prep loop: {type(error).__name__}", flush=True)
+        time.sleep(60)
+
 def start_tidings(pressed: bool = False) -> bool:
     """Starts a run unless one is going. A run asked for by hand waits out a short gap since the last."""
     # Checked and set together, so the hourly loop and a press at the same moment can't both start a run.
@@ -5458,8 +5696,10 @@ WATCH_SOURCES = {
                  "detail": "When you arrive at or leave a place you've saved, never a trail of where you go"},
     "focus": {"title": "Focus", "where": "phone", "uses": [],
               "detail": "Which Focus is on"},
-    "mail": {"title": "Mail", "where": "mac", "uses": [],
-             "detail": "New mail: who it's from, the subject and the first lines"},
+    "google-calendar": {"title": "Google Calendar", "where": "mac", "uses": ["Meeting prep"],
+                        "detail": "Meetings on the Google accounts signed in on your Mac: when, the title and who's invited"},
+    "mail": {"title": "Mail", "where": "mac", "uses": ["Meeting prep"],
+             "detail": "Gmail on your Mac: who mail is from, the subject and the first lines"},
     "messages": {"title": "Messages", "where": "mac", "uses": [],
                  "detail": "New texts: who they're from and the first lines"},
     "notes": {"title": "Notes", "where": "mac", "uses": [],
@@ -7743,4 +7983,5 @@ if __name__ == "__main__":
     threading.Thread(target=servers_loop, daemon=True).start()
     threading.Thread(target=tidings_loop, daemon=True).start()
     threading.Thread(target=watch_loop, daemon=True).start()
+    threading.Thread(target=prep_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
