@@ -1,9 +1,9 @@
 {
  "version": "1.2",
- "build": 33,
- "file": "Hermit-1.2-33.dmg",
- "sha256": "e56a7201d5665236486788d9408659531cc5820925dfb27ffd778747413d8107",
- "notes": "Bots can call you",
- "size": 26811106,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-33/Hermit-1.2-33.dmg"
+ "build": 34,
+ "file": "Hermit-1.2-34.dmg",
+ "sha256": "bd381a91f47f31e3994b16f2275dcbc5824269532344f3b8adb742f507ca6319",
+ "notes": "Answered calls connect at once",
+ "size": 26815848,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-34/Hermit-1.2-34.dmg"
 }
