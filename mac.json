@@ -1,9 +1,9 @@
 {
  "version": "1.2",
- "build": 34,
- "file": "Hermit-1.2-34.dmg",
- "sha256": "bd381a91f47f31e3994b16f2275dcbc5824269532344f3b8adb742f507ca6319",
- "notes": "Answered calls connect at once",
- "size": 26815848,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-34/Hermit-1.2-34.dmg"
+ "build": 35,
+ "file": "Hermit-1.2-35.dmg",
+ "sha256": "a5401f2f588e0d7c46dd802e88df45518d9b1fd74a7e9c94147421f3dc549ad7",
+ "notes": "Switch sessions while a bot works, routines that archive their sessions, hide a mini app",
+ "size": 26901089,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-35/Hermit-1.2-35.dmg"
 }
