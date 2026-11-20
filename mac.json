@@ -1,9 +1,9 @@
 {
  "version": "1.2",
- "build": 35,
- "file": "Hermit-1.2-35.dmg",
- "sha256": "a5401f2f588e0d7c46dd802e88df45518d9b1fd74a7e9c94147421f3dc549ad7",
- "notes": "Switch sessions while a bot works, routines that archive their sessions, hide a mini app",
- "size": 26901089,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-35/Hermit-1.2-35.dmg"
+ "build": 36,
+ "file": "Hermit-1.2-36.dmg",
+ "sha256": "1ad942ee2a10221492396b8e44db1d3139b27daaffc5ea6bf9a3d17ecd527976",
+ "notes": "Bots can call you with your brief ready, Health and Places for the bots you choose, and steadier sessions and calls",
+ "size": 27007136,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-36/Hermit-1.2-36.dmg"
 }
