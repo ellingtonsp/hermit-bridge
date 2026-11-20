@@ -7143,10 +7143,27 @@ def may_ring(device: dict, profile: str, routine: str | None, asked: bool) -> bo
     return asked and bool(device.get("rings"))
 
 
+# Apple takes a VoIP push of up to 5 KB, so what the call has to say is kept well inside that.
+RING_SAID_BYTES = 3500
+
+
+def ring_said(reply: str | None) -> str:
+    """What the bot just wrote, for the call to say when it's answered. A voice service can put its own
+    prompt above the call's instructions, and GPT-Live did: given only "Morning brief" it made up market news
+    and went off to research a brief that was already written. Text sent during the call is what it speaks."""
+    text = (reply or "").strip()
+    if text in SILENT_REPLIES:
+        return ""
+    while len(text.encode()) > RING_SAID_BYTES:
+        text = text[:int(len(text) * 0.9)].rstrip() + "\u2026"
+    return text
+
+
 def ring(profile: str, session_id: str | None, reason: str, routine: str | None = None, asked: bool = False,
-         only: str | None = None) -> int:
+         only: str | None = None, said: str = "") -> int:
     """Rings the phones that allow it with a VoIP push, which the app turns into an incoming call. `only`
-    rings one device's token, for the test in Settings. Returns how many Apple accepted."""
+    rings one device's token, for the test in Settings. `said` is what the bot wrote, so the call starts
+    with it in hand. Returns how many Apple accepted."""
     if not only:
         with rings_lock:
             if time.time() - last_rings.get(profile, 0) < RING_GAP_SECONDS:
@@ -7161,7 +7178,8 @@ def ring(profile: str, session_id: str | None, reason: str, routine: str | None 
     home = homes().get(profile)
     title = (bot_info(profile, home)["title"] if home else None) or profile.replace("-", " ").title()
     body = json.dumps({"profile": profile, "session": session_id or "", "name": title,
-                       "reason": (reason or routine or "")[:120], "id": str(uuid.uuid4())})
+                       "reason": (reason or routine or "")[:120], "said": ring_said(said), "id": str(uuid.uuid4())},
+                      ensure_ascii=False)
     authorization = apns_token(config)
     reached = 0
     for device in load_devices():
@@ -7193,7 +7211,7 @@ def ring_after_turn(session_id: str, event: dict) -> None:
     profile = owner[0]
     chat = session_id if owner[1] == "Bot Chat" else bot_chat_session(profile)
     asked = event.get("ring") is not None
-    ring(profile, chat, str(event.get("ring") or ""), event.get("routine"), asked)
+    ring(profile, chat, str(event.get("ring") or ""), event.get("routine"), asked, said=str(event.get("reply") or ""))
 
 
 def publish(session_id: str, event: dict) -> bool:
