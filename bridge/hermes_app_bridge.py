@@ -803,7 +803,20 @@ def run_gog(arguments: list[str], stdin: str | None = None, timeout: int = 45) -
 
 
 def read_json(path: pathlib.Path) -> dict:
+    # Raises on an unreadable file, so settings that guard something fail closed. See read_state.
     return json.loads(path.read_text()) if path.exists() else {}
+
+
+def read_state(path: pathlib.Path) -> dict:
+    """Bookkeeping that's safe to start over, such as read marks: empty when the file is unreadable, rather
+    than failing every request that reads it until someone mends the file by hand. Never for a setting that
+    allows something."""
+    try:
+        value = read_json(path)
+    except (ValueError, UnicodeDecodeError) as error:
+        print(f"state: {path.name} unreadable, starting it over: {type(error).__name__}", flush=True)
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def write_json(path: pathlib.Path, value: dict | list) -> None:
@@ -812,6 +825,9 @@ def write_json(path: pathlib.Path, value: dict | list) -> None:
     try:
         with os.fdopen(handle, "w") as file:
             file.write(json.dumps(value))
+            # On disk before it takes the real name, so a power cut leaves the old file, not an empty one.
+            file.flush()
+            os.fsync(file.fileno())
         os.replace(temporary, path)
     except BaseException:
         pathlib.Path(temporary).unlink(missing_ok=True)
@@ -2567,6 +2583,9 @@ CALLS = STATE / "calls"
 MAX_CALLS = 60
 
 
+calls_lock = threading.Lock()
+
+
 def save_call(profile: str, record: dict) -> None:
     """A finished phone call's transcript, kept on the Mac so every device shows it in the chat."""
     lines = [{"who": "you" if line.get("who") == "you" else "bot", "text": str(line.get("text") or "")[:2000]}
@@ -2577,8 +2596,10 @@ def save_call(profile: str, record: dict) -> None:
             "seconds": max(0, int(record.get("seconds") or 0)), "lines": lines}
     CALLS.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = CALLS / f"{profile}.json"
-    calls = read_json(path).get("calls", []) if path.exists() else []
-    write_json(path, {"calls": (calls + [call])[-MAX_CALLS:]})
+    # Two calls ending together each read the list before the other wrote, and one transcript was lost.
+    with calls_lock:
+        calls = read_json(path).get("calls", []) if path.exists() else []
+        write_json(path, {"calls": (calls + [call])[-MAX_CALLS:]})
 
 
 def calls_for(profile: str, session: str) -> list[dict]:
@@ -3010,7 +3031,7 @@ tidy_lock = threading.Lock()
 
 def tidy_routines() -> dict[str, list[str]]:
     """Profile to the names of its routines that archive their runs."""
-    saved = read_json(TIDY_ROUTINES)
+    saved = read_state(TIDY_ROUTINES)
     profiles = saved.get("profiles") if isinstance(saved, dict) else None
     if not isinstance(profiles, dict):
         return {}
@@ -3089,13 +3110,25 @@ def tidy_pass() -> int:
     return archived
 
 
+tidy_running = threading.Lock()
+
+
+def tidy_once() -> None:
+    """One pass, unless one is already going: a few quick toggles in a row ran several sweeps at once."""
+    if not tidy_running.acquire(blocking=False):
+        return
+    try:
+        if (count := tidy_pass()):
+            print(f"tidy: archived {count} routine session(s)", flush=True)
+    except Exception as error:
+        print(f"tidy: {type(error).__name__}", flush=True)
+    finally:
+        tidy_running.release()
+
+
 def tidy_loop() -> None:
     while True:
-        try:
-            if (count := tidy_pass()):
-                print(f"tidy: archived {count} routine session(s)", flush=True)
-        except Exception as error:
-            print(f"tidy: {type(error).__name__}", flush=True)
+        tidy_once()
         time.sleep(TIDY_SECONDS)
 
 
@@ -3630,7 +3663,7 @@ def inbox_item(profile: str, session_id: str, state: dict) -> dict:
 
 
 def load_inbox() -> dict:
-    return {"read": {}, "marked": [], **read_json(INBOX)}
+    return {"read": {}, "marked": [], **read_state(INBOX)}
 
 
 def inbox_state(sessions: list[dict]) -> list[dict]:
@@ -5276,6 +5309,9 @@ def tidings_material(state: dict, now: float | None = None) -> tuple[str, list[s
                 opens[ref] = {"kind": name, "value": values[index] if index < len(values) else ""}
                 lines.append(f"[{ref}] {line}")
             parts.append(f"## {heading}\n" + "\n".join(lines))
+    for name, heading in (("health", "Apple Health, by day"), ("location", "Places, arriving and leaving")):
+        if lines := device_lines(name, now):
+            parts.append(f"## {heading}\n" + "\n".join(lines))
     return "\n\n".join(parts), bots, opens
 
 
@@ -6000,7 +6036,10 @@ WATCH_SOURCES = {
                  "detail": "Your events for the next two weeks"},
     "reminders": {"title": "Reminders", "where": "phone", "uses": ["Tidings"],
                   "detail": "Reminders you haven't ticked off"},
-    "location": {"title": "Places", "where": "phone", "uses": [],
+    "health": {"title": "Health", "where": "phone", "uses": ["Tidings", "the bots you choose"],
+               "detail": "A daily summary from Apple Health: sleep, steps, exercise, workouts, resting heart rate, "
+                         "HRV, mindful minutes and weight"},
+    "location": {"title": "Places", "where": "phone", "uses": ["Tidings", "the bots you choose"],
                  "detail": "When you arrive at or leave a place you've saved, never a trail of where you go"},
     "focus": {"title": "Focus", "where": "phone", "uses": [],
               "detail": "Which Focus is on"},
@@ -6014,6 +6053,9 @@ WATCH_SOURCES = {
               "detail": "Notes you add or change"},
 }
 WATCH_CONNECTOR_SECONDS = 8
+# Sources a bot may read for itself through the plugin's hermit_device tool, once the owner names it. Tidings
+# reads them whenever the source is on.
+READABLE_SOURCES = ("health", "location")
 watching_lock = threading.Lock()
 
 
@@ -6038,8 +6080,11 @@ def watching_state() -> dict:
             pass
     sources = saved.get("sources") if isinstance(saved.get("sources"), dict) else {}
     connectors_on = saved.get("connectors") if isinstance(saved.get("connectors"), dict) else {}
+    readers = saved.get("readers") if isinstance(saved.get("readers"), dict) else {}
     return {"sources": {name: sources.get(name) is True for name in WATCH_SOURCES},
-            "connectors": {key: True for key, value in connectors_on.items() if isinstance(key, str) and value is True}}
+            "connectors": {key: True for key, value in connectors_on.items() if isinstance(key, str) and value is True},
+            "readers": {name: sorted({bot for bot in readers.get(name) or [] if isinstance(bot, str) and bot})
+                        for name in READABLE_SOURCES}}
 
 
 def watching_on(source: str) -> bool:
@@ -6094,8 +6139,18 @@ def watch_connectors(listing=None) -> list[dict]:
 
 def watching_view(listing=None) -> dict:
     state = watching_state()
-    return {"sources": [{"id": name, **info, "on": state["sources"][name]} for name, info in WATCH_SOURCES.items()],
+    known = homes()
+    return {"sources": [{"id": name, **info, "on": state["sources"][name],
+                         **({"readers": [bot for bot in state["readers"][name] if bot in known]}
+                            if name in READABLE_SOURCES else {})}
+                        for name, info in WATCH_SOURCES.items()],
             "bots": watch_connectors(listing)}
+
+
+def source_reader(profile: str, source: str) -> bool:
+    """Whether this bot may read this source for itself: the source is on and the owner chose the bot."""
+    state = watching_state()
+    return source in READABLE_SOURCES and state["sources"].get(source, False) and profile in state["readers"][source]
 
 
 def change_watching(fields: dict, device: str | None) -> dict:
@@ -6110,7 +6165,14 @@ def change_watching(fields: dict, device: str | None) -> dict:
         profile, _, name = key.partition("/") if isinstance(key, str) else ("", "", "")
         if profile in known and profile != TIDINGS and name and len(name) <= 128 and isinstance(value, bool):
             wanted_connectors[key] = value
-    if device is None and (any(wanted.values()) or any(wanted_connectors.values())):
+    readers_sent = fields.get("readers") if isinstance(fields.get("readers"), dict) else {}
+    wanted_readers = {}
+    for source, bots in readers_sent.items():
+        if source in READABLE_SOURCES and isinstance(bots, dict):
+            for bot, value in bots.items():
+                if bot in known and bot != TIDINGS and isinstance(value, bool):
+                    wanted_readers[(source, bot)] = value
+    if device is None and (any(wanted.values()) or any(wanted_connectors.values()) or any(wanted_readers.values())):
         raise PermissionError("Turn watching on from the app, on a device paired with its own key.")
     with watching_lock:
         state = watching_state()
@@ -6120,11 +6182,20 @@ def change_watching(fields: dict, device: str | None) -> dict:
                 state["connectors"][key] = True
             else:
                 state["connectors"].pop(key, None)
+        for (source, bot), value in wanted_readers.items():
+            chosen = set(state["readers"][source])
+            chosen.add(bot) if value else chosen.discard(bot)
+            state["readers"][source] = sorted(chosen)
         WATCHING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_json(WATCHING, state)
     changed = [f"{name} {'on' if value else 'off'}" for name, value in {**wanted, **wanted_connectors}.items()]
+    changed += [f"{bot} {'reads' if value else 'stops reading'} {source}" for (source, bot), value in wanted_readers.items()]
     if changed:
         print("watching: " + ", ".join(changed), flush=True)
+    # What a device sent for a source that's now off is forgotten at once.
+    gone = [name for name, value in wanted.items() if name in READABLE_SOURCES and value is False]
+    if gone:
+        forget_device_data(gone)
     # Tidings forgets what a device had sent for a source that's now off.
     if any(name in TIDINGS_SOURCES and value is False for name, value in wanted.items()):
         with tidings_lock:
@@ -6132,6 +6203,95 @@ def change_watching(fields: dict, device: str | None) -> dict:
             if kept != tidings_context():
                 write_json(TIDINGS_CONTEXT, kept)
     return state
+
+# ---- Health and Places, from the phone. The phone reads Apple Health and its saved places and sends short plain
+# lines here, only while the source is on in Watching. Tidings reads them, and so does a bot the owner named for
+# that source, through the plugin's hermit_device tool, which reads this file and Watching itself. Only a device's
+# own key may send: a bot holds its profile's key and mustn't be able to write what it later reads as fact.
+DEVICE_DATA = STATE / "device-data.json"
+DEVICE_HEALTH_LINES = 40
+DEVICE_PLACE_EVENTS = 60
+DEVICE_PLACE_DAYS = 7
+DEVICE_DATA_DAYS = 3
+device_data_lock = threading.Lock()
+
+
+def device_data() -> dict:
+    saved = read_state(DEVICE_DATA)
+    return {name: value for name, value in saved.items() if name in READABLE_SOURCES and isinstance(value, dict)}
+
+
+def forget_device_data(sources: list[str]) -> None:
+    with device_data_lock:
+        data = device_data()
+        kept = {name: value for name, value in data.items() if name not in sources}
+        if kept != data:
+            DEVICE_DATA.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json(DEVICE_DATA, kept)
+
+
+def plain_line(value, limit: int = 200) -> str:
+    return clipped(" ".join(str(value).split()), limit) if isinstance(value, str) else ""
+
+
+def take_device_data(fields: dict, device: str | None) -> dict:
+    """Health's summary lines, replaced whole each time, and Places events, added to a week's list. A source
+    that's off is ignored, and `withdrawn` takes back what this device sent for one it stopped sharing."""
+    if device is None:
+        raise PermissionError("Only the app, on a device paired with its own key, can send this.")
+    now = time.time()
+    with device_data_lock:
+        data = device_data()
+        withdrawn = fields.get("withdrawn") if isinstance(fields.get("withdrawn"), list) else []
+        for name in READABLE_SOURCES:
+            if name in withdrawn and (data.get(name) or {}).get("from") == device:
+                data.pop(name, None)
+        health = fields.get("health")
+        if watching_on("health") and isinstance(health, list):
+            lines = [line for line in (plain_line(item) for item in health) if line][:DEVICE_HEALTH_LINES]
+            data["health"] = {"at": now, "from": device, "lines": lines}
+        places = fields.get("places")
+        if watching_on("location") and isinstance(places, dict):
+            before = data.get("location") or {}
+            events = [event for event in before.get("events") or []
+                      if isinstance(event, dict) and now - float(event.get("at") or 0) < DEVICE_PLACE_DAYS * 86400]
+            for event in places.get("events") or []:
+                if not isinstance(event, dict) or event.get("kind") not in ("arrived", "left"):
+                    continue
+                place = plain_line(event.get("place"), 60)
+                when = event.get("at")
+                if place and isinstance(when, (int, float)) and now - DEVICE_PLACE_DAYS * 86400 < when <= now + 300:
+                    entry = {"at": float(when), "place": place, "kind": event["kind"]}
+                    if entry not in events:
+                        events.append(entry)
+            events = sorted(events, key=lambda event: event["at"])[-DEVICE_PLACE_EVENTS:]
+            saved = [plain_line(name, 60) for name in places.get("saved") or []] if isinstance(places.get("saved"), list) else before.get("saved") or []
+            data["location"] = {"at": now, "from": device, "events": events, "saved": [name for name in saved if name][:20]}
+            for event in events[-3:]:
+                if event["at"] > float(before.get("at") or 0):
+                    print(f"places: {event['kind']} {event['place']}", flush=True)
+        DEVICE_DATA.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(DEVICE_DATA, data)
+    # Which sources are on, so the phone reads and sends only those, and an empty request can just ask.
+    return {"kept": sorted(data), "on": [name for name in READABLE_SOURCES if watching_on(name)]}
+
+
+def device_lines(source: str, now: float | None = None) -> list[str]:
+    """What a reader sees of a source: plain lines, newest last, or nothing when it's off or stale."""
+    now = now or time.time()
+    if not watching_on(source):
+        return []
+    sent = device_data().get(source) or {}
+    if now - float(sent.get("at") or 0) > DEVICE_DATA_DAYS * 86400:
+        return []
+    if source == "health":
+        return list(sent.get("lines") or [])
+    lines = []
+    for event in sent.get("events") or []:
+        when = datetime.datetime.fromtimestamp(event["at"]).strftime("%a %d %b %-I:%M %p")
+        lines.append(f"{when}: {'arrived at' if event['kind'] == 'arrived' else 'left'} {event['place']}")
+    return lines
+
 
 WATCH_OWNER_CHARS = 1500
 WATCH_LINE_CHARS = 200
@@ -6759,7 +6919,13 @@ devices_lock = threading.Lock()
 
 
 def load_devices() -> list[dict]:
-    return json.loads(DEVICES.read_text()) if DEVICES.exists() else []
+    # Unreadable counts as none: each app registers again when it opens.
+    try:
+        devices = json.loads(DEVICES.read_text()) if DEVICES.exists() else []
+    except (ValueError, UnicodeDecodeError):
+        print("state: devices unreadable, starting it over", flush=True)
+        return []
+    return [d for d in devices if isinstance(d, dict) and d.get("token")] if isinstance(devices, list) else []
 
 
 def save_devices(devices: list[dict]) -> None:
@@ -7084,6 +7250,9 @@ PROXY_HEADERS = ("Content-Type", "Accept", "Idempotency-Key")
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # A peer that stops mid-request, or a kept-alive connection gone quiet, frees its thread after this long.
+    # Streams aren't cut by it: they write a ping well inside it.
+    timeout = 60
 
     def log_message(self, *_args):
         pass
@@ -7523,13 +7692,15 @@ class Handler(BaseHTTPRequestHandler):
         listener: queue.Queue = queue.Queue()
         with lock:
             subscribers.setdefault(session_id, []).append(listener)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
+        # The headers go inside the try too: a phone that hangs up before them left its listener behind,
+        # filling with every later event for the session.
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
             self.wfile.write(b": open\n\n")
             self.wfile.flush()
             while True:
@@ -7551,7 +7722,8 @@ class Handler(BaseHTTPRequestHandler):
         except VoiceError as error:  # written for people, so it's shown as it is
             return self.json(409, {"error": {"message": str(error)}})
         except Exception as error:  # the app shows this message, so keep it free of internals
-            print(f"gateway error: {type(error).__name__}: {error}", flush=True)
+            print(f"gateway error: {getattr(self, 'command', '')} {urllib.parse.urlsplit(getattr(self, 'path', '')).path}: "
+                  f"{type(error).__name__}: {error}", flush=True)
             return self.json(502, {"error": {"message": "Hermes couldn't complete that"}})
         # Sent outside the try: a phone that hung up mid-reply isn't a Hermes failure, and writing a
         # second reply to a closed connection only raised again.
@@ -7858,7 +8030,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(400, {"error": {"message": "That routine needs a name."}})
             names = set_tidy_routine(profile, routine, bool(fields.get("on")))
             # At once, so earlier runs leave the list now and not in five minutes.
-            threading.Thread(target=tidy_pass, daemon=True).start()
+            threading.Thread(target=tidy_once, daemon=True).start()
             return self.json(200, {"routines": names})
         if path == "/updates/bridge":
             if not authorized(header):
@@ -8028,6 +8200,22 @@ class Handler(BaseHTTPRequestHandler):
             except PermissionError as error:
                 return self.json(403, {"error": {"message": str(error)}})
             return self.guarded(watching_view)
+        if path == "/device/data":
+            data = self.body()
+            if not authorized(header):
+                return self.json(401, {"error": "unauthorized"})
+            try:
+                fields = json.loads(data or b"{}")
+            except ValueError:
+                fields = None
+            if not isinstance(fields, dict):
+                return self.json(400, {"error": {"message": "That request couldn't be read"}})
+            token = (header or "").removeprefix("Bearer ").strip()
+            device = device_for(token) if token.startswith(DEVICE_PREFIX) else None
+            try:
+                return self.json(200, take_device_data(fields, device))
+            except PermissionError as error:
+                return self.json(403, {"error": {"message": str(error)}})
         if path == "/live/register":
             return self.live_register(header)
         if path == "/inbox/state" or path == "/inbox/read" or path == "/inbox/close":

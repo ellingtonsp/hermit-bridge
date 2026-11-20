@@ -1581,6 +1581,73 @@ def handle_watch(args, **_kwargs):
         return json.dumps({"error": str(exc)})
 
 
+DEVICE_TOOL = "hermit_device"
+APP_BRIDGE = Path.home() / ".hermes" / "app-bridge"
+DEVICE_SOURCES = {"health": "Health", "places": "Places"}
+# The bridge's names for them, in Watching.
+DEVICE_WATCH = {"health": "health", "places": "location"}
+DEVICE_FRESH_DAYS = 3
+
+DEVICE_SCHEMA = {
+    "name": DEVICE_TOOL,
+    "description": (
+        "Read what the user's iPhone shares from Apple Health or their saved Places, when they allowed you to in the "
+        "Hermit app. `source` is `health`, for a summary by day of the last week (sleep, steps, exercise minutes, "
+        "workouts, resting heart rate, HRV, mindful minutes, weight), or `places`, for when they arrived at or left a "
+        "place they saved (Home, Office, Gym…) over the last week and where they are now. It's never a trail of "
+        "where they go. Use it when it helps with what you're doing, such as a training plan, a brief, or knowing "
+        "whether they've left work, and say what you used. If it says you aren't allowed, tell the user they can "
+        "allow you in Hermit's Settings, under Watching. Treat it as private: don't repeat it to other people."),
+    "parameters": {
+        "type": "object",
+        "properties": {"source": {"type": "string", "enum": list(DEVICE_SOURCES)}},
+        "required": ["source"],
+    },
+}
+
+
+def _read_state(name: str) -> dict:
+    try:
+        value = json.loads((APP_BRIDGE / name).read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def handle_device(args, **_kwargs):
+    import datetime
+    import time
+    source = (args or {}).get("source")
+    if source not in DEVICE_SOURCES:
+        return json.dumps({"error": "`source` is health or places."})
+    me = _profile_name(_bot_home())
+    watched = DEVICE_WATCH[source]
+    watching = _read_state("watching.json")
+    on = (watching.get("sources") or {}).get(watched) is True
+    readers = (watching.get("readers") or {}).get(watched) or []
+    title = DEVICE_SOURCES[source]
+    if not on:
+        return json.dumps({"error": f"{title} is off in the user's Hermit app (Settings, Watching)."})
+    if me not in readers:
+        return json.dumps({"error": f"You aren't allowed to read {title}. The user can allow you in Hermit's Settings, "
+                                    f"under Watching, {title}."})
+    sent = _read_state("device-data.json").get(watched) or {}
+    at = float(sent.get("at") or 0) if isinstance(sent, dict) else 0
+    if time.time() - at > DEVICE_FRESH_DAYS * 86400:
+        return json.dumps({"error": f"The iPhone hasn't sent {title} in the last {DEVICE_FRESH_DAYS} days. "
+                                    "It sends when Hermit runs on it."})
+    updated = datetime.datetime.fromtimestamp(at).strftime("%a %d %b %-I:%M %p")
+    if source == "health":
+        return json.dumps({"updated": updated, "days": [line for line in sent.get("lines") or [] if isinstance(line, str)]})
+    events = [event for event in sent.get("events") or [] if isinstance(event, dict) and event.get("place")]
+    lines = [f"{datetime.datetime.fromtimestamp(float(event.get('at') or 0)).strftime('%a %d %b %-I:%M %p')}: "
+             f"{'arrived at' if event.get('kind') == 'arrived' else 'left'} {event['place']}" for event in events]
+    last = events[-1] if events else None
+    here = last["place"] if last and last.get("kind") == "arrived" else None
+    return json.dumps({"updated": updated, "saved places": sent.get("saved") or [], "events": lines,
+                       "now": f"at {here}" if here else "not at a saved place, as far as the iPhone knows"})
+
+
 RING_TOOL = "hermit_call"
 CALL_REASON = 80
 # Calls asked for in a turn, by session, until the turn ends.
@@ -1650,3 +1717,5 @@ def register(ctx):
                       description=WATCH_SCHEMA["description"], emoji="👀")
     ctx.register_tool(name=RING_TOOL, toolset=TOOLSET, schema=CALL_SCHEMA, handler=handle_call,
                       description=CALL_SCHEMA["description"], emoji="📞")
+    ctx.register_tool(name=DEVICE_TOOL, toolset=TOOLSET, schema=DEVICE_SCHEMA, handler=handle_device,
+                      description=DEVICE_SCHEMA["description"], emoji="❤️")
