@@ -7178,7 +7178,7 @@ def ring(profile: str, session_id: str | None, reason: str, routine: str | None 
     home = homes().get(profile)
     title = (bot_info(profile, home)["title"] if home else None) or profile.replace("-", " ").title()
     body = json.dumps({"profile": profile, "session": session_id or "", "name": title,
-                       "reason": (reason or routine or "")[:120], "said": ring_said(said), "id": str(uuid.uuid4())},
+                       "reason": (reason or routine or "")[:120], "routine": (routine or "")[:120], "said": ring_said(said), "id": str(uuid.uuid4())},
                       ensure_ascii=False)
     authorization = apns_token(config)
     reached = 0
