@@ -5,11 +5,13 @@ so cards survive reloads. The tool itself does nothing external: an action's ``m
 back to the agent as an ordinary user turn, and only then does the agent act.
 """
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 from datetime import datetime
 import socket
+from urllib.parse import urlsplit
 
 # Bot Chat turns drop per-request instructions, so the app ends its messages with this
 # invisible character and the hook below adds the phone guidance for those turns only.
@@ -164,6 +166,25 @@ SCHEMA = {
                 "required": ["with", "messages"],
             },
             "reminder_list": {"type": "string", "description": "A Reminders list name, only if the user asked for one."},
+            "browser": {
+                "type": "object",
+                "description": (
+                    "Ask the user to type something into a page open in the bot browser, such as a password, a "
+                    "verification code or a security answer. What they type goes straight into the page and never "
+                    "reaches you or the chat; you're told only that it was entered. It's typed only into a tab on "
+                    "`site`. Focus the field first, or name it in `field`."),
+                "properties": {
+                    "site": {"type": "string", "description": "The page's https origin, such as https://accounts.google.com."},
+                    "label": {"type": "string", "description": "What to enter, such as 'Verification code'."},
+                    "secret": {"type": "boolean", "description": "Hide it while typing, for a password."},
+                    "enter": {"type": "boolean", "description": "Press Enter after typing it."},
+                    "field": {"type": "string", "description": "A CSS selector for the field, such as input[name=code]."},
+                    "takeover": {"type": "boolean", "description": (
+                        "Instead of typing, ask the user to do something on the page themselves, such as a captcha "
+                        "or a check only a person may make. The card opens the page live in the app.")},
+                },
+                "required": ["site"],
+            },
             "blocks": {
                 "type": "array",
                 "description": (
@@ -325,6 +346,28 @@ def _reminders(raw):
     return items or None
 
 
+def _browser(raw):
+    """A request for the user to type into the bot browser. Only the site's origin is kept, which is where the
+    bridge will type it."""
+    if not isinstance(raw, dict):
+        return None
+    parsed = urlsplit(_text(raw.get("site")) or "")
+    local = parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1")
+    if not parsed.netloc or not (parsed.scheme == "https" or local):
+        raise ValueError("browser.site must be the page's https address, such as https://accounts.google.com")
+    browser = {"site": f"{parsed.scheme}://{parsed.netloc.lower()}"}
+    if (label := _short(raw.get("label"), 60)):
+        browser["label"] = label
+    if (field := _short(raw.get("field"), 200)):
+        browser["field"] = field
+    if (tab := _text(raw.get("tab"))) and re.fullmatch(r"[A-Fa-f0-9]{16,64}", tab):
+        browser["tab"] = tab
+    for key in ("secret", "enter", "takeover"):
+        if raw.get(key) is True:
+            browser[key] = True
+    return browser
+
+
 def build_card(args):
     """Returns a clean card, or raises ValueError with a message the model can act on."""
     if not isinstance(args, dict):
@@ -352,6 +395,8 @@ def build_card(args):
         card["reminders"] = reminders
         if (name := _text(args.get("reminder_list"))):
             card["reminder_list"] = name
+    if (browser := _browser(args.get("browser"))):
+        card["browser"] = browser
     mail = args.get("mail") if isinstance(args.get("mail"), dict) else {}
     if (mail := {k: _text(mail.get(k)) for k in ("from", "reply_to_message_id") if _text(mail.get(k))}):
         card["mail"] = mail
@@ -1681,6 +1726,122 @@ def handle_call(args, session_id=None, **_kwargs):
                                            "Finish your reply as usual."})
 
 
+# ---- The bot browser: when a bot is stuck on a page, Hermit reads the page and asks the owner for exactly
+# what it needs. The page's fields say what they're for (autocomplete, type, their label), so the card is
+# built from the page itself, never from the bot's guess. What the owner types goes straight into the page
+# (the bridge's /browser/fill) and never reaches the bot.
+
+BROWSER_HELP_TOOL = "hermit_browser_help"
+BROWSER_HELP_SCHEMA = {
+    "name": BROWSER_HELP_TOOL,
+    "description": (
+        "When a page in the bot browser needs the user: a password or a code you don't have (try browser_vault "
+        "first, which fills saved logins and authenticator codes), a security answer, a captcha, or a step only a "
+        "person should take. Hermit reads the page and shows the user the right card; what they type goes straight "
+        "into the page and you never see it. Then stop and wait: you'll get 'Entered it in the browser' or "
+        "'Done in the browser', and carry on with the page."),
+    "parameters": {"type": "object", "properties": {
+        "url": {"type": "string", "description": "The address of the page that needs the user."},
+        "why": {"type": "string", "description": "A short line for the user, such as 'Signing in to your bank'."},
+    }, "required": ["url"]},
+}
+
+# Reads the page. Nothing from the bot goes into it. Labels come from the page and are only shown as labels.
+PAGE_NEEDS = """(() => {
+  const shown = e => e && !e.disabled && e.type !== 'hidden' && e.getClientRects().length > 0;
+  const label = e => {
+    const named = e.id && document.querySelector('label[for="' + CSS.escape(e.id) + '"]');
+    const around = e.closest('label');
+    return (e.getAttribute('aria-label') || (named && named.innerText) || (around && around.innerText)
+      || e.placeholder || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  };
+  const kind = e => {
+    const ac = (e.autocomplete || '').toLowerCase();
+    if (e.type === 'password') return ac === 'new-password' ? 'new-password' : 'password';
+    if (ac === 'one-time-code' || /code|otp|totp|passcode|pin/i.test((e.name || '') + ' ' + (e.id || ''))
+        || (e.inputMode === 'numeric' && [1, 4, 6, 8].includes(e.maxLength))) return 'code';
+    if (['text', 'email', 'tel', 'number', 'search', ''].includes(e.type) && !e.value) return 'text';
+    return '';
+  };
+  const fields = [...document.querySelectorAll('input')].filter(shown).map(e => ({kind: kind(e), label: label(e)}))
+    .filter(f => f.kind);
+  const frames = [...document.querySelectorAll('iframe')].map(f => f.src || '');
+  const captcha = frames.some(src => /recaptcha|hcaptcha|challenges\.cloudflare|turnstile|arkoselabs|funcaptcha/i.test(src))
+    || !!document.querySelector('.g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey]');
+  return {fields: fields.slice(0, 20), captcha, title: document.title.slice(0, 120)};
+})()"""
+
+
+def _bot_browser() -> str:
+    return os.getenv("HERMIT_BOT_BROWSER_CDP") or "http://127.0.0.1:9230"
+
+
+def _page_needs(url: str) -> tuple[str, dict]:
+    """The page's origin and what it asks for, read from the bot browser's tab at `url` (or the newest tab on
+    the same site)."""
+    import urllib.request
+    with urllib.request.urlopen(_bot_browser() + "/json/list", timeout=5) as response:
+        tabs = [t for t in json.loads(response.read()) if t.get("type") == "page"]
+    origin = lambda address: "{0.scheme}://{0.netloc}".format(urlsplit(address or "")).lower()
+    tab = next((t for t in tabs if t.get("url") == url), None) \
+        or next((t for t in tabs if origin(t.get("url")) == origin(url)), None)
+    if tab is None:
+        raise ValueError("That page isn't open in the bot browser")
+    from websockets.sync.client import connect
+    with connect(tab["webSocketDebuggerUrl"], open_timeout=10, max_size=4 * 1024 * 1024, proxy=None) as socket_:
+        socket_.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                 "params": {"expression": PAGE_NEEDS, "returnByValue": True}}))
+        while True:
+            message = json.loads(socket_.recv(timeout=10))
+            if message.get("id") == 1:
+                needs = message.get("result", {}).get("result", {}).get("value") or {}
+                return origin(tab.get("url")), {**needs, "tab": tab.get("id")}
+
+
+def browser_help_card(site: str, needs: dict, why: str | None) -> dict:
+    card = _browser_help_card(site, needs, why)
+    if needs.get("tab"):
+        # The very tab the bot is on, so a second tab on the same site never gets what's typed.
+        card["browser"]["tab"] = needs["tab"]
+    return card
+
+
+def _browser_help_card(site: str, needs: dict, why: str | None) -> dict:
+    """The card for what the page needs most: a person for a captcha, then a password, a new password, a code,
+    another answer, and else a look at the page."""
+    host = urlsplit(site).hostname or site
+    fields = needs.get("fields") or []
+    first = lambda kind: next((f for f in fields if f.get("kind") == kind), None)
+    card = {"app": "Browser", "subtitle": why} if why else {"app": "Browser"}
+    if needs.get("captcha"):
+        return {**card, "title": f"{host} wants to check you're a person",
+                "browser": {"site": site, "takeover": True}}
+    for kind, title, secret in (("password", "Your password for", True), ("new-password", "A new password for", True),
+                                ("code", "The code for", False), ("text", "An answer for", False)):
+        if (field := first(kind)):
+            entry = {"site": site, "enter": True}
+            if secret:
+                entry["secret"] = True
+            if field.get("label"):
+                entry["label"] = field["label"]
+            return {**card, "title": f"{title} {host}", "browser": entry}
+    return {**card, "title": f"Have a look at {host}", "browser": {"site": site, "takeover": True}}
+
+
+def handle_browser_help(args, **_kwargs):
+    try:
+        url = _text((args or {}).get("url"))
+        if not url or not url.lower().startswith(("https://", "http://localhost", "http://127.0.0.1")):
+            raise ValueError("url must be the page's https address")
+        site, needs = _page_needs(url)
+        card = build_card(browser_help_card(site, needs, _short((args or {}).get("why"), 120)))
+        return json.dumps({"card": card, "shown": True, "note": (
+            "The user can see this card. Stop here and wait for them: don't type into the page meanwhile. "
+            "You'll get 'Entered it in the browser' or 'Done in the browser'; then look at the page again.")})
+    except Exception as exc:
+        return json.dumps({"error": str(exc) or type(exc).__name__})
+
+
 def register(ctx):
     import pathlib
     if (pathlib.Path(__file__).parent / "bridge/hermit_setup.py").exists():
@@ -1719,3 +1880,5 @@ def register(ctx):
                       description=CALL_SCHEMA["description"], emoji="📞")
     ctx.register_tool(name=DEVICE_TOOL, toolset=TOOLSET, schema=DEVICE_SCHEMA, handler=handle_device,
                       description=DEVICE_SCHEMA["description"], emoji="❤️")
+    ctx.register_tool(name=BROWSER_HELP_TOOL, toolset=TOOLSET, schema=BROWSER_HELP_SCHEMA, handler=handle_browser_help,
+                      description=BROWSER_HELP_SCHEMA["description"], emoji="🔐")

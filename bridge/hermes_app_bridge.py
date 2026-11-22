@@ -8,6 +8,7 @@ events over loopback UDP, which can't slow the agent down.
 """
 import asyncio
 import base64
+import contextlib
 import datetime
 import fcntl
 import glob
@@ -139,7 +140,7 @@ SIGNALS_STATE = STATE / "signals.json"
 # Switches the plugin enforces on the Mac. Anything else the app sends is ignored.
 MAC_INTEGRATIONS = ("messagesRead", "notes")
 # Switches an app that doesn't know them yet leaves as they were, so an older copy can't turn one off.
-KEPT_INTEGRATIONS = ("recaps", "macCalls", "macDictation", "terminal", "cardActions")
+KEPT_INTEGRATIONS = ("recaps", "macCalls", "macDictation", "terminal", "cardActions", "botBrowser")
 # Switches that are on until someone turns them off.
 ON_UNLESS_OFF = ("macCalls", "macDictation")
 # Works for anyone. Rules for your own workspaces go in links.json.
@@ -3548,6 +3549,9 @@ def card_need(content: str | None) -> dict | None:
     except (ValueError, AttributeError):
         return None
     actions = [a for a in card.get("actions") or [] if a.get("message")]
+    if isinstance(card.get("browser"), dict):
+        # Something to type into the bot browser waits like a question until it's entered.
+        return {"kind": "card", "title": str(card.get("title") or "")[:120], "answers": [BROWSER_ENTERED, BROWSER_DONE]}
     if not actions:
         return None
     if str(card.get("app") or "").lower() in ("mail", "email", "gmail"):
@@ -3564,7 +3568,8 @@ def card_need(content: str | None) -> dict | None:
 
 
 # What the app sends after a card is used elsewhere, such as a mail sent from its card.
-CARD_RESULTS = ("Sent the email", "Sent the message", "Sent the invitation")
+BROWSER_ENTERED, BROWSER_DONE = "Entered it in the browser", "Done in the browser"
+CARD_RESULTS = ("Sent the email", "Sent the message", "Sent the invitation", BROWSER_ENTERED, BROWSER_DONE)
 
 
 def reply_text(content: str | None) -> str:
@@ -7276,6 +7281,26 @@ class BrowserError(Exception):
     pass
 
 
+# Finds and focuses the field a card's entry belongs in, when the card doesn't name one. The only thing put
+# into it is true or false, for whether it's a password. A focused field that fits wins; then a password box,
+# or for anything else a box made for a one-time code, then any empty text box. Answers what it found, or "".
+FIND_FIELD = """(() => {
+  const secret = %s;
+  const shown = e => e && !e.disabled && !e.readOnly && e.type !== 'hidden' && e.getClientRects().length > 0;
+  const fits = e => e && e.tagName === 'INPUT' && shown(e) && (e.type === 'password') === secret;
+  if (fits(document.activeElement)) return 'focused';
+  const all = selector => [...document.querySelectorAll(selector)].filter(fits);
+  const found = secret ? all('input[type=password]') : [
+    ...all('input[autocomplete="one-time-code"]'),
+    ...all('input[name*=code i], input[id*=code i], input[name*=otp i], input[id*=otp i], input[name*=totp i]'),
+    ...all('input[inputmode=numeric], input[type=tel], input[type=number]'),
+    ...all('input[type=text], input[type=email], input:not([type])').filter(e => !e.value)];
+  if (!found.length) return '';
+  found[0].focus();
+  return 'found';
+})()"""
+
+
 def browser_json(path: str, method: str = "GET"):
     request = urllib.request.Request(BOT_BROWSER_CDP + path, method=method)
     try:
@@ -7388,6 +7413,9 @@ class BrowserView:
             mouse("mouseWheel", (x, y), deltaX=float(fields.get("dx") or 0), deltaY=float(fields.get("dy") or 0))
         elif kind == "text":
             self.call("Input.insertText", text=str(fields.get("text") or "")[:2000])
+        elif kind == "move":
+            # The trackpad's cursor, so a page sees hovering.
+            mouse("mouseMoved", (x, y))
         elif kind == "fit":
             # The page laid out for the phone while someone watches, and put back when they leave.
             width, height = int(fields.get("width") or 0), int(fields.get("height") or 0)
@@ -7404,6 +7432,29 @@ class BrowserView:
             self.call("Input.dispatchKeyEvent", type="keyUp", **down)
         else:
             raise BrowserError("Unknown input")
+
+    def fill(self, text: str, field: str = "", enter: bool = False, secret: bool = False) -> None:
+        """Types what the owner entered on a card into the page: into `field` when the card names one, else the
+        field that fits, found on the page (the password box for a secret, else a code box). Typed a key at a
+        time, as a person would, so a code split over six boxes moves along by itself. Never logged or kept."""
+        if field:
+            document = self.call("DOM.getDocument", depth=0).get("result", {}).get("root", {})
+            found = self.call("DOM.querySelector", nodeId=document.get("nodeId", 0), selector=field).get("result", {})
+            if not found.get("nodeId"):
+                raise BrowserError("That field isn't on the page")
+            self.call("DOM.focus", nodeId=found["nodeId"])
+        else:
+            found = self.call("Runtime.evaluate", expression=FIND_FIELD % ("true" if secret else "false"), returnByValue=True)
+            if not found.get("result", {}).get("result", {}).get("value"):
+                raise BrowserError("Couldn't find where to type it on the page")
+        if len(text) <= 64:
+            for character in text:
+                self.call("Input.dispatchKeyEvent", type="keyDown", text=character, unmodifiedText=character, key=character)
+                self.call("Input.dispatchKeyEvent", type="keyUp", key=character)
+        else:
+            self.call("Input.insertText", text=text)
+        if enter:
+            self.act({"kind": "key", "key": "Enter"})
 
     def close(self) -> None:
         """Stops the screencast by closing its socket, then the thread's loop."""
@@ -7431,6 +7482,130 @@ def browser_view(tab: str) -> BrowserView:
                 raise BrowserError("That tab isn't open")
             view = browser_views[tab] = BrowserView(tab, found["webSocketDebuggerUrl"])
         return view
+
+
+def web_origin(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url or "")
+    return f"{parsed.scheme}://{parsed.netloc}".lower() if parsed.scheme in ("http", "https") and parsed.netloc else ""
+
+
+# A page served on the browser's own machine is a secure context to Chrome, as https is, which is how
+# scripts/browser-fill-check.py tests a sign-in without a real site.
+LOCAL_SITE = re.compile(r"http://(localhost|127\.0\.0\.1)(:\d{1,5})?")
+
+
+def browser_fill(fields: dict) -> None:
+    """A card's entry, typed only into a tab on the site the card named. A bot can't point it anywhere else:
+    no tab on that exact origin, nothing is typed."""
+    site = web_origin(str(fields.get("site") or ""))
+    if not (site.startswith("https://") or LOCAL_SITE.fullmatch(site)):
+        raise BrowserError("The card doesn't name a site")
+    text = str(fields.get("text") or "")
+    if not text or len(text) > 2000:
+        raise BrowserError("Nothing to enter")
+    on_site = [t for t in browser_tabs() if web_origin(t["url"]) == site]
+    # A card from the page names its tab, so a second tab on the same site never gets it. The tab still has
+    # to be on the card's site: one that has moved elsewhere gets nothing.
+    wanted = str(fields.get("tab") or "")
+    tab = next((t for t in on_site if t["id"] == wanted), None) if wanted else (on_site[0] if on_site else None)
+    if tab is None:
+        raise BrowserError(f"No tab is open on {urllib.parse.urlsplit(site).hostname}" if not wanted
+                           else f"That page has moved away from {urllib.parse.urlsplit(site).hostname}")
+    field = str(fields.get("field") or "")[:200]
+    browser_view(tab["id"]).fill(text, field, fields.get("enter") is True, fields.get("secret") is True)
+
+
+# Keeping the bot browser running while it's on: Chromium in the sandbox container, and its DevTools port
+# forwarded to 127.0.0.1 here over `docker exec`, one connection at a time, the way Hermes reaches a sandbox
+# browser. Bots reach it through `browser.cdp_url`; the live view through the same port.
+BOT_BROWSER_CONTAINER = os.getenv("HERMIT_BOT_BROWSER_CONTAINER") or "hermes-sandbox"
+BOT_BROWSER_PORT = 9230
+
+
+def docker_binary() -> str | None:
+    return shutil.which("docker") or next((p for p in ("/usr/local/bin/docker", "/opt/homebrew/bin/docker",
+                                                       f"{pathlib.Path.home()}/.orbstack/bin/docker") if os.path.exists(p)), None)
+
+
+def bot_browser_running(docker: str) -> bool:
+    done = subprocess.run([docker, "exec", BOT_BROWSER_CONTAINER, "sh", "-c", f"nc -z 127.0.0.1 {BOT_BROWSER_PORT}"],
+                          capture_output=True, timeout=15)
+    return done.returncode == 0
+
+
+def start_bot_browser(docker: str) -> None:
+    """Chromium on the sandbox's own screen, on a profile kept in its volume so sign-ins last."""
+    subprocess.run([docker, "exec", "-d", "-u", "abc", "-e", "DISPLAY=:1", "-e", "HOME=/config", BOT_BROWSER_CONTAINER,
+                    "chromium", "--user-data-dir=/config/bot-browser", f"--remote-debugging-port={BOT_BROWSER_PORT}",
+                    "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
+                    "--password-store=basic", "--window-position=0,0", "--window-size=1280,900", "about:blank"],
+                   capture_output=True, timeout=30)
+
+
+def forward_bot_browser(client: socket.socket, docker: str) -> None:
+    inner = subprocess.Popen([docker, "exec", "-i", BOT_BROWSER_CONTAINER, "nc", "127.0.0.1", str(BOT_BROWSER_PORT)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    def upstream() -> None:
+        try:
+            while chunk := client.recv(65536):
+                inner.stdin.write(chunk)
+                inner.stdin.flush()
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                inner.stdin.close()
+
+    threading.Thread(target=upstream, daemon=True).start()
+    try:
+        while chunk := inner.stdout.read(65536):
+            client.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        client.close()
+        inner.kill()
+
+
+def bot_browser_loop() -> None:
+    """While Bot browser is on in Integrations: keeps Chromium running in the sandbox and its port forwarded.
+    Off, the forward stops taking connections and the browser is left as it is, sign-ins and all."""
+    listener: socket.socket | None = None
+    while True:
+        try:
+            docker = docker_binary()
+            if integration_on("botBrowser") and docker:
+                if not bot_browser_running(docker):
+                    print("bot browser: starting Chromium in the sandbox", flush=True)
+                    start_bot_browser(docker)
+                if listener is None:
+                    listener = socket.socket()
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    try:
+                        listener.bind(("127.0.0.1", BOT_BROWSER_PORT))
+                    except OSError:
+                        # Something else forwards it already, such as scripts/bot-browser.py run by hand.
+                        listener.close()
+                        listener = None
+                    else:
+                        listener.listen(32)
+                        listener.settimeout(1)
+                        print(f"bot browser: forwarding 127.0.0.1:{BOT_BROWSER_PORT}", flush=True)
+                if listener is not None:
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline and integration_on("botBrowser"):
+                        with contextlib.suppress(socket.timeout):
+                            client, _ = listener.accept()
+                            threading.Thread(target=forward_bot_browser, args=(client, docker), daemon=True).start()
+                    continue
+            elif listener is not None:
+                listener.close()
+                listener = None
+                print("bot browser: stopped forwarding", flush=True)
+        except Exception as error:
+            print(f"bot browser: {type(error).__name__}", flush=True)
+        time.sleep(30)
 
 
 def browser_allowed(header: str | None) -> bool:
@@ -8398,13 +8573,16 @@ class Handler(BaseHTTPRequestHandler):
             except VoiceError as error:  # written for people
                 return self.json(409, {"error": {"message": str(error)}})
             return self.json(200, value)
-        if path in ("/browser/open", "/browser/input"):
+        if path in ("/browser/open", "/browser/input", "/browser/fill"):
             if not browser_allowed(header):
                 return self.json(401, {"error": "The bot browser needs this device's own key."})
             fields = json.loads(self.body(65536) or b"{}")
             try:
                 if path == "/browser/open":
                     return self.json(200, browser_open(str(fields.get("url") or "")))
+                if path == "/browser/fill":
+                    browser_fill(fields)
+                    return self.json(200, {"ok": True})
                 browser_view(str(fields.get("tab") or "")).act(fields)
             except (BrowserError, TimeoutError, ValueError, TypeError) as error:
                 return self.json(503, {"error": str(error) or "The bot browser didn't answer"})
@@ -8830,4 +9008,5 @@ if __name__ == "__main__":
     threading.Thread(target=prep_loop, daemon=True).start()
     threading.Thread(target=signals_loop, daemon=True).start()
     threading.Thread(target=tidy_loop, daemon=True).start()
+    threading.Thread(target=bot_browser_loop, daemon=True).start()
     Server(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
