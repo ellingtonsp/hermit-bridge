@@ -7262,6 +7262,182 @@ def udp_loop() -> None:
             print(f"event error: {type(error).__name__}", flush=True)
 
 
+# The bot browser's live view (spike). One Chromium the bots share, reached through its DevTools port
+# (scripts/bot-browser.py forwards it from the sandbox). The app watches one tab at a time: Chrome's own
+# screencast sends a picture whenever the page changes, and taps, drags and typing go back as input events.
+# Only a device with its own key may watch or touch it, since the tab is signed in as the owner.
+BOT_BROWSER_CDP = os.getenv("HERMIT_BOT_BROWSER_CDP") or "http://127.0.0.1:9230"
+BROWSER_IDLE = 60
+BROWSER_FRAME_WAIT = 5.0
+BROWSER_KEYS = {"Enter": 13, "Backspace": 8, "Tab": 9, "Escape": 27}
+
+
+class BrowserError(Exception):
+    pass
+
+
+def browser_json(path: str, method: str = "GET"):
+    request = urllib.request.Request(BOT_BROWSER_CDP + path, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read() or b"null")
+    except (OSError, ValueError) as error:
+        raise BrowserError("The bot browser isn't running") from error
+
+
+def browser_tabs() -> list[dict]:
+    return [{"id": tab["id"], "title": tab.get("title") or "", "url": tab.get("url") or ""}
+            for tab in browser_json("/json/list") or [] if tab.get("type") == "page"]
+
+
+def browser_open(url: str) -> dict:
+    if not re.match(r"https?://", url):
+        raise BrowserError("Only web addresses can be opened")
+    tab = browser_json("/json/new?" + urllib.parse.quote(url, safe=":/?&=%#"), method="PUT")
+    return {"id": tab["id"], "title": tab.get("title") or "", "url": tab.get("url") or url}
+
+
+class BrowserView:
+    """One tab's screencast and input, over its own DevTools socket on a thread of its own."""
+
+    def __init__(self, tab: str, socket_url: str):
+        self.tab, self.socket_url = tab, socket_url
+        self.changed = threading.Condition()
+        self.seq, self.frame, self.size = 0, b"", (0, 0)
+        self.seen = time.monotonic()
+        self.closed = False
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        self.task = asyncio.run_coroutine_threadsafe(self.run(), self.loop)
+
+    async def run(self) -> None:
+        from websockets.asyncio.client import connect
+        self.ids, self.waiting = 0, {}
+        try:
+            async with connect(self.socket_url, max_size=32 * 1024 * 1024, proxy=None, open_timeout=10) as socket_:
+                self.socket = socket_
+                self.ready.set()
+                # Replies are read by the loop below, so the opening commands go out without waiting on them.
+                await self.send("Page.enable", wait=False)
+                await self.send("Page.bringToFront", wait=False)
+                await self.send("Page.startScreencast", wait=False, format="jpeg", quality=60, maxWidth=1280, maxHeight=1600)
+                async for raw in socket_:
+                    message = json.loads(raw)
+                    if "id" in message and message["id"] in self.waiting:
+                        self.waiting.pop(message["id"]).set_result(message)
+                    elif message.get("method") == "Page.screencastFrame":
+                        params = message["params"]
+                        meta = params.get("metadata") or {}
+                        with self.changed:
+                            self.seq += 1
+                            self.frame = base64.b64decode(params["data"])
+                            self.size = (meta.get("deviceWidth") or 0, meta.get("deviceHeight") or 0)
+                            self.changed.notify_all()
+                        await self.send("Page.screencastFrameAck", wait=False, sessionId=params["sessionId"])
+        except Exception as error:
+            print(f"browser view {self.tab[:8]}: {type(error).__name__}", flush=True)
+        finally:
+            self.closed = True
+            self.ready.set()
+            with self.changed:
+                self.changed.notify_all()
+
+    async def send(self, method: str, wait: bool = True, **params):
+        self.ids += 1
+        future = self.loop.create_future()
+        if wait:
+            self.waiting[self.ids] = future
+        await self.socket.send(json.dumps({"id": self.ids, "method": method, "params": params}))
+        return await asyncio.wait_for(future, 10) if wait else None
+
+    def call(self, method: str, **params):
+        self.ready.wait(10)
+        if self.closed:
+            raise BrowserError("That tab closed")
+        return asyncio.run_coroutine_threadsafe(self.send(method, **params), self.loop).result(12)
+
+    def next_frame(self, after: int) -> tuple[int, bytes, tuple]:
+        self.seen = time.monotonic()
+        with self.changed:
+            self.changed.wait_for(lambda: self.seq > after or self.closed, timeout=BROWSER_FRAME_WAIT)
+            return self.seq, self.frame, self.size
+
+    def point(self, x: float, y: float) -> tuple[float, float]:
+        width, height = self.size
+        return max(0.0, min(1.0, x)) * width, max(0.0, min(1.0, y)) * height
+
+    def act(self, fields: dict) -> None:
+        self.seen = time.monotonic()
+        kind = fields.get("kind")
+        x, y = self.point(float(fields.get("x") or 0), float(fields.get("y") or 0))
+        mouse = lambda kind_, at, **extra: self.call("Input.dispatchMouseEvent", type=kind_, x=at[0], y=at[1], **extra)
+        if kind == "tap":
+            mouse("mouseMoved", (x, y))
+            mouse("mousePressed", (x, y), button="left", buttons=1, clickCount=1)
+            mouse("mouseReleased", (x, y), button="left", buttons=0, clickCount=1)
+        elif kind == "drag":
+            points = [self.point(float(p[0]), float(p[1])) for p in (fields.get("points") or [])[:200] if len(p) == 2]
+            if len(points) < 2:
+                return
+            mouse("mousePressed", points[0], button="left", buttons=1, clickCount=1)
+            for at in points[1:]:
+                mouse("mouseMoved", at, button="left", buttons=1)
+            mouse("mouseReleased", points[-1], button="left", buttons=0, clickCount=1)
+        elif kind == "scroll":
+            mouse("mouseWheel", (x, y), deltaX=float(fields.get("dx") or 0), deltaY=float(fields.get("dy") or 0))
+        elif kind == "text":
+            self.call("Input.insertText", text=str(fields.get("text") or "")[:2000])
+        elif kind == "fit":
+            # The page laid out for the phone while someone watches, and put back when they leave.
+            width, height = int(fields.get("width") or 0), int(fields.get("height") or 0)
+            if not (200 <= width <= 1400 and 200 <= height <= 2000):
+                raise BrowserError("Unknown size")
+            self.call("Emulation.setDeviceMetricsOverride", width=width, height=height, deviceScaleFactor=2, mobile=True)
+        elif kind == "unfit":
+            self.call("Emulation.clearDeviceMetricsOverride")
+        elif kind == "key" and (key := str(fields.get("key") or "")) in BROWSER_KEYS:
+            code = BROWSER_KEYS[key]
+            text = {"Enter": "\r", "Tab": "\t"}.get(key)
+            down = {"key": key, "code": key, "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code}
+            self.call("Input.dispatchKeyEvent", type="keyDown", **down, **({"text": text} if text else {}))
+            self.call("Input.dispatchKeyEvent", type="keyUp", **down)
+        else:
+            raise BrowserError("Unknown input")
+
+    def close(self) -> None:
+        """Stops the screencast by closing its socket, then the thread's loop."""
+        async def stop():
+            if hasattr(self, "socket"):
+                await self.socket.close()
+            self.loop.stop()
+        asyncio.run_coroutine_threadsafe(stop(), self.loop)
+
+
+browser_views: dict[str, BrowserView] = {}
+browser_views_lock = threading.Lock()
+
+
+def browser_view(tab: str) -> BrowserView:
+    """The live view of a tab, started on first use and dropped after a minute nobody watches it."""
+    with browser_views_lock:
+        for key, view in list(browser_views.items()):
+            if view.closed or time.monotonic() - view.seen > BROWSER_IDLE:
+                view.close()
+                browser_views.pop(key, None)
+        if (view := browser_views.get(tab)) is None:
+            found = next((t for t in browser_json("/json/list") or [] if t.get("id") == tab and t.get("type") == "page"), None)
+            if not found or not found.get("webSocketDebuggerUrl"):
+                raise BrowserError("That tab isn't open")
+            view = browser_views[tab] = BrowserView(tab, found["webSocketDebuggerUrl"])
+        return view
+
+
+def browser_allowed(header: str | None) -> bool:
+    token = (header or "").removeprefix("Bearer ").strip()
+    return authorized(header) and device_for(token) is not None
+
+
 PROXY_BODY = 8_000_000
 PROXY_HEADERS = ("Content-Type", "Accept", "Idempotency-Key")
 
@@ -7612,6 +7788,27 @@ class Handler(BaseHTTPRequestHandler):
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
             return self.json(200, integrations_view())
+        if url.path in ("/browser/tabs", "/browser/frame"):
+            if not browser_allowed(header):
+                return self.json(401, {"error": "The bot browser needs this device's own key."})
+            try:
+                if url.path == "/browser/tabs":
+                    return self.json(200, {"tabs": browser_tabs()})
+                after = int((query.get("after") or ["0"])[0] or 0)
+                seq, frame, (width, height) = browser_view((query.get("tab") or [""])[0]).next_frame(after)
+            except (BrowserError, ValueError) as error:
+                return self.json(503, {"error": str(error) or "The bot browser isn't running"})
+            if seq <= after or not frame:
+                return self.reply(204)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(frame)))
+            self.send_header("X-Frame-Seq", str(seq))
+            self.send_header("X-Frame-Size", f"{width}x{height}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(frame)
+            return
         if url.path == "/watching":
             if not authorized(header):
                 return self.json(401, {"error": "unauthorized"})
@@ -8201,6 +8398,17 @@ class Handler(BaseHTTPRequestHandler):
             except VoiceError as error:  # written for people
                 return self.json(409, {"error": {"message": str(error)}})
             return self.json(200, value)
+        if path in ("/browser/open", "/browser/input"):
+            if not browser_allowed(header):
+                return self.json(401, {"error": "The bot browser needs this device's own key."})
+            fields = json.loads(self.body(65536) or b"{}")
+            try:
+                if path == "/browser/open":
+                    return self.json(200, browser_open(str(fields.get("url") or "")))
+                browser_view(str(fields.get("tab") or "")).act(fields)
+            except (BrowserError, TimeoutError, ValueError, TypeError) as error:
+                return self.json(503, {"error": str(error) or "The bot browser didn't answer"})
+            return self.json(200, {"ok": True})
         if path == "/watching":
             data = self.body()
             if not authorized(header):
