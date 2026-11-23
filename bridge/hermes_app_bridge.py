@@ -7576,17 +7576,24 @@ def start_bot_browser(docker: str) -> None:
 
 
 def forward_bot_browser(client: socket.socket, docker: str) -> None:
-    """One connection, piped through `docker exec ... nc`. Either side closing ends both: the sandbox's nc
-    doesn't exit when its input ends, so it's stopped here, and its pipes closed. Left running, each
-    connection kept a process and its files, and the bridge ran out of files within the day."""
-    inner = subprocess.Popen([docker, "exec", "-i", BOT_BROWSER_CONTAINER, "nc", "127.0.0.1", str(BOT_BROWSER_PORT)],
+    """One connection, piped through `docker exec ... nc`. Either side closing ends both, and the pipes are
+    closed. Left running, each connection kept a process and its files, and the bridge ran out of files
+    within the day. The end comes from closing nc's input, which `-N` turns into closing its socket, so nc
+    exits inside the sandbox too: killing `docker exec` only stops the Mac's half, and left one nc behind
+    in the sandbox per connection. The kill is for an nc that doesn't go."""
+    inner = subprocess.Popen([docker, "exec", "-i", BOT_BROWSER_CONTAINER, "nc", "-N", "127.0.0.1", str(BOT_BROWSER_PORT)],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 
     def finish() -> None:
         with contextlib.suppress(OSError):
             client.shutdown(socket.SHUT_RDWR)
-        with contextlib.suppress(OSError, ProcessLookupError):
-            inner.kill()
+        with contextlib.suppress(OSError, ValueError):
+            inner.stdin.close()
+        try:
+            inner.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                inner.kill()
 
     def upstream() -> None:
         try:
