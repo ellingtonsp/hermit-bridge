@@ -7268,7 +7268,7 @@ def udp_loop() -> None:
 
 
 # The bot browser's live view (spike). One Chromium the bots share, reached through its DevTools port
-# (scripts/bot-browser.py forwards it from the sandbox). The app watches one tab at a time: Chrome's own
+# (bot_browser_loop forwards it from the sandbox). The app watches one tab at a time: Chrome's own
 # screencast sends a picture whenever the page changes, and taps, drags and typing go back as input events.
 # Only a device with its own key may watch or touch it, since the tab is signed in as the owner.
 BOT_BROWSER_CDP = os.getenv("HERMIT_BOT_BROWSER_CDP") or "http://127.0.0.1:9230"
@@ -7290,7 +7290,7 @@ FIND_FIELD = """(() => {
   const fits = e => e && e.tagName === 'INPUT' && shown(e) && (e.type === 'password') === secret;
   const all = selector => [...document.querySelectorAll(selector)].filter(fits);
   if (username) {
-    const user = [...all('input[autocomplete=username], input[autocomplete=email]'),
+    const user = [...all('input[autocomplete~=username i], input[autocomplete~=email i]'),
       ...all('input[type=email], input[name*=user i], input[id*=user i], input[name*=email i], input[id*=email i], input[name*=login i]'),
       ...all('input[type=text], input:not([type])')];
     if (!user.length) return '';
@@ -7321,6 +7321,22 @@ COPY_SELECTION = """(() => {
 })()"""
 
 
+# Whether a password box shows on the page: a two-step sign-in (Google's) shows it only after the username.
+PASSWORD_SHOWN = """(() => [...document.querySelectorAll('input[type=password]')].some(e => !e.disabled && !e.readOnly
+  && e.getClientRects().length > 0))()"""
+
+# Whether something on the page takes typing, and what it's called, so a paste says where it went.
+FOCUSED_FIELD = """(() => {
+  const e = document.activeElement;
+  if (!e || e === document.body) return null;
+  if (e.tagName === 'IFRAME') return 'the page';
+  const typed = e.isContentEditable || e.tagName === 'TEXTAREA'
+    || (e.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'range', 'color'].includes(e.type));
+  if (!typed || e.disabled || e.readOnly) return null;
+  return (e.getAttribute('aria-label') || e.placeholder || e.name || 'the field').replace(/\\s+/g, ' ').trim().slice(0, 40);
+})()"""
+
+
 def browser_json(path: str, method: str = "GET"):
     request = urllib.request.Request(BOT_BROWSER_CDP + path, method=method)
     try:
@@ -7330,8 +7346,30 @@ def browser_json(path: str, method: str = "GET"):
         raise BrowserError("The bot browser isn't running") from error
 
 
+def browser_openers() -> dict[str, str]:
+    """Which tab opened which, from Chrome's own list of targets. /json/list leaves it out. Empty when it can't
+    be read, which only costs following pop-ups."""
+    try:
+        from websockets.sync.client import connect
+        address = (browser_json("/json/version") or {}).get("webSocketDebuggerUrl") or ""
+        address = re.sub(r"^ws://[^/]+", "ws" + BOT_BROWSER_CDP[4:], address)
+        with connect(address, max_size=None, open_timeout=3, close_timeout=1) as socket_:
+            socket_.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                message = json.loads(socket_.recv(timeout=3))
+                if message.get("id") == 1:
+                    return {t["targetId"]: t["openerId"] for t in message.get("result", {}).get("targetInfos", [])
+                            if t.get("openerId")}
+    except Exception:
+        pass
+    return {}
+
+
 def browser_tabs() -> list[dict]:
-    return [{"id": tab["id"], "title": tab.get("title") or "", "url": tab.get("url") or ""}
+    openers = browser_openers()
+    return [{"id": tab["id"], "title": tab.get("title") or "", "url": tab.get("url") or "",
+             **({"opener": openers[tab["id"]]} if tab["id"] in openers else {})}
             for tab in browser_json("/json/list") or [] if tab.get("type") == "page"]
 
 
@@ -7443,7 +7481,15 @@ class BrowserView:
         elif kind == "scroll":
             mouse("mouseWheel", (x, y), deltaX=float(fields.get("dx") or 0), deltaY=float(fields.get("dy") or 0))
         elif kind == "text":
+            into = None
+            if fields.get("paste") is True:
+                # Typing with no field focused goes nowhere, silently: say so instead.
+                into = self.evaluate(FOCUSED_FIELD)
+                if not into:
+                    raise BrowserError("Tap a field on the page first")
             self.call("Input.insertText", text=str(fields.get("text") or "")[:2000])
+            if into:
+                return {"into": into}
         elif kind == "move":
             # The trackpad's cursor, so a page sees hovering.
             mouse("mouseMoved", (x, y))
@@ -7463,6 +7509,35 @@ class BrowserView:
             self.call("Input.dispatchKeyEvent", type="keyUp", **down)
         else:
             raise BrowserError("Unknown input")
+
+    def evaluate(self, expression: str):
+        return self.call("Runtime.evaluate", expression=expression, returnByValue=True).get("result", {}).get("result", {}).get("value")
+
+    def sign_in(self, username: str, password: str, timeout: float = 12) -> None:
+        """A login from the phone's password manager. On a page with both boxes, the username then the password.
+        On a two-step page (Google's), the username and Enter, then the password once its page shows it."""
+        if username:
+            if self.evaluate(FIND_FIELD % ("false", "true")):
+                self.fill(username, username=True)
+                if not self.evaluate(PASSWORD_SHOWN):
+                    self.act({"kind": "key", "key": "Enter"})
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        time.sleep(0.4)
+                        try:
+                            if self.evaluate(PASSWORD_SHOWN):
+                                break
+                        except (BrowserError, TimeoutError):
+                            pass  # The page is loading its next step.
+                    else:
+                        raise BrowserError("Entered the username, but the page hasn't asked for a password")
+                    time.sleep(0.4)  # Its box animates in and takes focus a moment after it shows.
+            elif not self.evaluate(PASSWORD_SHOWN):
+                raise BrowserError("There's nowhere to sign in on this page")
+        elif not self.evaluate(PASSWORD_SHOWN):
+            raise BrowserError("This page asks for a username first")
+        if password:
+            self.fill(password, enter=True, secret=True)
 
     def fill(self, text: str, field: str = "", enter: bool = False, secret: bool = False, username: bool = False) -> None:
         """Types what the owner entered on a card into the page: into `field` when the card names one, else the
@@ -7526,15 +7601,11 @@ def web_origin(url: str) -> str:
 LOCAL_SITE = re.compile(r"http://(localhost|127\.0\.0\.1)(:\d{1,5})?")
 
 
-def browser_fill(fields: dict) -> None:
-    """A card's entry, typed only into a tab on the site the card named. A bot can't point it anywhere else:
-    no tab on that exact origin, nothing is typed."""
+def site_tab(fields: dict) -> dict:
+    """The tab to type into: on the exact site named, and the named tab when there is one."""
     site = web_origin(str(fields.get("site") or ""))
     if not (site.startswith("https://") or LOCAL_SITE.fullmatch(site)):
         raise BrowserError("The card doesn't name a site")
-    text = str(fields.get("text") or "")
-    if not text or len(text) > 2000:
-        raise BrowserError("Nothing to enter")
     on_site = [t for t in browser_tabs() if web_origin(t["url"]) == site]
     # A card from the page names its tab, so a second tab on the same site never gets it. The tab still has
     # to be on the card's site: one that has moved elsewhere gets nothing.
@@ -7543,9 +7614,27 @@ def browser_fill(fields: dict) -> None:
     if tab is None:
         raise BrowserError(f"No tab is open on {urllib.parse.urlsplit(site).hostname}" if not wanted
                            else f"That page has moved away from {urllib.parse.urlsplit(site).hostname}")
+    return tab
+
+
+def browser_fill(fields: dict) -> None:
+    """A card's entry, typed only into a tab on the site the card named. A bot can't point it anywhere else:
+    no tab on that exact origin, nothing is typed."""
+    text = str(fields.get("text") or "")
+    if not text or len(text) > 2000:
+        raise BrowserError("Nothing to enter")
+    tab = site_tab(fields)
     field = str(fields.get("field") or "")[:200]
     browser_view(tab["id"]).fill(text, field, fields.get("enter") is True, fields.get("secret") is True,
                                  fields.get("role") == "username")
+
+
+def browser_sign_in(fields: dict) -> None:
+    """A login from the phone's password manager, into a tab only while it's on the site the sheet showed."""
+    username, password = str(fields.get("username") or ""), str(fields.get("password") or "")
+    if not (username or password) or len(username) > 500 or len(password) > 2000:
+        raise BrowserError("Nothing to enter")
+    browser_view(site_tab(fields)["id"]).sign_in(username, password)
 
 
 # Keeping the bot browser running while it's on: Chromium in the sandbox container, and its DevTools port
@@ -7638,7 +7727,7 @@ def bot_browser_loop() -> None:
                     try:
                         listener.bind(("127.0.0.1", BOT_BROWSER_PORT))
                     except OSError:
-                        # Something else forwards it already, such as scripts/bot-browser.py run by hand.
+                        # Something else forwards it already, such as another bridge on this Mac.
                         listener.close()
                         listener = None
                     else:
@@ -8626,7 +8715,7 @@ class Handler(BaseHTTPRequestHandler):
             except VoiceError as error:  # written for people
                 return self.json(409, {"error": {"message": str(error)}})
             return self.json(200, value)
-        if path in ("/browser/open", "/browser/input", "/browser/fill"):
+        if path in ("/browser/open", "/browser/input", "/browser/fill", "/browser/signin"):
             if not browser_allowed(header):
                 return self.json(401, {"error": "The bot browser needs this device's own key."})
             fields = json.loads(self.body(65536) or b"{}")
@@ -8635,6 +8724,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(200, browser_open(str(fields.get("url") or "")))
                 if path == "/browser/fill":
                     browser_fill(fields)
+                    return self.json(200, {"ok": True})
+                if path == "/browser/signin":
+                    browser_sign_in(fields)
                     return self.json(200, {"ok": True})
                 answer = browser_view(str(fields.get("tab") or "")).act(fields)
             except (BrowserError, TimeoutError, ValueError, TypeError) as error:

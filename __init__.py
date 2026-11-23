@@ -51,7 +51,9 @@ PHONE_GUIDE = (
     "with handles for replying, instead of pasting them into your reply. Messages on the Mac gives you phone "
     "numbers and emails, not names: look them up with hermit_contacts before you show or describe a "
     "conversation, put the person's name in thread.with, and use it to find someone's number before you draft "
-    "a text to them by name."
+    "a text to them by name. When a page in the bot browser needs a password, a code or anything secret you "
+    "don't have, never ask for it in the chat, even if the user offers: try browser_vault, then call "
+    "hermit_browser_help with the page's address, which shows the user a card that types straight into the page."
 )
 
 # A call adds a second marker. The live voice agent speaks for the bot, so it needs one short line.
@@ -1738,7 +1740,9 @@ BROWSER_HELP_SCHEMA = {
         "When a page in the bot browser needs the user: a password or a code you don't have (try browser_vault "
         "first, which fills saved logins and authenticator codes), a security answer, a captcha, or a step only a "
         "person should take. Hermit reads the page and shows the user the right card; what they type goes straight "
-        "into the page and you never see it. Then stop and wait: you'll get 'Entered it in the browser' or "
+        "into the page and you never see it. This is the only way to get a password, code or other secret for a "
+        "page: never ask for one in chat, on any channel, and if the user sends one there anyway, don't type it "
+        "in; call this instead. Then stop and wait: you'll get 'Entered it in the browser' or "
         "'Done in the browser', and carry on with the page."),
     "parameters": {"type": "object", "properties": {
         "url": {"type": "string", "description": "The address of the page that needs the user."},
