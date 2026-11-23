@@ -7285,11 +7285,20 @@ class BrowserError(Exception):
 # into it is true or false, for whether it's a password. A focused field that fits wins; then a password box,
 # or for anything else a box made for a one-time code, then any empty text box. Answers what it found, or "".
 FIND_FIELD = """(() => {
-  const secret = %s;
+  const secret = %s, username = %s;
   const shown = e => e && !e.disabled && !e.readOnly && e.type !== 'hidden' && e.getClientRects().length > 0;
   const fits = e => e && e.tagName === 'INPUT' && shown(e) && (e.type === 'password') === secret;
-  if (fits(document.activeElement)) return 'focused';
   const all = selector => [...document.querySelectorAll(selector)].filter(fits);
+  if (username) {
+    const user = [...all('input[autocomplete=username], input[autocomplete=email]'),
+      ...all('input[type=email], input[name*=user i], input[id*=user i], input[name*=email i], input[id*=email i], input[name*=login i]'),
+      ...all('input[type=text], input:not([type])')];
+    if (!user.length) return '';
+    user[0].focus();
+    user[0].select && user[0].select();
+    return 'found';
+  }
+  if (fits(document.activeElement)) return 'focused';
   const found = secret ? all('input[type=password]') : [
     ...all('input[autocomplete="one-time-code"]'),
     ...all('input[name*=code i], input[id*=code i], input[name*=otp i], input[id*=otp i], input[name*=totp i]'),
@@ -7298,6 +7307,17 @@ FIND_FIELD = """(() => {
   if (!found.length) return '';
   found[0].focus();
   return 'found';
+})()"""
+
+
+# What's selected on the page, for copying to the phone: the text in a focused field first, else the page's.
+COPY_SELECTION = """(() => {
+  const e = document.activeElement;
+  if (e && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA') && e.type !== 'password'
+      && typeof e.selectionStart === 'number' && e.selectionEnd > e.selectionStart) {
+    return e.value.slice(e.selectionStart, e.selectionEnd);
+  }
+  return String(window.getSelection() || '');
 })()"""
 
 
@@ -7392,15 +7412,26 @@ class BrowserView:
         width, height = self.size
         return max(0.0, min(1.0, x)) * width, max(0.0, min(1.0, y)) * height
 
-    def act(self, fields: dict) -> None:
+    def act(self, fields: dict) -> dict | None:
         self.seen = time.monotonic()
         kind = fields.get("kind")
         x, y = self.point(float(fields.get("x") or 0), float(fields.get("y") or 0))
         mouse = lambda kind_, at, **extra: self.call("Input.dispatchMouseEvent", type=kind_, x=at[0], y=at[1], **extra)
         if kind == "tap":
+            # A second tap close behind the first arrives with clicks 2: a double-click, which selects a word.
+            clicks = 2 if fields.get("clicks") == 2 else 1
             mouse("mouseMoved", (x, y))
-            mouse("mousePressed", (x, y), button="left", buttons=1, clickCount=1)
-            mouse("mouseReleased", (x, y), button="left", buttons=0, clickCount=1)
+            mouse("mousePressed", (x, y), button="left", buttons=1, clickCount=clicks)
+            mouse("mouseReleased", (x, y), button="left", buttons=0, clickCount=clicks)
+        elif kind == "rightclick":
+            # Reaches a page's own menu (a web app's). Chrome's own menu is part of its window, not the page,
+            # so it never shows in the picture.
+            mouse("mouseMoved", (x, y))
+            mouse("mousePressed", (x, y), button="right", buttons=2, clickCount=1)
+            mouse("mouseReleased", (x, y), button="right", buttons=0, clickCount=1)
+        elif kind == "copy":
+            found = self.call("Runtime.evaluate", expression=COPY_SELECTION, returnByValue=True)
+            return {"text": str(found.get("result", {}).get("result", {}).get("value") or "")[:20000]}
         elif kind == "drag":
             points = [self.point(float(p[0]), float(p[1])) for p in (fields.get("points") or [])[:200] if len(p) == 2]
             if len(points) < 2:
@@ -7433,7 +7464,7 @@ class BrowserView:
         else:
             raise BrowserError("Unknown input")
 
-    def fill(self, text: str, field: str = "", enter: bool = False, secret: bool = False) -> None:
+    def fill(self, text: str, field: str = "", enter: bool = False, secret: bool = False, username: bool = False) -> None:
         """Types what the owner entered on a card into the page: into `field` when the card names one, else the
         field that fits, found on the page (the password box for a secret, else a code box). Typed a key at a
         time, as a person would, so a code split over six boxes moves along by itself. Never logged or kept."""
@@ -7444,7 +7475,8 @@ class BrowserView:
                 raise BrowserError("That field isn't on the page")
             self.call("DOM.focus", nodeId=found["nodeId"])
         else:
-            found = self.call("Runtime.evaluate", expression=FIND_FIELD % ("true" if secret else "false"), returnByValue=True)
+            found = self.call("Runtime.evaluate", expression=FIND_FIELD % ("true" if secret else "false", "true" if username else "false"),
+                              returnByValue=True)
             if not found.get("result", {}).get("result", {}).get("value"):
                 raise BrowserError("Couldn't find where to type it on the page")
         if len(text) <= 64:
@@ -7512,7 +7544,8 @@ def browser_fill(fields: dict) -> None:
         raise BrowserError(f"No tab is open on {urllib.parse.urlsplit(site).hostname}" if not wanted
                            else f"That page has moved away from {urllib.parse.urlsplit(site).hostname}")
     field = str(fields.get("field") or "")[:200]
-    browser_view(tab["id"]).fill(text, field, fields.get("enter") is True, fields.get("secret") is True)
+    browser_view(tab["id"]).fill(text, field, fields.get("enter") is True, fields.get("secret") is True,
+                                 fields.get("role") == "username")
 
 
 # Keeping the bot browser running while it's on: Chromium in the sandbox container, and its DevTools port
@@ -8583,10 +8616,10 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/browser/fill":
                     browser_fill(fields)
                     return self.json(200, {"ok": True})
-                browser_view(str(fields.get("tab") or "")).act(fields)
+                answer = browser_view(str(fields.get("tab") or "")).act(fields)
             except (BrowserError, TimeoutError, ValueError, TypeError) as error:
                 return self.json(503, {"error": str(error) or "The bot browser didn't answer"})
-            return self.json(200, {"ok": True})
+            return self.json(200, {"ok": True, **(answer or {})})
         if path == "/watching":
             data = self.body()
             if not authorized(header):
