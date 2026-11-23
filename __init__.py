@@ -1821,6 +1821,10 @@ def _browser_help_card(site: str, needs: dict, why: str | None) -> dict:
     if needs.get("captcha"):
         return {**card, "title": f"{host} wants to check you're a person",
                 "browser": {"site": site, "takeover": True}}
+    # A passkey this browser can't give: the person picks another way (a password, a prompt on their phone).
+    if re.search(r"passkey|fingerprint, face|screen lock|security key", needs.get("title") or "", re.I):
+        return {**card, "title": f"Sign in to {host} another way", "body": "Tap Try another way on the page.",
+                "browser": {"site": site, "takeover": True}}
     for kind, title, secret in (("password", "Your password for", True), ("new-password", "A new password for", True),
                                 ("code", "The code for", False), ("username", "Your email or username for", False),
                                 ("text", "An answer for", False)):

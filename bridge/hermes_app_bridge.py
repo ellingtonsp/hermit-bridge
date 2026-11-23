@@ -7380,6 +7380,19 @@ def browser_open(url: str) -> dict:
     return {"id": tab["id"], "title": tab.get("title") or "", "url": tab.get("url") or url}
 
 
+def browser_close(tab: str) -> None:
+    """Closes a tab. Chrome answers in plain text, not JSON, so its reply isn't read as one."""
+    if not re.fullmatch(r"[A-Fa-f0-9]{16,64}", tab):
+        raise BrowserError("That tab isn't open")
+    try:
+        with urllib.request.urlopen(BOT_BROWSER_CDP + "/json/close/" + tab, timeout=5) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        raise BrowserError("That tab isn't open") from error
+    except (OSError, ValueError) as error:
+        raise BrowserError("The bot browser isn't running") from error
+
+
 class BrowserView:
     """One tab's screencast and input, over its own DevTools socket on a thread of its own."""
 
@@ -7436,9 +7449,17 @@ class BrowserView:
 
     def call(self, method: str, **params):
         self.ready.wait(10)
+        self.seen = time.monotonic()
         if self.closed:
             raise BrowserError("That tab closed")
-        return asyncio.run_coroutine_threadsafe(self.send(method, **params), self.loop).result(12)
+        try:
+            return asyncio.run_coroutine_threadsafe(self.send(method, **params), self.loop).result(12)
+        except (TimeoutError, BrowserError):
+            raise
+        except Exception as error:
+            # The tab's socket went (the tab closed, or Chrome dropped it): the next use opens a fresh one.
+            self.closed = True
+            raise BrowserError("Lost the tab; try again") from error
 
     def next_frame(self, after: int) -> tuple[int, bytes, tuple]:
         self.seen = time.monotonic()
@@ -7502,6 +7523,20 @@ class BrowserView:
             self.refresh()
         elif kind == "unfit":
             self.call("Emulation.clearDeviceMetricsOverride")
+        elif kind in ("back", "forward"):
+            history = self.call("Page.getNavigationHistory").get("result") or {}
+            entries, index = history.get("entries") or [], int(history.get("currentIndex") or 0)
+            index += -1 if kind == "back" else 1
+            if not 0 <= index < len(entries):
+                raise BrowserError("Nothing to go back to" if kind == "back" else "Nothing to go forward to")
+            self.call("Page.navigateToHistoryEntry", entryId=entries[index]["id"])
+        elif kind == "reload":
+            self.call("Page.reload")
+        elif kind == "navigate":
+            url = str(fields.get("url") or "")
+            if not re.match(r"https?://", url):
+                raise BrowserError("Only web addresses can be opened")
+            self.call("Page.navigate", url=url[:4000])
         elif kind == "key" and (key := str(fields.get("key") or "")) in BROWSER_KEYS:
             code = BROWSER_KEYS[key]
             text = {"Enter": "\r", "Tab": "\t"}.get(key)
@@ -7660,6 +7695,22 @@ def bot_browser_running(docker: str) -> bool:
     done = subprocess.run([docker, "exec", BOT_BROWSER_CONTAINER, "sh", "-c", f"nc -z 127.0.0.1 {BOT_BROWSER_PORT}"],
                           capture_output=True, timeout=15)
     return done.returncode == 0
+
+
+def close_browser_prompt(tab: str) -> None:
+    """Escape in the browser's own window, for a prompt Chrome draws itself (a passkey's, a permission's): it's
+    not part of the page, so it's not in the live view's picture, and it holds the page until it's answered.
+    The watched tab is brought to the front first, since Chrome shows a tab's prompt only while it's in front.
+    A page with no prompt open gets an Escape, which pages take as closing a menu."""
+    docker = docker_binary()
+    if not docker:
+        raise BrowserError("The bot browser isn't running")
+    browser_view(tab).call("Page.bringToFront")
+    done = subprocess.run([docker, "exec", "-u", "abc", "-e", "DISPLAY=:1", BOT_BROWSER_CONTAINER, "xdotool", "search",
+                           "--onlyvisible", "--class", "chromium", "windowactivate", "--sync", "key", "Escape"],
+                          capture_output=True, timeout=15)
+    if done.returncode != 0:
+        raise BrowserError("Couldn't reach the browser's window")
 
 
 def start_bot_browser(docker: str) -> None:
@@ -8735,8 +8786,14 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/browser/signin":
                     browser_sign_in(fields)
                     return self.json(200, {"ok": True})
+                if fields.get("kind") == "close":
+                    browser_close(str(fields.get("tab") or ""))
+                    return self.json(200, {"ok": True})
+                if fields.get("kind") == "prompt":
+                    close_browser_prompt(str(fields.get("tab") or ""))
+                    return self.json(200, {"ok": True})
                 answer = browser_view(str(fields.get("tab") or "")).act(fields)
-            except (BrowserError, TimeoutError, ValueError, TypeError) as error:
+            except (BrowserError, TimeoutError, ValueError, TypeError, subprocess.SubprocessError) as error:
                 return self.json(503, {"error": str(error) or "The bot browser didn't answer"})
             return self.json(200, {"ok": True, **(answer or {})})
         if path == "/watching":
