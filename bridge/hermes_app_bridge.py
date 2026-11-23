@@ -7576,29 +7576,42 @@ def start_bot_browser(docker: str) -> None:
 
 
 def forward_bot_browser(client: socket.socket, docker: str) -> None:
+    """One connection, piped through `docker exec ... nc`. Either side closing ends both: the sandbox's nc
+    doesn't exit when its input ends, so it's stopped here, and its pipes closed. Left running, each
+    connection kept a process and its files, and the bridge ran out of files within the day."""
     inner = subprocess.Popen([docker, "exec", "-i", BOT_BROWSER_CONTAINER, "nc", "127.0.0.1", str(BOT_BROWSER_PORT)],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    def finish() -> None:
+        with contextlib.suppress(OSError):
+            client.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError, ProcessLookupError):
+            inner.kill()
 
     def upstream() -> None:
         try:
             while chunk := client.recv(65536):
                 inner.stdin.write(chunk)
                 inner.stdin.flush()
-        except OSError:
+        except (OSError, ValueError):
             pass
         finally:
-            with contextlib.suppress(OSError):
-                inner.stdin.close()
+            finish()
 
     threading.Thread(target=upstream, daemon=True).start()
     try:
         while chunk := inner.stdout.read(65536):
             client.sendall(chunk)
-    except OSError:
+    except (OSError, ValueError):
         pass
     finally:
+        finish()
+        with contextlib.suppress(Exception):
+            inner.wait(timeout=10)
+        for pipe in (inner.stdin, inner.stdout):
+            with contextlib.suppress(OSError):
+                pipe.close()
         client.close()
-        inner.kill()
 
 
 def bot_browser_loop() -> None:
