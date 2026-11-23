@@ -1764,6 +1764,7 @@ PAGE_NEEDS = """(() => {
     if (e.type === 'password') return ac === 'new-password' ? 'new-password' : 'password';
     if (ac === 'one-time-code' || /code|otp|totp|passcode|pin/i.test((e.name || '') + ' ' + (e.id || ''))
         || (e.inputMode === 'numeric' && [1, 4, 6, 8].includes(e.maxLength))) return 'code';
+    if (!e.value && (e.type === 'email' || /\\b(username|email)\\b/.test(ac))) return 'username';
     if (['text', 'email', 'tel', 'number', 'search', ''].includes(e.type) && !e.value) return 'text';
     return '';
   };
@@ -1821,7 +1822,8 @@ def _browser_help_card(site: str, needs: dict, why: str | None) -> dict:
         return {**card, "title": f"{host} wants to check you're a person",
                 "browser": {"site": site, "takeover": True}}
     for kind, title, secret in (("password", "Your password for", True), ("new-password", "A new password for", True),
-                                ("code", "The code for", False), ("text", "An answer for", False)):
+                                ("code", "The code for", False), ("username", "Your email or username for", False),
+                                ("text", "An answer for", False)):
         if (field := first(kind)):
             entry = {"site": site, "enter": True}
             if secret:

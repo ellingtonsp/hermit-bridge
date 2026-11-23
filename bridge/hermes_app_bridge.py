@@ -7499,6 +7499,7 @@ class BrowserView:
             if not (200 <= width <= 1400 and 200 <= height <= 2000):
                 raise BrowserError("Unknown size")
             self.call("Emulation.setDeviceMetricsOverride", width=width, height=height, deviceScaleFactor=2, mobile=True)
+            self.refresh()
         elif kind == "unfit":
             self.call("Emulation.clearDeviceMetricsOverride")
         elif kind == "key" and (key := str(fields.get("key") or "")) in BROWSER_KEYS:
@@ -7509,6 +7510,12 @@ class BrowserView:
             self.call("Input.dispatchKeyEvent", type="keyUp", **down)
         else:
             raise BrowserError("Unknown input")
+
+    def refresh(self) -> None:
+        """A new picture now. Chrome sends one only when the page paints, and a still page resized for the phone
+        (the keyboard closing, say) doesn't, so the last picture, at the old size, stayed: half the view black."""
+        self.call("Page.stopScreencast")
+        self.call("Page.startScreencast", format="jpeg", quality=60, maxWidth=1280, maxHeight=1600)
 
     def evaluate(self, expression: str):
         return self.call("Runtime.evaluate", expression=expression, returnByValue=True).get("result", {}).get("result", {}).get("value")
