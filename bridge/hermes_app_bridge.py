@@ -778,6 +778,22 @@ class Watcher:
         task = self.gateway.rpc(method, _timeout=15, session_id=self.session_id, **self.params, **params)
         return asyncio.run_coroutine_threadsafe(task, self.loop).result(timeout=18)
 
+    def start(self, method: str, **params) -> None:
+        """A call that outlives the app's request, such as compacting a chat, which is a model call that can
+        take minutes. Hermes finishes a session edit even if this socket drops, so nothing waits on it here."""
+        if self.gateway is None:
+            raise VoiceError("Hermes isn't connected yet")
+        task = self.gateway.rpc(method, _timeout=900, session_id=self.session_id, **self.params, **params)
+        future = asyncio.run_coroutine_threadsafe(task, self.loop)
+
+        def done(finished):
+            try:
+                outcome = (finished.result() or {}).get("summary") or {}
+                print(f"{method} {params.get('operation')}: {outcome.get('headline') or 'done'}", flush=True)
+            except Exception as error:
+                print(f"{method} {params.get('operation')}: {type(error).__name__}: {error}", flush=True)
+        future.add_done_callback(done)
+
     def snapshot(self) -> dict:
         self.touched = self.polled = time.time()
         model = read_yaml(self.home / "config.yaml").get("model")
@@ -1204,6 +1220,11 @@ def session_request(action: str, fields: dict) -> tuple[str, dict]:
         command = str(fields.get("command") or "").strip()
         if not re.fullmatch(r"/[A-Za-z][\w.-]*(?: [^\r\n\0]{0,2000})?", command):
             raise ValueError("That isn't a command.")
+        name, _, rest = command.partition(" ")
+        if name.lower() in ("/compress", "/compact"):
+            # Hermes's slash worker runs /compress only in its terminal. The gateway's own compress edit
+            # does the same for any chat (Hermes Desktop uses it), and takes the same arguments.
+            return "session.mutate", {"operation": "compress", "payload": {"focus": rest.strip()}}
         return "slash.exec", {"command": command}
     if action == "undo":
         message = fields.get("message")
@@ -8976,6 +8997,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise VoiceError("Wait for the bot to finish, then try again.")
                 params.update(request_id=str(uuid.uuid4()), expected_revision=state.get("revision"),
                               expected_generation=state.get("execution_generation"))
+                if params.get("operation") == "compress":
+                    watch.start(method, **params)
+                    return {"output": "Compacting this chat. It takes a minute or two, and the context meter drops when it's done."}
             return session_reply(method, watch.call(method, **params))
         try:
             self.json(200, act())
