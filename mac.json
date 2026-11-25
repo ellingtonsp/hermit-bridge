@@ -1,9 +1,9 @@
 {
  "version": "1.3",
- "build": 37,
- "file": "Hermit-1.3-37.dmg",
- "sha256": "2f953404064e2500a19c67d9f027e173f2b347bf1e967c198a46be39e6a02617",
- "notes": "Dictation that keeps every word, reads it over as a whole and tidies it when you stop, with a waveform and Send while dictating",
- "size": 27536594,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-37/Hermit-1.3-37.dmg"
+ "build": 38,
+ "file": "Hermit-1.3-38.dmg",
+ "sha256": "3d1f3c1918fa713bf758d393beef4e57a4e6e7f4dec54f08c096840979d5ccc8",
+ "notes": "Code blocks wrap to fit with the copy button beside them, and a tap on inline code copies it.",
+ "size": 27544019,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-38/Hermit-1.3-38.dmg"
 }
