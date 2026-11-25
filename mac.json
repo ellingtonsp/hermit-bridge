@@ -1,9 +1,9 @@
 {
- "version": "1.2",
- "build": 36,
- "file": "Hermit-1.2-36.dmg",
- "sha256": "1ad942ee2a10221492396b8e44db1d3139b27daaffc5ea6bf9a3d17ecd527976",
- "notes": "Bots can call you with your brief ready, Health and Places for the bots you choose, and steadier sessions and calls",
- "size": 27007136,
- "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-36/Hermit-1.2-36.dmg"
+ "version": "1.3",
+ "build": 37,
+ "file": "Hermit-1.3-37.dmg",
+ "sha256": "2f953404064e2500a19c67d9f027e173f2b347bf1e967c198a46be39e6a02617",
+ "notes": "Dictation that keeps every word, reads it over as a whole and tidies it when you stop, with a waveform and Send while dictating",
+ "size": 27536594,
+ "url": "https://github.com/ellingtonsp/hermit-bridge/releases/download/mac-37/Hermit-1.3-37.dmg"
 }
